@@ -32,9 +32,9 @@ mod value;
 
 pub use params::{Params, ParamsError, DEFAULT_PARAMS, RANGE_TEST_PARAMS};
 pub use stream::{
-    BatchContinuation, BlockInput, BlockPointer, LogInput, LogValueSlot, LogValueStream,
-    LogValueStreamCompletion, LogValueStreamError, LogValueStreamEvent, LogValueStreamItem,
-    LogValueStreamTermination, PendingDelimiter, UnknownValueSpaceVersion, ValueSpaceAnchor,
-    ValueSpaceVersion, GETH_V1,
+    BatchContinuation, BlockInput, BlockPointer, LogInput, LogValueKind, LogValueSlot,
+    LogValueStream, LogValueStreamCompletion, LogValueStreamError, LogValueStreamEvent,
+    LogValueStreamItem, LogValueStreamTermination, PendingDelimiter, UnknownValueSpaceVersion,
+    ValueSpaceAnchor, ValueSpaceVersion, GETH_V1,
 };
 pub use value::{address_value, topic_value};

@@ -87,7 +87,7 @@ pub struct BlockInput {
     pub number: u64,
     /// Block hash.
     pub hash: B256,
-    /// Logs flattened in receipt order and then in-log order.
+    /// Complete logs flattened in receipt order and then log-within-receipt order.
     pub logs: Vec<LogInput>,
 }
 
@@ -136,6 +136,18 @@ impl BlockPointer {
     }
 }
 
+/// Classification of a searchable log value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogValueKind {
+    /// A log's emitting address.
+    Address,
+    /// One of a log's declared topics.
+    Topic {
+        /// Zero-based position within the log's topics.
+        ordinal: u8,
+    },
+}
+
 /// An entry that consumes one absolute log value index.
 ///
 /// Searchable values, delimiters, and padding are slots. This differs from metadata events such as
@@ -148,6 +160,8 @@ pub enum LogValueSlot {
         index: u64,
         /// SHA-256 hash of the address or topic.
         value: B256,
+        /// Whether this value came from an address or an ordered topic.
+        kind: LogValueKind,
     },
     /// An unmarked entry closing a block that is no longer the current head.
     BlockDelimiter {
@@ -278,6 +292,18 @@ pub enum LogValueStreamError {
         /// Number of the next input block.
         actual: u64,
     },
+    /// An input log exceeds Ethereum's topic limit.
+    #[error(
+        "invalid topic count in block {block_number}, log {log_index}: expected at most 4, got {actual}"
+    )]
+    InvalidTopicCount {
+        /// Number of the block containing the invalid log.
+        block_number: u64,
+        /// Zero-based position in the block's flattened logs.
+        log_index: usize,
+        /// Number of topics supplied by the log.
+        actual: usize,
+    },
     /// The anchor points before padding required by its first log.
     #[error("anchor index {index} requires {padding} padding slots before its first log")]
     AnchorRequiresPadding {
@@ -358,6 +384,16 @@ impl LogValueStream {
             })
         }
 
+        if let Some((log_index, log)) =
+            block.logs.iter().enumerate().find(|(_, log)| log.topics.len() > 4)
+        {
+            return Err(LogValueStreamError::InvalidTopicCount {
+                block_number: block.number,
+                log_index,
+                actual: log.topics.len(),
+            })
+        }
+
         if let Some(first_log) = block.logs.first() {
             let padding = self.padding_before(first_log);
             if !self.initialized && padding != 0 {
@@ -378,9 +414,12 @@ impl LogValueStream {
                 let padding = self.padding_before(log);
                 self.queue_padding(padding)?;
             }
-            self.queue_value(address_value(log.address))?;
-            for &topic in &log.topics {
-                self.queue_value(topic_value(topic))?;
+            self.queue_value(address_value(log.address), LogValueKind::Address)?;
+            for (ordinal, &topic) in log.topics.iter().enumerate() {
+                self.queue_value(
+                    topic_value(topic),
+                    LogValueKind::Topic { ordinal: ordinal as u8 },
+                )?;
             }
         }
 
@@ -438,10 +477,10 @@ impl LogValueStream {
         Ok(())
     }
 
-    fn queue_value(&mut self, value: B256) -> Result<(), LogValueStreamError> {
+    fn queue_value(&mut self, value: B256, kind: LogValueKind) -> Result<(), LogValueStreamError> {
         let index = self.next_index;
         self.queued.push_back(LogValueStreamItem::Event(LogValueStreamEvent::Slot(
-            LogValueSlot::Value { index, value },
+            LogValueSlot::Value { index, value, kind },
         )));
         self.advance_index()
     }
