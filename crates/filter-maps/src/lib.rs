@@ -2,8 +2,8 @@
 //!
 //! A filter map is a grid of rows by columns that holds a fixed number of *log value slots*. A
 //! searchable slot contains an address or topic hash; unmarked slots hold block delimiters or
-//! padding. [`LogValueStream`] produces those slots as typed events. It also emits metadata events,
-//! such as [`BlockPointer`], which describe the value space without consuming a slot.
+//! padding. [`LogValueStream`] produces those slots as typed events. It also emits [`BlockPointer`]
+//! and [`MapBoundary`] metadata without consuming slots.
 //!
 //! [`ValueSpaceVersion`] identifies the persisted semantic rules that assign absolute indices.
 //! [`LogValueStream`] implements [`GETH_V1`] directly, so callers do not select a version when
@@ -34,7 +34,7 @@ pub use params::{Params, ParamsError, DEFAULT_PARAMS, RANGE_TEST_PARAMS};
 pub use stream::{
     BatchContinuation, BlockInput, BlockPointer, LogInput, LogValueKind, LogValueSlot,
     LogValueStream, LogValueStreamCompletion, LogValueStreamError, LogValueStreamEvent,
-    LogValueStreamItem, LogValueStreamTermination, PendingDelimiter, UnknownValueSpaceVersion,
-    ValueSpaceAnchor, ValueSpaceVersion, GETH_V1,
+    LogValueStreamItem, LogValueStreamTermination, MapBoundary, PendingDelimiter,
+    UnknownValueSpaceVersion, ValueSpaceAnchor, ValueSpaceVersion, GETH_V1,
 };
 pub use value::{address_value, topic_value};

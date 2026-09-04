@@ -136,6 +136,31 @@ impl BlockPointer {
     }
 }
 
+/// Resume metadata emitted after all slots in a filter map have been materialized.
+///
+/// The resume block's separately emitted [`BlockPointer`] supplies the numerical pointer from
+/// which iteration can reproduce the boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MapBoundary {
+    /// Absolute index of the completed filter map.
+    pub completed_map_index: u32,
+    /// Number of the canonical block whose value-space range completed the map.
+    pub resume_block_number: u64,
+    /// Hash of the canonical resume block.
+    pub resume_block_hash: B256,
+}
+
+impl MapBoundary {
+    /// Creates resume metadata for a completed filter map.
+    pub const fn new(
+        completed_map_index: u32,
+        resume_block_number: u64,
+        resume_block_hash: B256,
+    ) -> Self {
+        Self { completed_map_index, resume_block_number, resume_block_hash }
+    }
+}
+
 /// Classification of a searchable log value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogValueKind {
@@ -186,6 +211,8 @@ pub enum LogValueStreamEvent {
     BlockPointer(BlockPointer),
     /// A materialized slot in the value space.
     Slot(LogValueSlot),
+    /// Resume metadata emitted immediately after the slot that completed a filter map.
+    MapBoundary(MapBoundary),
 }
 
 /// The current head's delimiter, reserved at an absolute index but not materialized yet.
@@ -329,6 +356,12 @@ pub enum LogValueStreamError {
     /// Advancing the absolute index would overflow `u64`.
     #[error("log value index overflow")]
     LogValueIndexOverflow,
+    /// A completed absolute map index does not fit in the persisted `u32` domain.
+    #[error("filter map index {map_index} exceeds u32")]
+    MapIndexOverflow {
+        /// Absolute map index derived from the completing log value slot.
+        map_index: u64,
+    },
     /// Deriving the next expected block number would overflow `u64`.
     #[error("block number overflow")]
     BlockNumberOverflow,
@@ -344,6 +377,7 @@ pub struct LogValueStream {
     queued: VecDeque<LogValueStreamItem>,
     next_index: u64,
     next_block_number: u64,
+    previous_block: Option<(u64, B256)>,
     initialized: bool,
     fused: bool,
 }
@@ -367,6 +401,7 @@ impl LogValueStream {
             queued: VecDeque::new(),
             next_index: anchor.first_log_value_index,
             next_block_number: anchor.block_number,
+            previous_block: None,
             initialized: false,
             fused: false,
         }
@@ -426,7 +461,11 @@ impl LogValueStream {
                     padding,
                 })
             }
-            self.queue_padding(padding)?;
+            if padding != 0 {
+                let (resume_block_number, resume_block_hash) =
+                    self.previous_block.expect("an initialized stream has a preceding block");
+                self.queue_padding(padding, resume_block_number, resume_block_hash)?;
+            }
         }
 
         let pointer = BlockPointer::new(block.number, block.hash, self.next_index);
@@ -436,13 +475,20 @@ impl LogValueStream {
         for (log_index, log) in block.logs.iter().enumerate() {
             if log_index != 0 {
                 let padding = self.padding_before(log);
-                self.queue_padding(padding)?;
+                self.queue_padding(padding, block.number, block.hash)?;
             }
-            self.queue_value(address_value(log.address), LogValueKind::Address)?;
+            self.queue_value(
+                address_value(log.address),
+                LogValueKind::Address,
+                block.number,
+                block.hash,
+            )?;
             for (ordinal, &topic) in log.topics.iter().enumerate() {
                 self.queue_value(
                     topic_value(topic),
                     LogValueKind::Topic { ordinal: ordinal as u8 },
+                    block.number,
+                    block.hash,
                 )?;
             }
         }
@@ -459,16 +505,18 @@ impl LogValueStream {
         }
 
         let index = self.next_index;
-        self.queued.push_back(LogValueStreamItem::Event(LogValueStreamEvent::Slot(
+        self.queue_slot(
             LogValueSlot::BlockDelimiter {
                 index,
                 block_number: block.number,
                 block_hash: block.hash,
             },
-        )));
-        self.advance_index()?;
+            block.number,
+            block.hash,
+        )?;
         self.next_block_number =
             block.number.checked_add(1).ok_or(LogValueStreamError::BlockNumberOverflow)?;
+        self.previous_block = Some((block.number, block.hash));
 
         if input_ended {
             let continuation = BatchContinuation::new(self.next_block_number, self.next_index);
@@ -490,23 +538,60 @@ impl LogValueStream {
         }
     }
 
-    fn queue_padding(&mut self, count: u64) -> Result<(), LogValueStreamError> {
+    fn queue_padding(
+        &mut self,
+        count: u64,
+        resume_block_number: u64,
+        resume_block_hash: B256,
+    ) -> Result<(), LogValueStreamError> {
         for _ in 0..count {
             let index = self.next_index;
-            self.queued.push_back(LogValueStreamItem::Event(LogValueStreamEvent::Slot(
+            self.queue_slot(
                 LogValueSlot::Padding { index },
-            )));
-            self.advance_index()?;
+                resume_block_number,
+                resume_block_hash,
+            )?;
         }
         Ok(())
     }
 
-    fn queue_value(&mut self, value: B256, kind: LogValueKind) -> Result<(), LogValueStreamError> {
+    fn queue_value(
+        &mut self,
+        value: B256,
+        kind: LogValueKind,
+        resume_block_number: u64,
+        resume_block_hash: B256,
+    ) -> Result<(), LogValueStreamError> {
         let index = self.next_index;
-        self.queued.push_back(LogValueStreamItem::Event(LogValueStreamEvent::Slot(
+        self.queue_slot(
             LogValueSlot::Value { index, value, kind },
-        )));
-        self.advance_index()
+            resume_block_number,
+            resume_block_hash,
+        )
+    }
+
+    fn queue_slot(
+        &mut self,
+        slot: LogValueSlot,
+        resume_block_number: u64,
+        resume_block_hash: B256,
+    ) -> Result<(), LogValueStreamError> {
+        let index = self.next_index;
+        self.queued.push_back(LogValueStreamItem::Event(LogValueStreamEvent::Slot(slot)));
+
+        let values_per_map = self.params.values_per_map();
+        let completes_map = index % values_per_map == values_per_map - 1;
+        self.advance_index()?;
+
+        if completes_map {
+            let map_index = index / values_per_map;
+            let completed_map_index = u32::try_from(map_index)
+                .map_err(|_| LogValueStreamError::MapIndexOverflow { map_index })?;
+            self.queued.push_back(LogValueStreamItem::Event(LogValueStreamEvent::MapBoundary(
+                MapBoundary::new(completed_map_index, resume_block_number, resume_block_hash),
+            )));
+        }
+        Ok(())
     }
 
     fn advance_index(&mut self) -> Result<(), LogValueStreamError> {

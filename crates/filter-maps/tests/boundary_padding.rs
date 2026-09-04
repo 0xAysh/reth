@@ -4,8 +4,8 @@ use alloy_primitives::{Address, B256};
 use reth_filter_maps::{
     address_value, topic_value, BatchContinuation, BlockInput, BlockPointer, LogInput,
     LogValueKind, LogValueSlot, LogValueStream, LogValueStreamCompletion, LogValueStreamError,
-    LogValueStreamEvent, LogValueStreamItem, LogValueStreamTermination, PendingDelimiter,
-    ValueSpaceAnchor, DEFAULT_PARAMS, RANGE_TEST_PARAMS,
+    LogValueStreamEvent, LogValueStreamItem, LogValueStreamTermination, MapBoundary,
+    PendingDelimiter, ValueSpaceAnchor, DEFAULT_PARAMS, RANGE_TEST_PARAMS,
 };
 
 const fn value(index: u64, hash: B256, kind: LogValueKind) -> LogValueStreamItem {
@@ -14,6 +14,14 @@ const fn value(index: u64, hash: B256, kind: LogValueKind) -> LogValueStreamItem
         value: hash,
         kind,
     }))
+}
+
+const fn map_boundary(map_index: u32, block_number: u64, hash: B256) -> LogValueStreamItem {
+    LogValueStreamItem::Event(LogValueStreamEvent::MapBoundary(MapBoundary::new(
+        map_index,
+        block_number,
+        hash,
+    )))
 }
 
 #[test]
@@ -41,6 +49,7 @@ fn a_log_that_exactly_fits_the_map_remainder_is_not_padded() {
             ))),
             value(65_534, address_value(address), LogValueKind::Address),
             value(65_535, topic_value(topic), LogValueKind::Topic { ordinal: 0 }),
+            map_boundary(0, 0, block_hash),
             LogValueStreamItem::Event(LogValueStreamEvent::Slot(LogValueSlot::BlockDelimiter {
                 index: 65_536,
                 block_number: 0,
@@ -92,6 +101,7 @@ fn a_log_one_slot_wider_than_the_remainder_moves_intact_to_the_next_map() {
             LogValueStreamItem::Event(LogValueStreamEvent::Slot(LogValueSlot::Padding {
                 index: 65_535,
             })),
+            map_boundary(0, 0, block_hash),
             value(65_536, address_value(second_address), LogValueKind::Address),
             value(65_537, topic_value(topics[0]), LogValueKind::Topic { ordinal: 0 }),
             value(65_538, topic_value(topics[1]), LogValueKind::Topic { ordinal: 1 }),
@@ -137,6 +147,7 @@ fn padding_before_a_blocks_first_log_places_its_pointer_after_the_padding() {
             LogValueStreamItem::Event(LogValueStreamEvent::Slot(LogValueSlot::Padding {
                 index: 65_535,
             })),
+            map_boundary(0, 0, first_hash),
             LogValueStreamItem::Event(LogValueStreamEvent::BlockPointer(BlockPointer::new(
                 1,
                 second_hash,
@@ -180,6 +191,7 @@ fn a_delimiter_occupies_the_last_map_slot_without_padding() {
                 block_number: 0,
                 block_hash: first_hash,
             },)),
+            map_boundary(0, 0, first_hash),
             LogValueStreamItem::Event(LogValueStreamEvent::BlockPointer(BlockPointer::new(
                 1,
                 second_hash,
@@ -252,9 +264,11 @@ fn an_oversized_later_block_emits_no_events_from_the_failing_block() {
                 0, first_hash, 0
             ),))),
             Ok(value(0, address_value(first_address), LogValueKind::Address)),
+            Ok(map_boundary(0, 0, first_hash)),
             Ok(LogValueStreamItem::Event(LogValueStreamEvent::Slot(
                 LogValueSlot::BlockDelimiter { index: 1, block_number: 0, block_hash: first_hash },
             ))),
+            Ok(map_boundary(1, 0, first_hash)),
             Err(LogValueStreamError::LogTooWide {
                 block_number: 1,
                 log_index: 0,
