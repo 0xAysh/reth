@@ -304,6 +304,20 @@ pub enum LogValueStreamError {
         /// Number of topics supplied by the log.
         actual: usize,
     },
+    /// A complete log cannot fit within one filter map.
+    #[error(
+        "log {log_index} in block {block_number} has width {log_width}, exceeding the map capacity {values_per_map}"
+    )]
+    LogTooWide {
+        /// Number of the block containing the oversized log.
+        block_number: u64,
+        /// Zero-based position in the block's flattened logs.
+        log_index: usize,
+        /// Number of slots required by the log's address and topics.
+        log_width: u64,
+        /// Number of log value slots available in one map.
+        values_per_map: u64,
+    },
     /// The anchor points before padding required by its first log.
     #[error("anchor index {index} requires {padding} padding slots before its first log")]
     AnchorRequiresPadding {
@@ -384,14 +398,24 @@ impl LogValueStream {
             })
         }
 
-        if let Some((log_index, log)) =
-            block.logs.iter().enumerate().find(|(_, log)| log.topics.len() > 4)
-        {
-            return Err(LogValueStreamError::InvalidTopicCount {
-                block_number: block.number,
-                log_index,
-                actual: log.topics.len(),
-            })
+        for (log_index, log) in block.logs.iter().enumerate() {
+            if log.topics.len() > 4 {
+                return Err(LogValueStreamError::InvalidTopicCount {
+                    block_number: block.number,
+                    log_index,
+                    actual: log.topics.len(),
+                })
+            }
+            let log_width = 1 + log.topics.len() as u64;
+            let values_per_map = self.params.values_per_map();
+            if log_width > values_per_map {
+                return Err(LogValueStreamError::LogTooWide {
+                    block_number: block.number,
+                    log_index,
+                    log_width,
+                    values_per_map,
+                })
+            }
         }
 
         if let Some(first_log) = block.logs.first() {
