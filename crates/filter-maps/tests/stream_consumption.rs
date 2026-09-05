@@ -39,7 +39,7 @@ fn block(number: u64, topics: usize) -> BlockInput {
 #[test]
 fn construction_and_map_limited_consumer_do_not_exhaust_input() {
     let fetched = Cell::new(0);
-    // Borrows local state and is not Clone: consumers must not need 'static or clonable sources.
+    // Borrows local state and is not Clone: consumers must not need 'static or cloneable sources.
     let input = NonCloneBlocks { fetched: &fetched, next_number: 0 };
     let mut stream = LogValueStream::new(
         DEFAULT_PARAMS,
