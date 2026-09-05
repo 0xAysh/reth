@@ -1,18 +1,6 @@
 // GENERATED from go-ethereum core/filtermaps. DO NOT EDIT.
 // Geth commit: af7c0fd8ee09de71b1034dbe6d1112556b49b59f
 //
-// Regenerate: the mapping functions are unexported, so this is produced by an
-// in-package Go test placed at core/filtermaps/ in a go-ethereum checkout at the
-// commit above. It calls sanitize() on DefaultParams and RangeTestParams (which
-// runs deriveFields; the mapping functions read those derived fields), then walks
-// addressValue, topicValue, rowIndex, columnIndex, maxRowLength, maskedMapIndex,
-// mapEpoch, firstEpochMap, lastEpochMap, mapGroupIndex and mapGroupOffset over the
-// inputs recorded in each table below, and prints them as Rust consts:
-// Generator: https://github.com/0xAysh/reth/blob/6257117d088246a8244ac8c5859e512c41f85916/tools/filtermaps-oracles/mapping/gen_golden_test.go
-// Instructions: https://github.com/0xAysh/reth/blob/6257117d088246a8244ac8c5859e512c41f85916/tools/filtermaps-oracles/README.md
-// Run tools/filtermaps-oracles/regenerate.sh <geth-checkout> <reth-checkout>.
-// Pins selected representative and boundary inputs, not every public input.
-//
 // Params are DEFAULT unless a table name says RANGE_TEST.
 
 pub const ADDRESS_VALUES: &[(&str, &str)] = &[
