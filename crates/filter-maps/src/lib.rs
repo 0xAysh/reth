@@ -3,7 +3,9 @@
 //! A filter map is a grid of rows by columns that holds a fixed number of *log value slots*. A
 //! searchable slot contains an address or topic hash; unmarked slots hold block delimiters or
 //! padding. [`LogValueStream`] produces those slots as typed events. It also emits [`BlockPointer`]
-//! and [`MapBoundary`] metadata without consuming slots.
+//! and [`MapBoundary`] metadata without consuming slots. A boundary identifies a completed map and
+//! resume-block identity; only the corresponding block pointer supplies the numerical position
+//! needed to construct a durable restart anchor.
 //!
 //! [`ValueSpaceVersion`] identifies the persisted semantic rules that assign absolute indices.
 //! [`LogValueStream`] implements [`GETH_V1`] directly, so callers do not select a version when
@@ -16,7 +18,8 @@
 //! golden vectors generated from Geth (see `tests/golden`).
 //!
 //! Nothing here touches storage: the stream and mapping functions produce the input that a later
-//! rendering layer can persist.
+//! rendering layer can persist. That layer is responsible for atomically publishing rendered rows,
+//! map resume metadata, the numerical block pointer, and its valid-range update.
 
 #![doc(
     html_logo_url = "https://raw.githubusercontent.com/paradigmxyz/reth/main/assets/reth-docs.png",

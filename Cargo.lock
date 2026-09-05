@@ -9039,6 +9039,7 @@ dependencies = [
 name = "reth-filter-maps"
 version = "2.5.2"
 dependencies = [
+ "alloy-eips",
  "alloy-primitives",
  "sha2 0.10.9",
  "thiserror 2.0.18",

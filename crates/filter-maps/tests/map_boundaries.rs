@@ -1,5 +1,6 @@
 //! Completed-map resume-anchor tests.
 
+use alloy_eips::BlockNumHash;
 use alloy_primitives::{address, b256};
 use reth_filter_maps::{
     BlockInput, LogInput, LogValueSlot, LogValueStream, LogValueStreamError, LogValueStreamEvent,
@@ -88,7 +89,9 @@ fn delimiter_can_complete_a_map() {
         DEFAULT_PARAMS,
         ValueSpaceAnchor::new(10, BLOCK_10_HASH, index),
         [block],
-        LogValueStreamTermination::BatchExhausted,
+        LogValueStreamTermination::BatchExhausted {
+            next_block: BlockNumHash::new(11, BLOCK_11_HASH),
+        },
     )
     .collect::<Result<Vec<_>, _>>()
     .unwrap();
@@ -99,12 +102,12 @@ fn delimiter_can_complete_a_map() {
             LogValueSlot::BlockDelimiter { index: delimiter_index, .. }
         )) if delimiter_index == index
     ));
-    assert_eq!(boundary(&items[2]), Some(MapBoundary::new(0, 10, BLOCK_10_HASH)));
+    assert_eq!(boundary(&items[2]), Some(MapBoundary::new(0, 11, BLOCK_11_HASH)));
     assert!(matches!(items[3], LogValueStreamItem::Complete(_)));
 }
 
 #[test]
-fn padding_before_a_new_block_uses_the_preceding_block_as_resume_anchor() {
+fn padding_before_a_new_block_uses_that_block_as_resume_anchor() {
     let values_per_map = DEFAULT_PARAMS.values_per_map();
     let first_index = values_per_map - 2;
     let blocks =
@@ -125,7 +128,7 @@ fn padding_before_a_new_block_uses_the_preceding_block_as_resume_anchor() {
             index
         })) if index == values_per_map - 1
     ));
-    assert_eq!(boundary(&items[boundary_position]), Some(MapBoundary::new(0, 10, BLOCK_10_HASH)));
+    assert_eq!(boundary(&items[boundary_position]), Some(MapBoundary::new(0, 11, BLOCK_11_HASH)));
     assert!(matches!(
         items[boundary_position + 1],
         LogValueStreamItem::Event(LogValueStreamEvent::BlockPointer(pointer))

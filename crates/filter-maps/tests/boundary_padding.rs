@@ -1,5 +1,6 @@
 //! Filter-map boundary padding tests.
 
+use alloy_eips::BlockNumHash;
 use alloy_primitives::{Address, B256};
 use reth_filter_maps::{
     address_value, topic_value, BatchContinuation, BlockInput, BlockPointer, LogInput,
@@ -36,7 +37,9 @@ fn a_log_that_exactly_fits_the_map_remainder_is_not_padded() {
         DEFAULT_PARAMS,
         anchor,
         [block],
-        LogValueStreamTermination::BatchExhausted,
+        LogValueStreamTermination::BatchExhausted {
+            next_block: BlockNumHash::new(1, B256::repeat_byte(0x22)),
+        },
     )
     .collect::<Result<Vec<_>, _>>()
     .unwrap();
@@ -57,7 +60,10 @@ fn a_log_that_exactly_fits_the_map_remainder_is_not_padded() {
             },)),
             LogValueStreamItem::Complete(LogValueStreamCompletion::BatchExhausted {
                 last_block: BlockPointer::new(0, block_hash, 65_534),
-                continuation: BatchContinuation::new(1, 65_537),
+                continuation: BatchContinuation::new(
+                    BlockNumHash::new(1, B256::repeat_byte(0x22)),
+                    65_537,
+                ),
             }),
         ]
     );
@@ -147,7 +153,7 @@ fn padding_before_a_blocks_first_log_places_its_pointer_after_the_padding() {
             LogValueStreamItem::Event(LogValueStreamEvent::Slot(LogValueSlot::Padding {
                 index: 65_535,
             })),
-            map_boundary(0, 0, first_hash),
+            map_boundary(0, 1, second_hash),
             LogValueStreamItem::Event(LogValueStreamEvent::BlockPointer(BlockPointer::new(
                 1,
                 second_hash,
@@ -191,7 +197,7 @@ fn a_delimiter_occupies_the_last_map_slot_without_padding() {
                 block_number: 0,
                 block_hash: first_hash,
             },)),
-            map_boundary(0, 0, first_hash),
+            map_boundary(0, 1, second_hash),
             LogValueStreamItem::Event(LogValueStreamEvent::BlockPointer(BlockPointer::new(
                 1,
                 second_hash,
@@ -268,7 +274,7 @@ fn an_oversized_later_block_emits_no_events_from_the_failing_block() {
             Ok(LogValueStreamItem::Event(LogValueStreamEvent::Slot(
                 LogValueSlot::BlockDelimiter { index: 1, block_number: 0, block_hash: first_hash },
             ))),
-            Ok(map_boundary(1, 0, first_hash)),
+            Ok(map_boundary(1, 1, second_hash)),
             Err(LogValueStreamError::LogTooWide {
                 block_number: 1,
                 log_index: 0,

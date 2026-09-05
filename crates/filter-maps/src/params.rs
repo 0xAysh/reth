@@ -196,7 +196,7 @@ impl Params {
 
     /// Returns the index of the last map in the given epoch.
     pub const fn last_epoch_map(&self, epoch: u32) -> u32 {
-        ((epoch + 1) << self.log_maps_per_epoch) - 1
+        self.first_epoch_map(epoch) | (self.maps_per_epoch() - 1)
     }
 
     /// Returns the start index of the base row group containing the given map index.

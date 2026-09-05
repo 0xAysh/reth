@@ -1,5 +1,6 @@
 //! Searchable log-value stream tests.
 
+use alloy_eips::BlockNumHash;
 use alloy_primitives::{Address, B256};
 use reth_filter_maps::{
     address_value, topic_value, BatchContinuation, BlockInput, BlockPointer, LogInput,
@@ -189,7 +190,9 @@ fn flattened_receipts_emit_only_log_values_in_canonical_order() {
         DEFAULT_PARAMS,
         anchor,
         [block],
-        LogValueStreamTermination::BatchExhausted,
+        LogValueStreamTermination::BatchExhausted {
+            next_block: BlockNumHash::new(1, B256::repeat_byte(0x22)),
+        },
     )
     .collect::<Result<Vec<_>, _>>()
     .unwrap();
@@ -213,7 +216,10 @@ fn flattened_receipts_emit_only_log_values_in_canonical_order() {
             },)),
             LogValueStreamItem::Complete(LogValueStreamCompletion::BatchExhausted {
                 last_block: BlockPointer::new(0, block_hash, 10),
-                continuation: BatchContinuation::new(1, 17),
+                continuation: BatchContinuation::new(
+                    BlockNumHash::new(1, B256::repeat_byte(0x22)),
+                    17,
+                ),
             }),
         ]
     );

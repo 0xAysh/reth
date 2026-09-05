@@ -1,5 +1,6 @@
 //! Lifecycle tests for the public log value stream.
 
+use alloy_eips::BlockNumHash;
 use alloy_primitives::B256;
 use reth_filter_maps::{
     BatchContinuation, BlockInput, BlockPointer, LogValueSlot, LogValueStream,
@@ -63,7 +64,9 @@ fn nonzero_anchor_exhausts_batch_across_contiguous_empty_blocks() {
         DEFAULT_PARAMS,
         anchor,
         [empty_block(100, 0x64), empty_block(101, 0x65), empty_block(102, 0x66)],
-        LogValueStreamTermination::BatchExhausted,
+        LogValueStreamTermination::BatchExhausted {
+            next_block: BlockNumHash::new(103, B256::repeat_byte(0x67)),
+        },
     );
 
     assert_eq!(
@@ -77,7 +80,10 @@ fn nonzero_anchor_exhausts_batch_across_contiguous_empty_blocks() {
             Ok(delimiter(102, 0x66, 44)),
             Ok(LogValueStreamItem::Complete(LogValueStreamCompletion::BatchExhausted {
                 last_block: BlockPointer::new(102, B256::repeat_byte(0x66), 44),
-                continuation: BatchContinuation::new(103, 45),
+                continuation: BatchContinuation::new(
+                    BlockNumHash::new(103, B256::repeat_byte(0x67)),
+                    45,
+                ),
             })),
         ]
     );
@@ -150,7 +156,9 @@ fn batch_exhaustion_materializes_the_last_delimiter_and_returns_continuation() {
         DEFAULT_PARAMS,
         anchor,
         [genesis],
-        LogValueStreamTermination::BatchExhausted,
+        LogValueStreamTermination::BatchExhausted {
+            next_block: BlockNumHash::new(1, B256::repeat_byte(0x22)),
+        },
     );
 
     assert_eq!(
@@ -171,7 +179,7 @@ fn batch_exhaustion_materializes_the_last_delimiter_and_returns_continuation() {
         stream.next(),
         Some(Ok(LogValueStreamItem::Complete(LogValueStreamCompletion::BatchExhausted {
             last_block: BlockPointer::new(0, genesis_hash, 0),
-            continuation: BatchContinuation::new(1, 1),
+            continuation: BatchContinuation::new(BlockNumHash::new(1, B256::repeat_byte(0x22)), 1,),
         })))
     );
     assert_eq!(stream.next(), None);
@@ -225,7 +233,9 @@ fn delimiter_index_overflow_discards_the_failed_blocks_events() {
         DEFAULT_PARAMS,
         anchor,
         [empty_block(100, 0x64)],
-        LogValueStreamTermination::BatchExhausted,
+        LogValueStreamTermination::BatchExhausted {
+            next_block: BlockNumHash::new(101, B256::repeat_byte(0x65)),
+        },
     );
 
     assert_eq!(stream.next(), Some(Err(LogValueStreamError::LogValueIndexOverflow)));
@@ -265,7 +275,9 @@ fn maximum_block_number_at_batch_boundary_errors_once_then_fuses() {
         DEFAULT_PARAMS,
         anchor,
         [BlockInput::new(u64::MAX, block_hash, [])],
-        LogValueStreamTermination::BatchExhausted,
+        LogValueStreamTermination::BatchExhausted {
+            next_block: BlockNumHash::new(u64::MAX, B256::repeat_byte(0x01)),
+        },
     );
 
     assert_eq!(stream.next(), Some(Err(LogValueStreamError::BlockNumberOverflow)));
@@ -278,7 +290,7 @@ fn value_space_version_has_a_stable_rejecting_encoding() {
     let _: ValueSpaceVersion = GETH_V1;
     let _ = DEFAULT_PARAMS;
 
-    assert_eq!(LogValueStream::VALUE_SPACE_VERSION, GETH_V1);
+    assert_eq!(LogValueStream::<std::iter::Empty<BlockInput>>::VALUE_SPACE_VERSION, GETH_V1);
     assert_eq!(u8::from(GETH_V1), 1);
     assert_eq!(ValueSpaceVersion::try_from(1), Ok(GETH_V1));
     assert_eq!(ValueSpaceVersion::try_from(2), Err(UnknownValueSpaceVersion::new(2)),);
@@ -321,5 +333,46 @@ fn an_anchor_hash_mismatch_errors_once_then_fuses() {
         }))
     );
     assert_eq!(stream.next(), None);
+    assert_eq!(stream.next(), None);
+}
+
+#[test]
+fn batch_lookahead_is_validated_before_the_final_blocks_events() {
+    let block_hash = B256::repeat_byte(0x64);
+    let mut stream = LogValueStream::new(
+        DEFAULT_PARAMS,
+        ValueSpaceAnchor::new(100, block_hash, 42),
+        [BlockInput::new(100, block_hash, [])],
+        LogValueStreamTermination::BatchExhausted {
+            next_block: BlockNumHash::new(102, B256::repeat_byte(0x66)),
+        },
+    );
+
+    assert_eq!(
+        stream.next(),
+        Some(Err(LogValueStreamError::NonContiguousBlock { expected: 101, actual: 102 }))
+    );
+    assert_eq!(stream.next(), None);
+}
+
+#[test]
+fn continuation_validates_the_first_blocks_hash() {
+    let expected_hash = B256::repeat_byte(0x65);
+    let actual_hash = B256::repeat_byte(0x66);
+    let continuation = BatchContinuation::new(BlockNumHash::new(101, expected_hash), 43);
+    let mut stream = LogValueStream::continue_from(
+        DEFAULT_PARAMS,
+        continuation,
+        [BlockInput::new(101, actual_hash, [])],
+        LogValueStreamTermination::ReachedHead,
+    );
+
+    assert_eq!(
+        stream.next(),
+        Some(Err(LogValueStreamError::ContinuationBlockHashMismatch {
+            expected: expected_hash,
+            actual: actual_hash,
+        }))
+    );
     assert_eq!(stream.next(), None);
 }

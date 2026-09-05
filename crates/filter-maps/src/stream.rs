@@ -1,8 +1,353 @@
 //! Typed events for the Geth-compatible log value stream.
 
 use crate::{address_value, topic_value, Params, ParamsError};
+use alloy_eips::BlockNumHash;
 use alloy_primitives::{Address, B256};
-use std::collections::VecDeque;
+use std::iter::Peekable;
+
+/// Iterator that turns canonical blocks into typed value-space events.
+///
+/// Construction does not advance the input. The stream retains an active block and at most one
+/// successor, plus constant-sized pending output. The input iterator may itself own a larger batch.
+/// Every block is prevalidated, including arithmetic, before its first event escapes; this scans
+/// all its logs but neither hashes values nor buffers expanded output. Hashing happens on demand.
+///
+/// A consumer may stop after any event and resume the same in-memory iterator. Dropping it does not
+/// drain the input. A [`MapBoundary`] identifies a completed map and its resume block, but it is
+/// not a durable restart point by itself: durable publication also needs that block's
+/// [`BlockPointer`]. The storage layer must publish the rendered rows, boundary identity, numerical
+/// pointer, and valid-range update atomically. Cloning is available only when the input iterator is
+/// cloneable, and is not a persistence format.
+///
+/// Receipt acquisition must handle read failures and supply complete, bounded batches. Never map
+/// a provider error to input exhaustion: [`LogValueStreamTermination::ReachedHead`] trusts the
+/// caller's assertion that the final supplied block really is the canonical head. This pure stream
+/// does not verify receipt completeness or canonical-chain membership and does not perform I/O.
+///
+/// # Examples
+///
+/// Pause an in-memory iterator after one map without consuming the rest of the stream:
+///
+/// ```
+/// use reth_filter_maps::{
+///     BlockInput, LogInput, LogValueStream, LogValueStreamEvent, LogValueStreamItem,
+///     LogValueStreamTermination, ValueSpaceAnchor, DEFAULT_PARAMS,
+/// };
+///
+/// let block = BlockInput::new(10, Default::default(), [LogInput::new(Default::default(), [])]);
+/// let anchor = ValueSpaceAnchor::new(10, block.hash, DEFAULT_PARAMS.values_per_map() - 1);
+/// let mut stream = LogValueStream::new(
+///     DEFAULT_PARAMS,
+///     anchor,
+///     [block],
+///     LogValueStreamTermination::ReachedHead,
+/// );
+/// for item in stream.by_ref() {
+///     // A renderer handles pointer/slot events here, stopping only after the boundary event.
+///     if matches!(item?, LogValueStreamItem::Event(LogValueStreamEvent::MapBoundary(_))) {
+///         break;
+///     }
+/// }
+/// // This is only an in-memory pause: the retained stream can continue. Durable restart would
+/// // additionally require the matching block pointer and an atomic storage publication.
+/// assert!(matches!(stream.next().transpose()?, Some(LogValueStreamItem::Complete(_))));
+/// # Ok::<(), reth_filter_maps::LogValueStreamError>(())
+/// ```
+#[derive(Debug, Clone)]
+pub struct LogValueStream<I: Iterator<Item = BlockInput>> {
+    params: Params,
+    start: StreamStart,
+    blocks: Peekable<I>,
+    termination: LogValueStreamTermination,
+    cursor: SlotCursor,
+    active: Option<ActiveBlock>,
+    pending_boundary: Option<MapBoundary>,
+    next_block_number: u64,
+    initialized: bool,
+    fused: bool,
+}
+
+impl<I: Iterator<Item = BlockInput>> LogValueStream<I> {
+    /// Value-space rules implemented by this stream.
+    pub const VALUE_SPACE_VERSION: ValueSpaceVersion = GETH_V1;
+
+    /// Creates a stream at `anchor` over canonical `blocks` with an explicit input termination.
+    ///
+    /// Validation errors are yielded on advancement, not during construction.
+    pub fn new(
+        params: Params,
+        anchor: ValueSpaceAnchor,
+        blocks: impl IntoIterator<Item = BlockInput, IntoIter = I>,
+        termination: LogValueStreamTermination,
+    ) -> Self {
+        Self {
+            params,
+            start: StreamStart::Anchor(anchor),
+            blocks: blocks.into_iter().peekable(),
+            termination,
+            cursor: SlotCursor { index: anchor.first_log_value_index },
+            active: None,
+            pending_boundary: None,
+            next_block_number: anchor.block_number,
+            initialized: false,
+            fused: false,
+        }
+    }
+
+    /// Continues a stream at the raw cursor returned by a bounded batch.
+    ///
+    /// Unlike a [`ValueSpaceAnchor`], a continuation cursor can precede padding required by the
+    /// first block's first log. That padding is emitted before the block's derived pointer.
+    pub fn continue_from(
+        params: Params,
+        continuation: BatchContinuation,
+        blocks: impl IntoIterator<Item = BlockInput, IntoIter = I>,
+        termination: LogValueStreamTermination,
+    ) -> Self {
+        Self {
+            params,
+            start: StreamStart::Continuation(continuation),
+            blocks: blocks.into_iter().peekable(),
+            termination,
+            cursor: SlotCursor { index: continuation.next_log_value_index },
+            active: None,
+            pending_boundary: None,
+            next_block_number: continuation.next_block.number,
+            initialized: false,
+            fused: false,
+        }
+    }
+
+    fn prepare_block(&mut self) -> Result<(), LogValueStreamError> {
+        if !self.initialized {
+            self.params.validate()?;
+        }
+        let block = self.blocks.next().ok_or(LogValueStreamError::EmptyInput)?;
+        let lookahead = self.blocks.peek().map(|next| BlockNumHash::new(next.number, next.hash));
+        let input_ended = lookahead.is_none();
+        if !self.initialized {
+            match self.start {
+                StreamStart::Anchor(anchor) => {
+                    if block.number != anchor.block_number {
+                        return Err(LogValueStreamError::AnchorBlockNumberMismatch {
+                            expected: anchor.block_number,
+                            actual: block.number,
+                        })
+                    }
+                    if block.hash != anchor.block_hash {
+                        return Err(LogValueStreamError::AnchorBlockHashMismatch {
+                            expected: anchor.block_hash,
+                            actual: block.hash,
+                        })
+                    }
+                }
+                StreamStart::Continuation(continuation) => {
+                    if block.number != continuation.next_block.number {
+                        return Err(LogValueStreamError::NonContiguousBlock {
+                            expected: continuation.next_block.number,
+                            actual: block.number,
+                        })
+                    }
+                    if block.hash != continuation.next_block.hash {
+                        return Err(LogValueStreamError::ContinuationBlockHashMismatch {
+                            expected: continuation.next_block.hash,
+                            actual: block.hash,
+                        })
+                    }
+                }
+            }
+        } else if block.number != self.next_block_number {
+            return Err(LogValueStreamError::NonContiguousBlock {
+                expected: self.next_block_number,
+                actual: block.number,
+            })
+        }
+
+        let expected_successor =
+            if input_ended && self.termination == LogValueStreamTermination::ReachedHead {
+                None
+            } else {
+                Some(block.number.checked_add(1).ok_or(LogValueStreamError::BlockNumberOverflow)?)
+            };
+        let successor = if input_ended {
+            match self.termination {
+                LogValueStreamTermination::ReachedHead => None,
+                LogValueStreamTermination::BatchExhausted { next_block } => {
+                    let expected = expected_successor.expect("a bounded batch has a successor");
+                    if next_block.number != expected {
+                        return Err(LogValueStreamError::NonContiguousBlock {
+                            expected,
+                            actual: next_block.number,
+                        })
+                    }
+                    Some(next_block)
+                }
+            }
+        } else {
+            lookahead
+        };
+
+        // Validate all geometry first to retain error precedence over arithmetic in earlier logs.
+        for (log_index, log) in block.logs.iter().enumerate() {
+            if log.topics.len() > 4 {
+                return Err(LogValueStreamError::InvalidTopicCount {
+                    block_number: block.number,
+                    log_index,
+                    actual: log.topics.len(),
+                })
+            }
+            let log_width = 1 + log.topics.len() as u64;
+            if log_width > self.params.values_per_map() {
+                return Err(LogValueStreamError::LogTooWide {
+                    block_number: block.number,
+                    log_index,
+                    log_width,
+                    values_per_map: self.params.values_per_map(),
+                })
+            }
+        }
+
+        let mut preflight = self.cursor;
+        let mut first_index = preflight.index;
+        for (log_index, log) in block.logs.iter().enumerate() {
+            let padding = preflight.padding_before(log, self.params);
+            if log_index == 0 &&
+                !self.initialized &&
+                matches!(self.start, StreamStart::Anchor(_)) &&
+                padding != 0
+            {
+                return Err(LogValueStreamError::AnchorRequiresPadding {
+                    index: preflight.index,
+                    padding,
+                })
+            }
+            preflight.advance_by(padding, self.params)?;
+            if log_index == 0 {
+                first_index = preflight.index;
+            }
+            preflight.advance_by(1 + log.topics.len() as u64, self.params)?;
+        }
+        if let Some(successor) = successor {
+            let expected = expected_successor.expect("a materialized delimiter has a successor");
+            // A map-ending delimiter publishes its successor identity, so validate it before any
+            // events of this block escape. Otherwise continuity is checked when that block enters.
+            if preflight.completes_map(self.params) && successor.number != expected {
+                return Err(LogValueStreamError::NonContiguousBlock {
+                    expected,
+                    actual: successor.number,
+                })
+            }
+            preflight.advance(self.params)?;
+            self.next_block_number = expected;
+        }
+
+        self.active = Some(ActiveBlock {
+            pointer: BlockPointer::new(block.number, block.hash, first_index),
+            input: block,
+            successor,
+            terminal: input_ended,
+            log_index: 0,
+            value_index: 0,
+            pointer_emitted: false,
+            delimiter_emitted: false,
+        });
+        self.initialized = true;
+        Ok(())
+    }
+
+    fn next_item(&mut self) -> Result<LogValueStreamItem, LogValueStreamError> {
+        if let Some(boundary) = self.pending_boundary.take() {
+            return Ok(LogValueStreamItem::Event(LogValueStreamEvent::MapBoundary(boundary)))
+        }
+        if self.active.is_none() {
+            self.prepare_block()?;
+        }
+        let active = self.active.as_mut().expect("a block was prepared");
+        let identity = BlockNumHash::new(active.input.number, active.input.hash);
+        let log = active.input.logs.get(active.log_index);
+        let index = self.cursor.index;
+        if let Some(log) = log &&
+            active.value_index == 0 &&
+            self.cursor.padding_before(log, self.params) != 0
+        {
+            return self.emit_slot(LogValueSlot::Padding { index }, identity)
+        }
+        if !active.pointer_emitted {
+            active.pointer_emitted = true;
+            return Ok(LogValueStreamItem::Event(LogValueStreamEvent::BlockPointer(active.pointer)))
+        }
+        if let Some(log) = log {
+            let (value, kind) = if active.value_index == 0 {
+                (address_value(log.address), LogValueKind::Address)
+            } else {
+                (
+                    topic_value(log.topics[active.value_index - 1]),
+                    LogValueKind::Topic { ordinal: (active.value_index - 1) as u8 },
+                )
+            };
+            active.value_index += 1;
+            if active.value_index == 1 + log.topics.len() {
+                active.log_index += 1;
+                active.value_index = 0;
+            }
+            return self.emit_slot(LogValueSlot::Value { index, value, kind }, identity)
+        }
+        let Some(successor) = active.successor else {
+            return Ok(LogValueStreamItem::Complete(LogValueStreamCompletion::ReachedHead {
+                head: active.pointer,
+                pending_delimiter: PendingDelimiter::new(identity.number, identity.hash, index),
+            }))
+        };
+        if !active.delimiter_emitted {
+            active.delimiter_emitted = true;
+            if !active.terminal {
+                self.active = None;
+            }
+            return self.emit_slot(
+                LogValueSlot::BlockDelimiter {
+                    index,
+                    block_number: identity.number,
+                    block_hash: identity.hash,
+                },
+                successor,
+            )
+        }
+        Ok(LogValueStreamItem::Complete(LogValueStreamCompletion::BatchExhausted {
+            last_block: active.pointer,
+            continuation: BatchContinuation::new(successor, index),
+        }))
+    }
+
+    fn emit_slot(
+        &mut self,
+        slot: LogValueSlot,
+        resume: BlockNumHash,
+    ) -> Result<LogValueStreamItem, LogValueStreamError> {
+        if let Some(map_index) = self.cursor.advance(self.params)? {
+            self.pending_boundary = Some(MapBoundary::new(map_index, resume.number, resume.hash));
+        }
+        Ok(LogValueStreamItem::Event(LogValueStreamEvent::Slot(slot)))
+    }
+}
+
+impl<I: Iterator<Item = BlockInput>> Iterator for LogValueStream<I> {
+    type Item = Result<LogValueStreamItem, LogValueStreamError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.fused {
+            return None
+        }
+        let item = self.next_item();
+        if matches!(item, Err(_) | Ok(LogValueStreamItem::Complete(_))) {
+            self.fused = true;
+            self.active = None;
+            self.pending_boundary = None;
+        }
+        Some(item)
+    }
+}
+
+impl<I: Iterator<Item = BlockInput>> std::iter::FusedIterator for LogValueStream<I> {}
 
 /// Version of the rules that assign absolute log value indices.
 ///
@@ -57,8 +402,8 @@ impl UnknownValueSpaceVersion {
 /// A point from which a log value stream can be reproduced.
 ///
 /// The numerical pointer is the first non-padding slot generated by the block: its first log's
-/// address when it has logs, or its delimiter when it is empty. Map-boundary padding emitted before
-/// that slot belongs to the preceding block's range.
+/// address when it has logs, or its delimiter when it is empty. Any padding required before that
+/// slot must already have been traversed; a raw batch continuation represents the earlier cursor.
 ///
 /// The stream verifies that the first input's block identity matches this value, but trusts the
 /// supplied numerical pointer. Establishing checkpoint provenance and canonical-chain membership
@@ -71,6 +416,14 @@ pub struct ValueSpaceAnchor {
     pub block_hash: B256,
     /// Absolute index of the first non-padding slot generated by the anchored block.
     pub first_log_value_index: u64,
+}
+
+/// Converts pointer metadata without establishing checkpoint provenance, canonical-chain
+/// membership, or the correctness of the numerical index. Those remain the caller's responsibility.
+impl From<BlockPointer> for ValueSpaceAnchor {
+    fn from(pointer: BlockPointer) -> Self {
+        Self::new(pointer.block_number, pointer.block_hash, pointer.first_log_value_index)
+    }
 }
 
 impl ValueSpaceAnchor {
@@ -117,8 +470,9 @@ impl LogInput {
 /// Metadata mapping a block to its first non-padding slot in the value space.
 ///
 /// This points to the first log address when the block has logs, or the block delimiter when it is
-/// empty. Any map-boundary padding before it belongs to the preceding block's range. A block
-/// pointer is metadata: it does not consume a log value index and is not a filter-map slot.
+/// empty. Padding caused by the first log precedes this pointer but uses this block as the
+/// boundary's resume identity. A block pointer is metadata: it does not consume a log value index
+/// and is not a filter-map slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockPointer {
     /// Block number.
@@ -136,15 +490,23 @@ impl BlockPointer {
     }
 }
 
-/// Resume metadata emitted after all slots in a filter map have been materialized.
+/// Boundary event emitted after all slots in a filter map have been materialized.
 ///
-/// The resume block's separately emitted [`BlockPointer`] supplies the numerical pointer from
-/// which iteration can reproduce the boundary.
+/// This identifies the completed map and canonical resume block, but carries no numerical block
+/// pointer and is not a durable checkpoint or [`ValueSpaceAnchor`] by itself. A stateful renderer
+/// may pause a retained iterator here. It may publish a durable map resume anchor only after it has
+/// the resume block's separately emitted [`BlockPointer`], in the same atomic storage transaction
+/// as the rendered rows and valid-range update.
+///
+/// The resume block is the iterator's block after advancing past the completing slot, not
+/// necessarily the block that owned that slot. A delimiter can therefore name its successor,
+/// padding can name the block whose log caused it, and consecutive boundaries can legitimately
+/// name the same block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MapBoundary {
     /// Absolute index of the completed filter map.
     pub completed_map_index: u32,
-    /// Number of the canonical block whose value-space range completed the map.
+    /// Number of the canonical block from whose pointer this boundary can be resumed.
     pub resume_block_number: u64,
     /// Hash of the canonical resume block.
     pub resume_block_hash: B256,
@@ -239,22 +601,31 @@ pub enum LogValueStreamTermination {
     /// The final input block is the canonical head, so its delimiter remains pending.
     ReachedHead,
     /// The final input block only ends this bounded batch, so its delimiter is materialized.
-    BatchExhausted,
+    ///
+    /// The next canonical block is lookahead needed when that delimiter completes a map: Geth
+    /// records the successor as the map's restart block.
+    BatchExhausted {
+        /// Identity of the first canonical block after this batch.
+        next_block: BlockNumHash,
+    },
 }
 
 /// State needed to continue after a bounded batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BatchContinuation {
-    /// Number expected for the first block in the next batch.
-    pub next_block_number: u64,
+    /// Identity expected for the first block in the next batch.
+    pub next_block: BlockNumHash,
     /// Absolute cursor immediately after the last batch block's materialized delimiter.
+    ///
+    /// This is the cursor before processing the next block, not necessarily that block's pointer:
+    /// padding before its first log can move the pointer forward.
     pub next_log_value_index: u64,
 }
 
 impl BatchContinuation {
     /// Creates bounded-batch continuation state.
-    pub const fn new(next_block_number: u64, next_log_value_index: u64) -> Self {
-        Self { next_block_number, next_log_value_index }
+    pub const fn new(next_block: BlockNumHash, next_log_value_index: u64) -> Self {
+        Self { next_block, next_log_value_index }
     }
 }
 
@@ -319,6 +690,14 @@ pub enum LogValueStreamError {
         /// Number of the next input block.
         actual: u64,
     },
+    /// The first continued block does not have the expected hash.
+    #[error("continuation block hash mismatch: expected {expected}, got {actual}")]
+    ContinuationBlockHashMismatch {
+        /// Hash recorded by the bounded-batch continuation.
+        expected: B256,
+        /// Hash of the first supplied continuation block.
+        actual: B256,
+    },
     /// An input log exceeds Ethereum's topic limit.
     #[error(
         "invalid topic count in block {block_number}, log {log_index}: expected at most 4, got {actual}"
@@ -367,261 +746,65 @@ pub enum LogValueStreamError {
     BlockNumberOverflow,
 }
 
-/// Iterator that turns canonical blocks into typed value-space events.
-#[derive(Debug, Clone)]
-pub struct LogValueStream {
-    params: Params,
-    anchor: ValueSpaceAnchor,
-    blocks: VecDeque<BlockInput>,
-    termination: LogValueStreamTermination,
-    queued: VecDeque<LogValueStreamItem>,
-    next_index: u64,
-    next_block_number: u64,
-    previous_block: Option<(u64, B256)>,
-    initialized: bool,
-    fused: bool,
+#[derive(Debug, Clone, Copy)]
+enum StreamStart {
+    Anchor(ValueSpaceAnchor),
+    Continuation(BatchContinuation),
 }
 
-impl LogValueStream {
-    /// Value-space rules implemented by this stream.
-    pub const VALUE_SPACE_VERSION: ValueSpaceVersion = GETH_V1;
+#[derive(Debug, Clone)]
+struct ActiveBlock {
+    input: BlockInput,
+    pointer: BlockPointer,
+    successor: Option<BlockNumHash>,
+    terminal: bool,
+    log_index: usize,
+    value_index: usize,
+    pointer_emitted: bool,
+    delimiter_emitted: bool,
+}
 
-    /// Creates a stream at `anchor` over canonical `blocks` with an explicit input termination.
-    pub fn new(
-        params: Params,
-        anchor: ValueSpaceAnchor,
-        blocks: impl IntoIterator<Item = BlockInput>,
-        termination: LogValueStreamTermination,
-    ) -> Self {
-        Self {
-            params,
-            anchor,
-            blocks: blocks.into_iter().collect(),
-            termination,
-            queued: VecDeque::new(),
-            next_index: anchor.first_log_value_index,
-            next_block_number: anchor.block_number,
-            previous_block: None,
-            initialized: false,
-            fused: false,
-        }
-    }
+/// Shared slot accounting for the preflight pass and incremental emission.
+#[derive(Debug, Clone, Copy)]
+struct SlotCursor {
+    index: u64,
+}
 
-    fn prepare_block(&mut self) -> Result<(), LogValueStreamError> {
-        if !self.initialized {
-            self.params.validate()?;
-        }
-
-        let block = self.blocks.pop_front().ok_or(LogValueStreamError::EmptyInput)?;
-        if !self.initialized {
-            if block.number != self.anchor.block_number {
-                return Err(LogValueStreamError::AnchorBlockNumberMismatch {
-                    expected: self.anchor.block_number,
-                    actual: block.number,
-                })
-            }
-            if block.hash != self.anchor.block_hash {
-                return Err(LogValueStreamError::AnchorBlockHashMismatch {
-                    expected: self.anchor.block_hash,
-                    actual: block.hash,
-                })
-            }
-        } else if block.number != self.next_block_number {
-            return Err(LogValueStreamError::NonContiguousBlock {
-                expected: self.next_block_number,
-                actual: block.number,
-            })
-        }
-
-        for (log_index, log) in block.logs.iter().enumerate() {
-            if log.topics.len() > 4 {
-                return Err(LogValueStreamError::InvalidTopicCount {
-                    block_number: block.number,
-                    log_index,
-                    actual: log.topics.len(),
-                })
-            }
-            let log_width = 1 + log.topics.len() as u64;
-            let values_per_map = self.params.values_per_map();
-            if log_width > values_per_map {
-                return Err(LogValueStreamError::LogTooWide {
-                    block_number: block.number,
-                    log_index,
-                    log_width,
-                    values_per_map,
-                })
-            }
-        }
-
-        if let Some(first_log) = block.logs.first() {
-            let padding = self.padding_before(first_log);
-            if !self.initialized && padding != 0 {
-                return Err(LogValueStreamError::AnchorRequiresPadding {
-                    index: self.next_index,
-                    padding,
-                })
-            }
-            if padding != 0 {
-                let (resume_block_number, resume_block_hash) =
-                    self.previous_block.expect("an initialized stream has a preceding block");
-                self.queue_padding(padding, resume_block_number, resume_block_hash)?;
-            }
-        }
-
-        let pointer = BlockPointer::new(block.number, block.hash, self.next_index);
-        self.queued
-            .push_back(LogValueStreamItem::Event(LogValueStreamEvent::BlockPointer(pointer)));
-
-        for (log_index, log) in block.logs.iter().enumerate() {
-            if log_index != 0 {
-                let padding = self.padding_before(log);
-                self.queue_padding(padding, block.number, block.hash)?;
-            }
-            self.queue_value(
-                address_value(log.address),
-                LogValueKind::Address,
-                block.number,
-                block.hash,
-            )?;
-            for (ordinal, &topic) in log.topics.iter().enumerate() {
-                self.queue_value(
-                    topic_value(topic),
-                    LogValueKind::Topic { ordinal: ordinal as u8 },
-                    block.number,
-                    block.hash,
-                )?;
-            }
-        }
-
-        self.initialized = true;
-        let input_ended = self.blocks.is_empty();
-        if input_ended && self.termination == LogValueStreamTermination::ReachedHead {
-            let pending_delimiter =
-                PendingDelimiter::new(block.number, block.hash, self.next_index);
-            self.queued.push_back(LogValueStreamItem::Complete(
-                LogValueStreamCompletion::ReachedHead { head: pointer, pending_delimiter },
-            ));
-            return Ok(())
-        }
-
-        let index = self.next_index;
-        self.queue_slot(
-            LogValueSlot::BlockDelimiter {
-                index,
-                block_number: block.number,
-                block_hash: block.hash,
-            },
-            block.number,
-            block.hash,
-        )?;
-        self.next_block_number =
-            block.number.checked_add(1).ok_or(LogValueStreamError::BlockNumberOverflow)?;
-        self.previous_block = Some((block.number, block.hash));
-
-        if input_ended {
-            let continuation = BatchContinuation::new(self.next_block_number, self.next_index);
-            self.queued.push_back(LogValueStreamItem::Complete(
-                LogValueStreamCompletion::BatchExhausted { last_block: pointer, continuation },
-            ));
-        }
-        Ok(())
-    }
-
-    const fn padding_before(&self, log: &LogInput) -> u64 {
-        let entry_count = 1 + log.topics.len() as u64;
-        let values_per_map = self.params.values_per_map();
-        let remaining = values_per_map - self.next_index % values_per_map;
-        if entry_count > remaining {
+impl SlotCursor {
+    const fn padding_before(self, log: &LogInput, params: Params) -> u64 {
+        let width = 1 + log.topics.len() as u64;
+        let remaining = params.values_per_map() - self.index % params.values_per_map();
+        if width > remaining {
             remaining
         } else {
             0
         }
     }
 
-    fn queue_padding(
-        &mut self,
-        count: u64,
-        resume_block_number: u64,
-        resume_block_hash: B256,
-    ) -> Result<(), LogValueStreamError> {
-        for _ in 0..count {
-            let index = self.next_index;
-            self.queue_slot(
-                LogValueSlot::Padding { index },
-                resume_block_number,
-                resume_block_hash,
-            )?;
-        }
-        Ok(())
+    const fn completes_map(self, params: Params) -> bool {
+        self.index % params.values_per_map() == params.values_per_map() - 1
     }
 
-    fn queue_value(
-        &mut self,
-        value: B256,
-        kind: LogValueKind,
-        resume_block_number: u64,
-        resume_block_hash: B256,
-    ) -> Result<(), LogValueStreamError> {
-        let index = self.next_index;
-        self.queue_slot(
-            LogValueSlot::Value { index, value, kind },
-            resume_block_number,
-            resume_block_hash,
-        )
-    }
-
-    fn queue_slot(
-        &mut self,
-        slot: LogValueSlot,
-        resume_block_number: u64,
-        resume_block_hash: B256,
-    ) -> Result<(), LogValueStreamError> {
-        let index = self.next_index;
-        self.queued.push_back(LogValueStreamItem::Event(LogValueStreamEvent::Slot(slot)));
-
-        let values_per_map = self.params.values_per_map();
-        let completes_map = index % values_per_map == values_per_map - 1;
-        self.advance_index()?;
-
+    fn advance(&mut self, params: Params) -> Result<Option<u32>, LogValueStreamError> {
+        let index = self.index;
+        let completes_map = self.completes_map(params);
+        self.index = index.checked_add(1).ok_or(LogValueStreamError::LogValueIndexOverflow)?;
         if completes_map {
-            let map_index = index / values_per_map;
-            let completed_map_index = u32::try_from(map_index)
+            let map_index = index / params.values_per_map();
+            let map_index = u32::try_from(map_index)
                 .map_err(|_| LogValueStreamError::MapIndexOverflow { map_index })?;
-            self.queued.push_back(LogValueStreamItem::Event(LogValueStreamEvent::MapBoundary(
-                MapBoundary::new(completed_map_index, resume_block_number, resume_block_hash),
-            )));
+            Ok(Some(map_index))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn advance_by(&mut self, count: u64, params: Params) -> Result<(), LogValueStreamError> {
+        // A validated log has at most five values and at most four preceding padding slots.
+        // Reusing the slot step also preserves overflow precedence at the final u64 index.
+        for _ in 0..count {
+            self.advance(params)?;
         }
         Ok(())
     }
-
-    fn advance_index(&mut self) -> Result<(), LogValueStreamError> {
-        self.next_index =
-            self.next_index.checked_add(1).ok_or(LogValueStreamError::LogValueIndexOverflow)?;
-        Ok(())
-    }
 }
-
-impl Iterator for LogValueStream {
-    type Item = Result<LogValueStreamItem, LogValueStreamError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.fused {
-            return None
-        }
-        if self.queued.is_empty() &&
-            let Err(error) = self.prepare_block()
-        {
-            self.fused = true;
-            self.queued.clear();
-            return Some(Err(error))
-        }
-        let item = self.queued.pop_front()?;
-        if matches!(item, LogValueStreamItem::Complete(_)) {
-            self.fused = true;
-            self.queued.clear();
-        }
-        Some(Ok(item))
-    }
-}
-
-impl std::iter::FusedIterator for LogValueStream {}

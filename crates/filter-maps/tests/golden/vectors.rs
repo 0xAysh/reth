@@ -1,5 +1,5 @@
 // GENERATED from go-ethereum core/filtermaps. DO NOT EDIT.
-// Geth commit: ca1f2e4d38f4e94676981bb9251239a5d490b004
+// Geth commit: af7c0fd8ee09de71b1034dbe6d1112556b49b59f
 //
 // Regenerate: the mapping functions are unexported, so this is produced by an
 // in-package Go test placed at core/filtermaps/ in a go-ethereum checkout at the
@@ -8,10 +8,10 @@
 // addressValue, topicValue, rowIndex, columnIndex, maxRowLength, maskedMapIndex,
 // mapEpoch, firstEpochMap, lastEpochMap, mapGroupIndex and mapGroupOffset over the
 // inputs recorded in each table below, and prints them as Rust consts:
-//   go test -run TestGenGolden -v
-// The generator (gen_golden_test.go) is not part of this repository; see the
-// FilterMaps tracking issue, https://github.com/paradigmxyz/reth/issues/16999.
-// The description above is sufficient to rewrite it.
+// Generator: https://github.com/0xAysh/reth/blob/6257117d088246a8244ac8c5859e512c41f85916/tools/filtermaps-oracles/mapping/gen_golden_test.go
+// Instructions: https://github.com/0xAysh/reth/blob/6257117d088246a8244ac8c5859e512c41f85916/tools/filtermaps-oracles/README.md
+// Run tools/filtermaps-oracles/regenerate.sh <geth-checkout> <reth-checkout>.
+// Pins selected representative and boundary inputs, not every public input.
 //
 // Params are DEFAULT unless a table name says RANGE_TEST.
 
@@ -252,11 +252,20 @@ pub const EPOCH_HELPERS_DEFAULT: &[(u32, u32, u32, u32)] = &[
     (2048, 2, 2048, 3071),
     (1048575, 1023, 1047552, 1048575),
     (1048576, 1024, 1048576, 1049599),
+    (4294966271, 4194302, 4294965248, 4294966271),
+    (4294967295, 4194303, 4294966272, 4294967295),
 ];
 
 // map_index -> (map_epoch, first_epoch_map(that epoch), last_epoch_map(that epoch)) (RANGE_TEST)
-pub const EPOCH_HELPERS_RANGE_TEST: &[(u32, u32, u32, u32)] =
-    &[(0, 0, 0, 0), (1, 1, 1, 1), (2, 2, 2, 2), (7, 7, 7, 7), (1024, 1024, 1024, 1024)];
+pub const EPOCH_HELPERS_RANGE_TEST: &[(u32, u32, u32, u32)] = &[
+    (0, 0, 0, 0),
+    (1, 1, 1, 1),
+    (2, 2, 2, 2),
+    (7, 7, 7, 7),
+    (1024, 1024, 1024, 1024),
+    (4294967294, 4294967294, 4294967294, 4294967294),
+    (4294967295, 4294967295, 4294967295, 4294967295),
+];
 
 // map_index -> (map_group_index, map_group_offset) (DEFAULT)
 pub const MAP_GROUP_DEFAULT: &[(u32, u32, u32)] = &[
