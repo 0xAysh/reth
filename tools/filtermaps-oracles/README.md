@@ -6,20 +6,46 @@ branch into `filter-maps` or include Go tooling in the upstream submission.
 Reth's implementation branch contains generated outputs and ordinary Rust tests.
 Private project specs and agent notes do not belong here.
 
+## How it works
+
+Generation is an explicit maintainer operation:
+
+```text
+public oracle generator
+        │ copied temporarily into the same Go package
+        ▼
+pinned Geth core/filtermaps
+        │ executes Geth's private mapping functions and logIterator
+        ▼
+committed Rust vectors and text fixtures
+```
+
+Normal Reth testing uses only the committed outputs:
+
+```text
+committed fixture → Rust parser → LogValueStream → exact event/index comparison
+```
+
+The split keeps the reference source reviewable without adding Go tooling or a
+Geth checkout to Reth's implementation branch or CI.
+
 ## Pins
 
 - Geth: `af7c0fd8ee09de71b1034dbe6d1112556b49b59f`.
-- Generator: the exact commit containing this folder, recorded in every generated
-  stream fixture by `regenerate.sh`.
+- Generator: the exact commit recorded in each generated stream fixture.
 - Tested tools: Go `1.26.5`; rustfmt `1.9.0-nightly (37d85e592f 2026-04-28)`.
-
-Publish the exact oracle commit before relying on its links in a public PR. Rust
-CI consumes committed outputs and requires neither Go nor a Geth checkout.
 
 ## Regeneration
 
-Start with the exact oracle commit, a clean checkout of the pinned Geth commit,
-and a Reth implementation checkout containing `crates/filter-maps`:
+Three clean inputs are required:
+
+```text
+1. exact public oracle commit
+2. clean Geth checkout at the pinned revision
+3. Reth checkout containing crates/filter-maps
+```
+
+Then run:
 
 ```sh
 REFERENCE=/absolute/path/to/oracle-reference-checkout
@@ -30,11 +56,16 @@ cd geth-oracle
 git checkout --detach af7c0fd8ee09de71b1034dbe6d1112556b49b59f
 GETH="$PWD"
 
-# Select one output family, or use all. Omitting the mode also means all.
+# PR3 whole-stream fixtures only.
 bash "$REFERENCE/tools/filtermaps-oracles/regenerate.sh" stream "$GETH" "$RETH"
+
+# PR1 mapping vectors only.
 bash "$REFERENCE/tools/filtermaps-oracles/regenerate.sh" mapping "$GETH" "$RETH"
+
+# Both output families. Omitting the mode also means all.
 bash "$REFERENCE/tools/filtermaps-oracles/regenerate.sh" all "$GETH" "$RETH"
 
+# Normal Rust verification needs no Go or Geth.
 cd "$RETH"
 cargo test -p reth-filter-maps --test it
 ```
