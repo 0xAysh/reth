@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description = "Mapping math for the FilterMaps local search index"
+description = "Value-space and mapping primitives for the FilterMaps local search index"
 
 [lints]
 workspace = true

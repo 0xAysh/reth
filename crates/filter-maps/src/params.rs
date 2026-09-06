@@ -3,18 +3,23 @@
 use alloy_primitives::B256;
 use sha2::{Digest, Sha256};
 
-/// The parameters of the filter map structure.
+/// A recognized valid parameter set for the filter map structure.
+///
+/// Callers currently select one of the exported constants rather than construct arbitrary field
+/// combinations. Future configuration or persistence should identify a recognized parameter set;
+/// it must not deserialize unchecked fields and treat [`validate`](Self::validate) as a complete
+/// checked constructor.
 ///
 /// Only the source fields are stored. Everything Geth caches in `deriveFields` — map height, maps
 /// per epoch, values per map, base row length — is recomputed by the `const fn` accessors below, so
 /// a `Params` value cannot be observed in a half-derived state.
 ///
 /// The mapping methods assume a sane parameter set, as Geth's do: `log_map_width` strictly greater
-/// than `log_values_per_map` and less than 32, and `log_maps_per_epoch` under 32. Both shipped sets
-/// satisfy this. Outside that range the shift widths go out of bounds, where Rust panics on debug
-/// assertions and Go would silently yield zero — a divergence from the oracle either way, so it is
-/// stated here rather than papered over. [`validate`](Self::validate) deliberately does not check
-/// it: it mirrors Geth's `sanitize` exactly.
+/// than `log_values_per_map` and less than 32, and `log_maps_per_epoch` under 32. Both recognized
+/// sets satisfy this. Outside that range the shift widths go out of bounds, where Rust panics on
+/// debug assertions and Go would silently yield zero — a divergence from the oracle either way.
+/// [`validate`](Self::validate) deliberately checks only the two conditions checked by Geth's
+/// `sanitize`; it does not make arbitrary parameter combinations supported.
 ///
 /// Fields are deliberately private: the derived values must stay formulas. Hardcoding
 /// [`base_row_length`](Self::base_row_length), in particular, is how a parameter set silently
@@ -90,7 +95,10 @@ impl Params {
         1 << self.log_maps_per_epoch
     }
 
-    /// The number of log values marked on each filter map.
+    /// The number of value-space slots covered by each filter map.
+    ///
+    /// Searchable values produce row marks; block delimiters and padding consume these slots
+    /// without producing marks.
     pub const fn values_per_map(&self) -> u64 {
         1 << self.log_values_per_map
     }
@@ -112,9 +120,11 @@ impl Params {
             as u32
     }
 
-    /// Validates the parameter set, mirroring the checks in Geth's `sanitize`.
+    /// Runs the two checks performed by Geth's `sanitize`.
     ///
-    /// Unlike `sanitize` this is pure — there are no derived fields to fill in.
+    /// Unlike `sanitize` this is pure — there are no derived fields to fill in. Passing these
+    /// checks does not make an arbitrary field combination a supported parameter set; callers
+    /// currently use the recognized exported constants.
     pub const fn validate(&self) -> Result<(), ParamsError> {
         if !self.log_map_width.is_multiple_of(8) {
             return Err(ParamsError::MapWidthNotMultipleOfEight(self.log_map_width))
@@ -238,9 +248,10 @@ pub const DEFAULT_PARAMS: Params = Params {
     log_layer_diff: 4,
 };
 
-/// A parameter set that puts one log value per epoch, giving block-exact tail unindexing in tests.
+/// The recognized range-test parameter set: one value-space slot per map and one map per epoch.
 ///
-/// The ratio of 16 is load-bearing rather than arbitrary: it holds `base_row_length` at
+/// This gives block-exact tail unindexing in tests. The ratio of 16 is load-bearing rather than
+/// arbitrary: it holds `base_row_length` at
 /// `1 * 16 / 16 = 1`. The mainnet ratio of 8 would floor this map's base row length to zero —
 /// rows that hold nothing, and therefore a dead index.
 pub const RANGE_TEST_PARAMS: Params = Params {
@@ -342,7 +353,7 @@ mod tests {
     /// Guards the row length progression against the stale progression published in EIP-7745,
     /// which differs from Geth's and would diverge the row layout from it.
     #[test]
-    fn max_row_length_doubles_per_layer_then_clamps() {
+    fn max_row_length_grows_by_the_configured_factor_then_clamps() {
         for params in [DEFAULT_PARAMS, RANGE_TEST_PARAMS] {
             // The first layer whose remap frequency has already reached once-per-map; growth stops
             // there because a shorter epoch cannot be subdivided further.
@@ -352,7 +363,7 @@ mod tests {
                 assert_eq!(
                     params.max_row_length(layer_index),
                     params.base_row_length() << (layer_index * params.log_layer_diff()),
-                    "layer {layer_index} grew off the doubling curve"
+                    "layer {layer_index} grew off the configured curve"
                 );
             }
             let clamped = params.base_row_length() << params.log_maps_per_epoch();

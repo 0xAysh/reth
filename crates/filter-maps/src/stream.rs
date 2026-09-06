@@ -187,7 +187,9 @@ impl<I: Iterator<Item = BlockInput>> LogValueStream<I> {
             lookahead
         };
 
-        // Validate all geometry first to retain error precedence over arithmetic in earlier logs.
+        // Validate every log's topic count and width before preflighting any slot arithmetic.
+        // Consequently, a geometry error in a later log takes precedence over an arithmetic error
+        // that an earlier, otherwise valid log would encounter.
         for (log_index, log) in block.logs.iter().enumerate() {
             if log.topics.len() > 4 {
                 return Err(LogValueStreamError::InvalidTopicCount {
@@ -433,14 +435,14 @@ impl ValueSpaceAnchor {
     }
 }
 
-/// One input block and its logs in canonical receipt order.
+/// One input block and its complete logs in canonical receipt order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockInput {
     /// Block number.
     pub number: u64,
     /// Block hash.
     pub hash: B256,
-    /// Complete logs flattened in receipt order and then log-within-receipt order.
+    /// Complete logs, ordered first by receipt and then by position within the receipt.
     pub logs: Vec<LogInput>,
 }
 
@@ -721,7 +723,7 @@ pub enum LogValueStreamError {
         log_index: usize,
         /// Number of slots required by the log's address and topics.
         log_width: u64,
-        /// Number of log value slots available in one map.
+        /// Number of value-space slots available in one map.
         values_per_map: u64,
     },
     /// The anchor points before padding required by its first log.

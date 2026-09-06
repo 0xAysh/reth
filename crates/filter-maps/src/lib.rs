@@ -9,8 +9,10 @@
 //!
 //! [`ValueSpaceVersion`] identifies the persisted semantic rules that assign absolute indices.
 //! [`LogValueStream`] implements [`GETH_V1`] directly, so callers do not select a version when
-//! constructing it. The version remains separate from [`Params`], which contains only the numerical
-//! dimensions used to map searchable values into rows and columns.
+//! constructing it. The version remains separate from [`Params`], which represents recognized
+//! valid numerical dimensions used to map searchable values into rows and columns. Callers
+//! currently select an exported parameter constant; arbitrary configured or persisted field
+//! combinations are not supported.
 //!
 //! The math is a port of go-ethereum's `core/filtermaps` package. Behavioral equivalence with Geth
 //! is the contract: the index is only interoperable with Geth-compatible tooling, and Geth is only
