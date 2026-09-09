@@ -31,11 +31,14 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+pub mod coverage;
 mod params;
 mod stream;
 mod value;
 
-pub use params::{Params, ParamsError, DEFAULT_PARAMS, RANGE_TEST_PARAMS};
+pub use params::{
+    Params, ParamsError, ParamsId, UnknownParamsId, DEFAULT_PARAMS, RANGE_TEST_PARAMS,
+};
 pub use stream::{
     BatchContinuation, BlockInput, BlockPointer, LogInput, LogValueKind, LogValueSlot,
     LogValueStream, LogValueStreamCompletion, LogValueStreamError, LogValueStreamEvent,
