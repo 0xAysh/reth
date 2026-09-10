@@ -184,9 +184,13 @@ mod tests {
     /// Blocks 0..=19 over maps 0..=1 and blocks 100..=129 over maps 10..=12.
     fn coverage() -> CoverageSet {
         let mut set = CoverageSet::new(identity());
-        set.open_segment(SegmentOrigin::Genesis, aligned(1, 20)).unwrap();
+        set.open_segment_batch(SegmentOrigin::Genesis, anchors_through(0, aligned(1, 20))).unwrap();
         let checkpoint = VerifiedCheckpoint::derived(identity(), aligned(9, 100));
-        set.open_segment(SegmentOrigin::Checkpoint(checkpoint), aligned(12, 130)).unwrap();
+        set.open_segment_batch(
+            SegmentOrigin::Checkpoint(checkpoint),
+            anchors_through(10, aligned(12, 130)),
+        )
+        .unwrap();
         set
     }
 

@@ -18,21 +18,30 @@ pub struct ValidatedSegment {
 }
 
 impl ValidatedSegment {
-    /// Creates a segment through its first published map.
+    /// Creates a segment from one completed-map anchor.
     pub fn new(
         identity: &IndexIdentity,
         origin: SegmentOrigin,
-        terminal: MapResumeAnchor,
+        anchor: MapResumeAnchor,
+    ) -> Result<Self, SegmentError> {
+        Self::new_batch(identity, origin, [anchor])
+    }
+
+    /// Creates a segment from all completed-map anchors in one publication.
+    pub fn new_batch(
+        identity: &IndexIdentity,
+        origin: SegmentOrigin,
+        anchors: impl IntoIterator<Item = MapResumeAnchor>,
     ) -> Result<Self, SegmentError> {
         if let SegmentOrigin::Checkpoint(checkpoint) = &origin {
-            identity.check_compatible(checkpoint.checkpoint().identity())?;
+            identity.check_compatible(checkpoint.identity())?;
         }
         let params = identity.params.params();
         let (start, first_map, first_block) = match origin.anchor() {
             None => (ValueSpaceAnchor::new(0, identity.genesis_hash, 0), 0, 0),
             Some(anchor) => resolve_start(anchor, &params)?,
         };
-        Self::build(*identity, origin, start, first_map, first_block, vec![terminal])
+        Self::build(*identity, origin, start, first_map, first_block, anchors.into_iter().collect())
     }
 
     fn build(
@@ -44,13 +53,24 @@ impl ValidatedSegment {
         anchors: Vec<MapResumeAnchor>,
     ) -> Result<Self, SegmentError> {
         let terminal = *anchors.last().ok_or(SegmentError::MissingTerminal)?;
-        let params = identity.params.params();
-        check_resume_order(&start, &terminal, &params)?;
         if terminal.completed_map_index < first_map {
             return Err(SegmentError::NoCompletedMap {
                 first_map,
                 terminal_map: terminal.completed_map_index,
             })
+        }
+        let params = identity.params.params();
+        check_map_sequence(first_map, &anchors)?;
+        let mut previous = start;
+        for anchor in &anchors {
+            if anchor.value_space_version != identity.value_space_version {
+                return Err(SegmentError::AnchorValueSpaceVersion {
+                    expected: identity.value_space_version,
+                    actual: anchor.value_space_version,
+                })
+            }
+            check_resume_order(&previous, anchor, &params)?;
+            previous = anchor.resume_anchor();
         }
         Ok(Self { identity, origin, start, first_map, first_block, anchors })
     }
@@ -73,6 +93,11 @@ impl ValidatedSegment {
     /// Returns the durable anchor from which construction continues.
     pub fn terminal(&self) -> MapResumeAnchor {
         *self.anchors.last().expect("validated segments have a terminal anchor")
+    }
+
+    /// Returns the canonical resume identity retained for every completed map.
+    pub fn anchors(&self) -> &[MapResumeAnchor] {
+        &self.anchors
     }
 
     /// Returns whether this segment published `anchor`.
@@ -106,15 +131,39 @@ impl ValidatedSegment {
         self.identity == next.identity && next.origin.anchor() == Some(self.terminal())
     }
 
-    /// Returns a segment extended through a later completed map.
-    pub fn extend(&self, terminal: MapResumeAnchor) -> Result<Self, SegmentError> {
+    /// Returns a segment extended through one completed-map anchor.
+    pub fn extend(&self, anchor: MapResumeAnchor) -> Result<Self, SegmentError> {
+        self.extend_batch([anchor])
+    }
+
+    /// Returns a segment extended through every supplied completed-map anchor.
+    pub fn extend_batch(
+        &self,
+        anchors: impl IntoIterator<Item = MapResumeAnchor>,
+    ) -> Result<Self, SegmentError> {
         let current = self.terminal();
+        let anchors: Vec<_> = anchors.into_iter().collect();
+        let Some(&terminal) = anchors.last() else { return Err(SegmentError::MissingTerminal) };
         if terminal.completed_map_index <= current.completed_map_index {
             return Err(SegmentError::TerminalNotLater { current, proposed: terminal })
         }
-        check_resume_order(&current.resume_anchor(), &terminal, &self.identity.params.params())?;
+        let first_map =
+            current.completed_map_index.checked_add(1).ok_or(SegmentError::MapIndexOverflow)?;
+        check_map_sequence(first_map, &anchors)?;
+        let params = self.identity.params.params();
+        let mut previous = current.resume_anchor();
+        for anchor in &anchors {
+            if anchor.value_space_version != self.identity.value_space_version {
+                return Err(SegmentError::AnchorValueSpaceVersion {
+                    expected: self.identity.value_space_version,
+                    actual: anchor.value_space_version,
+                })
+            }
+            check_resume_order(&previous, anchor, &params)?;
+            previous = anchor.resume_anchor();
+        }
         let mut extended = self.clone();
-        extended.anchors.push(terminal);
+        extended.anchors.extend(anchors);
         Ok(extended)
     }
 
@@ -218,6 +267,14 @@ pub enum SegmentError {
     /// A restored segment has no terminal anchor.
     #[error("segment has no terminal anchor")]
     MissingTerminal,
+    /// A map anchor was derived under different value-space rules.
+    #[error("map anchor value-space version {actual:?} does not match {expected:?}")]
+    AnchorValueSpaceVersion {
+        /// Version required by the segment identity.
+        expected: crate::ValueSpaceVersion,
+        /// Version carried by the map anchor.
+        actual: crate::ValueSpaceVersion,
+    },
     /// The terminal anchor does not complete any map after the origin.
     #[error("terminal map {terminal_map} precedes the segment's first map {first_map}")]
     NoCompletedMap {
@@ -251,6 +308,14 @@ pub enum SegmentError {
         /// The malformed anchor.
         anchor: MapResumeAnchor,
     },
+    /// A publication omitted a completed map's canonical resume anchor.
+    #[error("expected a resume anchor for map {expected}, found map {actual}")]
+    MissingMapAnchor {
+        /// Next completed map whose anchor was required.
+        expected: u32,
+        /// Map carried by the next supplied anchor.
+        actual: u32,
+    },
     /// An extension does not complete a later map.
     #[error("proposed terminal {proposed:?} is not later than {current:?}")]
     TerminalNotLater {
@@ -279,6 +344,22 @@ pub enum SegmentError {
     /// The first covered block after the origin does not fit in `u64`.
     #[error("block number overflow")]
     BlockNumberOverflow,
+}
+
+fn check_map_sequence(first_map: u32, anchors: &[MapResumeAnchor]) -> Result<(), SegmentError> {
+    let mut expected = first_map;
+    for (index, anchor) in anchors.iter().enumerate() {
+        if anchor.completed_map_index != expected {
+            return Err(SegmentError::MissingMapAnchor {
+                expected,
+                actual: anchor.completed_map_index,
+            })
+        }
+        if index + 1 < anchors.len() {
+            expected = expected.checked_add(1).ok_or(SegmentError::MapIndexOverflow)?;
+        }
+    }
+    Ok(())
 }
 
 /// Resolves the first rendered map and wholly covered block after `anchor`.
@@ -335,12 +416,20 @@ mod tests {
     use super::*;
     use crate::{coverage::test_utils::*, ParamsId};
 
+    fn segment_through(
+        identity: &IndexIdentity,
+        origin: SegmentOrigin,
+        terminal: MapResumeAnchor,
+    ) -> Result<ValidatedSegment, SegmentError> {
+        let first_map = origin.anchor().map_or(0, |anchor| anchor.completed_map_index + 1);
+        ValidatedSegment::new_batch(identity, origin, anchors_through(first_map, terminal))
+    }
+
     #[test]
     fn genesis_segment_covers_from_block_zero() {
         // Map 0 completes mid-block 5; blocks 0..=4 are whole.
         let segment =
-            ValidatedSegment::new(&identity(), SegmentOrigin::Genesis, anchor(0, 5, VPM - 10))
-                .unwrap();
+            segment_through(&identity(), SegmentOrigin::Genesis, anchor(0, 5, VPM - 10)).unwrap();
         assert_eq!(segment.start(), ValueSpaceAnchor::new(0, hash(0), 0));
         assert_eq!(segment.maps(), 0..=0);
         assert_eq!(segment.blocks(), Some(0..=4));
@@ -351,7 +440,7 @@ mod tests {
     #[test]
     fn map_completed_inside_the_first_block_publishes_no_coverage() {
         let segment =
-            ValidatedSegment::new(&identity(), SegmentOrigin::Genesis, anchor(0, 0, 0)).unwrap();
+            segment_through(&identity(), SegmentOrigin::Genesis, anchor(0, 0, 0)).unwrap();
         assert_eq!(segment.maps(), 0..=0);
         assert_eq!(segment.blocks(), None);
     }
@@ -360,8 +449,7 @@ mod tests {
     fn checkpoint_block_that_spans_the_boundary_is_excluded() {
         // Block 100 started inside map 9 and continues into map 10.
         let origin = checkpoint(anchor(9, 100, 10 * VPM - 3));
-        let segment =
-            ValidatedSegment::new(&identity(), origin, anchor(12, 140, 13 * VPM)).unwrap();
+        let segment = segment_through(&identity(), origin, anchor(12, 140, 13 * VPM)).unwrap();
         assert_eq!(segment.first_map(), 10);
         assert_eq!(segment.blocks(), Some(101..=139));
     }
@@ -369,8 +457,7 @@ mod tests {
     #[test]
     fn checkpoint_block_that_starts_at_the_boundary_is_included() {
         let origin = checkpoint(anchor(9, 100, 10 * VPM));
-        let segment =
-            ValidatedSegment::new(&identity(), origin, anchor(12, 140, 13 * VPM)).unwrap();
+        let segment = segment_through(&identity(), origin, anchor(12, 140, 13 * VPM)).unwrap();
         assert_eq!(segment.blocks(), Some(100..=139));
     }
 
@@ -378,7 +465,7 @@ mod tests {
     fn terminal_must_complete_a_map_after_the_origin() {
         let origin = checkpoint(anchor(9, 100, 10 * VPM));
         assert_eq!(
-            ValidatedSegment::new(&identity(), origin, anchor(9, 100, 10 * VPM)),
+            segment_through(&identity(), origin, anchor(9, 100, 10 * VPM)),
             Err(SegmentError::NoCompletedMap { first_map: 10, terminal_map: 9 })
         );
     }
@@ -386,7 +473,7 @@ mod tests {
     #[test]
     fn resume_pointer_cannot_move_backwards() {
         let origin = checkpoint(anchor(9, 100, 10 * VPM));
-        let err = ValidatedSegment::new(&identity(), origin, anchor(12, 99, 13 * VPM)).unwrap_err();
+        let err = segment_through(&identity(), origin, anchor(12, 99, 13 * VPM)).unwrap_err();
         assert!(matches!(err, SegmentError::ResumeMovesBackwards { .. }));
     }
 
@@ -394,17 +481,31 @@ mod tests {
     fn resume_pointer_cannot_lie_beyond_the_map_boundary() {
         let bad = anchor(12, 140, 13 * VPM + 1);
         assert_eq!(
-            ValidatedSegment::new(&identity(), SegmentOrigin::Genesis, bad),
+            segment_through(&identity(), SegmentOrigin::Genesis, bad),
             Err(SegmentError::ResumeBeyondMapBoundary { anchor: bad })
+        );
+    }
+
+    #[test]
+    fn every_completed_map_requires_a_resume_anchor() {
+        assert_eq!(
+            ValidatedSegment::new(&identity(), SegmentOrigin::Genesis, aligned(1, 20)),
+            Err(SegmentError::MissingMapAnchor { expected: 0, actual: 1 })
+        );
+
+        let segment =
+            ValidatedSegment::new(&identity(), SegmentOrigin::Genesis, aligned(0, 10)).unwrap();
+        assert_eq!(
+            segment.extend(aligned(2, 30)),
+            Err(SegmentError::MissingMapAnchor { expected: 1, actual: 2 })
         );
     }
 
     #[test]
     fn extension_moves_the_terminal_forward_only() {
         let segment =
-            ValidatedSegment::new(&identity(), SegmentOrigin::Genesis, anchor(0, 5, VPM - 10))
-                .unwrap();
-        let extended = segment.extend(anchor(3, 30, 4 * VPM)).unwrap();
+            segment_through(&identity(), SegmentOrigin::Genesis, anchor(0, 5, VPM - 10)).unwrap();
+        let extended = segment.extend_batch(anchors_through(1, anchor(3, 30, 4 * VPM))).unwrap();
         assert_eq!(extended.maps(), 0..=3);
         assert_eq!(extended.blocks(), Some(0..=29));
         assert!(matches!(
@@ -415,13 +516,10 @@ mod tests {
 
     #[test]
     fn merge_requires_exact_anchor_continuity() {
-        let left = ValidatedSegment::new(
-            &identity(),
-            SegmentOrigin::Genesis,
-            anchor(9, 100, 10 * VPM - 3),
-        )
-        .unwrap();
-        let right = ValidatedSegment::new(
+        let left =
+            segment_through(&identity(), SegmentOrigin::Genesis, anchor(9, 100, 10 * VPM - 3))
+                .unwrap();
+        let right = segment_through(
             &identity(),
             checkpoint(anchor(9, 100, 10 * VPM - 3)),
             anchor(12, 140, 13 * VPM),
@@ -435,7 +533,7 @@ mod tests {
         assert_eq!(merged.origin(), &SegmentOrigin::Genesis);
 
         // Same block, different pointer: not the same value space.
-        let mismatched = ValidatedSegment::new(
+        let mismatched = segment_through(
             &identity(),
             checkpoint(anchor(9, 100, 10 * VPM - 4)),
             anchor(12, 140, 13 * VPM),
@@ -448,9 +546,9 @@ mod tests {
     #[test]
     fn contraction_keeps_only_maps_through_the_anchor() {
         let published = anchor(2, 25, 3 * VPM - 1);
-        let segment = ValidatedSegment::new(&identity(), SegmentOrigin::Genesis, published)
+        let segment = segment_through(&identity(), SegmentOrigin::Genesis, published)
             .unwrap()
-            .extend(anchor(5, 60, 6 * VPM))
+            .extend_batch(anchors_through(3, anchor(5, 60, 6 * VPM)))
             .unwrap();
         let contracted = segment.contract_to(published).unwrap().unwrap();
         assert_eq!(contracted.maps(), 0..=2);
@@ -465,8 +563,7 @@ mod tests {
     #[test]
     fn contraction_rejects_an_anchor_that_claims_blocks_no_map_holds() {
         let segment =
-            ValidatedSegment::new(&identity(), SegmentOrigin::Genesis, anchor(5, 60, 6 * VPM))
-                .unwrap();
+            segment_through(&identity(), SegmentOrigin::Genesis, anchor(5, 60, 6 * VPM)).unwrap();
         // Map 2 cannot resume at an index in map 100.
         let beyond = anchor(2, 500, 100 * VPM);
         assert_eq!(
@@ -487,8 +584,12 @@ mod tests {
         let mut identity = identity();
         identity.params = ParamsId::RangeTest;
         // Five one-slot maps cannot hold 900 blocks.
-        let segment =
-            ValidatedSegment::new(&identity, SegmentOrigin::Genesis, anchor(3, 3, 4)).unwrap();
+        let segment = ValidatedSegment::new_batch(
+            &identity,
+            SegmentOrigin::Genesis,
+            [anchor(0, 0, 0), anchor(1, 0, 0), anchor(2, 0, 0), anchor(3, 3, 4)],
+        )
+        .unwrap();
         assert!(matches!(
             segment.extend(anchor(4, 900, 5)),
             Err(SegmentError::ImplausibleResume { .. })
@@ -500,8 +601,7 @@ mod tests {
     fn contracting_to_the_origin_removes_the_segment() {
         let origin = anchor(9, 100, 10 * VPM);
         let segment =
-            ValidatedSegment::new(&identity(), checkpoint(origin), anchor(12, 140, 13 * VPM))
-                .unwrap();
+            segment_through(&identity(), checkpoint(origin), anchor(12, 140, 13 * VPM)).unwrap();
         assert_eq!(segment.contract_to(origin), Ok(None));
         assert!(matches!(
             segment.contract_to(anchor(8, 90, 9 * VPM)),
@@ -512,9 +612,9 @@ mod tests {
     #[test]
     fn retention_moves_the_origin_to_a_retained_anchor() {
         let tail = anchor(2, 25, 3 * VPM - 1);
-        let segment = ValidatedSegment::new(&identity(), SegmentOrigin::Genesis, tail)
+        let segment = segment_through(&identity(), SegmentOrigin::Genesis, tail)
             .unwrap()
-            .extend(anchor(5, 60, 6 * VPM))
+            .extend_batch(anchors_through(3, anchor(5, 60, 6 * VPM)))
             .unwrap();
         let retained = segment.retain_after(tail).unwrap().unwrap();
         assert!(

@@ -74,13 +74,22 @@ impl CoverageSet {
             .collect()
     }
 
-    /// Publishes a new segment from a trusted origin.
+    /// Publishes a new segment from a trusted origin and one completed-map anchor.
     pub fn open_segment(
         &mut self,
         origin: SegmentOrigin,
-        terminal: MapResumeAnchor,
+        anchor: MapResumeAnchor,
     ) -> Result<(), PublishError> {
-        let segment = ValidatedSegment::new(&self.identity, origin, terminal)?;
+        self.open_segment_batch(origin, [anchor])
+    }
+
+    /// Publishes a new segment from a trusted origin and every completed-map anchor.
+    pub fn open_segment_batch(
+        &mut self,
+        origin: SegmentOrigin,
+        anchors: impl IntoIterator<Item = MapResumeAnchor>,
+    ) -> Result<(), PublishError> {
+        let segment = ValidatedSegment::new_batch(&self.identity, origin, anchors)?;
         self.insert(segment)
     }
 
@@ -96,18 +105,27 @@ impl CoverageSet {
         }
     }
 
-    /// Extends the segment ending at `from` through `to`.
+    /// Extends the segment ending at `from` through one completed-map anchor.
     pub fn extend(
         &mut self,
         from: MapResumeAnchor,
-        to: MapResumeAnchor,
+        anchor: MapResumeAnchor,
+    ) -> Result<(), PublishError> {
+        self.extend_batch(from, [anchor])
+    }
+
+    /// Extends the segment ending at `from` through every supplied completed-map anchor.
+    pub fn extend_batch(
+        &mut self,
+        from: MapResumeAnchor,
+        anchors: impl IntoIterator<Item = MapResumeAnchor>,
     ) -> Result<(), PublishError> {
         let index = self
             .segments
             .iter()
             .position(|segment| segment.terminal() == from)
             .ok_or(PublishError::UnknownAnchor { anchor: from })?;
-        let extended = self.segments[index].extend(to)?;
+        let extended = self.segments[index].extend_batch(anchors)?;
         if let Some(next) = self.segments.get(index + 1) {
             check_adjacent(&extended, next)?;
         }
@@ -347,18 +365,44 @@ mod tests {
         set.segments().iter().map(ValidatedSegment::blocks).collect()
     }
 
+    fn open_through(
+        set: &mut CoverageSet,
+        origin: SegmentOrigin,
+        terminal: MapResumeAnchor,
+    ) -> Result<(), PublishError> {
+        let first_map = origin.anchor().map_or(0, |anchor| anchor.completed_map_index + 1);
+        set.open_segment_batch(origin, anchors_through(first_map, terminal))
+    }
+
+    fn extend_through(
+        set: &mut CoverageSet,
+        from: MapResumeAnchor,
+        to: MapResumeAnchor,
+    ) -> Result<(), PublishError> {
+        set.extend_batch(from, anchors_through(from.completed_map_index + 1, to))
+    }
+
+    fn segment_through(
+        identity: &IndexIdentity,
+        origin: SegmentOrigin,
+        terminal: MapResumeAnchor,
+    ) -> Result<ValidatedSegment, SegmentError> {
+        let first_map = origin.anchor().map_or(0, |anchor| anchor.completed_map_index + 1);
+        ValidatedSegment::new_batch(identity, origin, anchors_through(first_map, terminal))
+    }
+
     #[test]
     fn genesis_segment_grows_through_its_terminal_only() {
         let mut set = CoverageSet::new(identity());
-        set.open_segment(SegmentOrigin::Genesis, aligned(0, 10)).unwrap();
+        open_through(&mut set, SegmentOrigin::Genesis, aligned(0, 10)).unwrap();
         assert_eq!(blocks(&set), vec![Some(0..=9)]);
 
-        set.extend(aligned(0, 10), aligned(3, 40)).unwrap();
+        extend_through(&mut set, aligned(0, 10), aligned(3, 40)).unwrap();
         assert_eq!(blocks(&set), vec![Some(0..=39)]);
 
         // Progress must name the current terminal exactly.
         assert_eq!(
-            set.extend(aligned(0, 10), aligned(5, 60)),
+            extend_through(&mut set, aligned(0, 10), aligned(5, 60)),
             Err(PublishError::UnknownAnchor { anchor: aligned(0, 10) })
         );
         assert_eq!(blocks(&set), vec![Some(0..=39)]);
@@ -367,8 +411,8 @@ mod tests {
     #[test]
     fn disjoint_checkpoint_segments_remain_independent() {
         let mut set = CoverageSet::new(identity());
-        set.open_segment(SegmentOrigin::Genesis, aligned(1, 20)).unwrap();
-        set.open_segment(checkpoint(aligned(9, 100)), aligned(12, 130)).unwrap();
+        open_through(&mut set, SegmentOrigin::Genesis, aligned(1, 20)).unwrap();
+        open_through(&mut set, checkpoint(aligned(9, 100)), aligned(12, 130)).unwrap();
         assert_eq!(blocks(&set), vec![Some(0..=19), Some(100..=129)]);
         assert!(set.covers(19));
         assert!(!set.covers(20));
@@ -387,26 +431,26 @@ mod tests {
     fn adjacent_segments_merge_only_under_exact_anchor_continuity() {
         let join = anchor(9, 100, 10 * VPM - 5);
         let mut set = CoverageSet::new(identity());
-        set.open_segment(SegmentOrigin::Genesis, aligned(1, 20)).unwrap();
-        set.open_segment(checkpoint(join), aligned(12, 130)).unwrap();
+        open_through(&mut set, SegmentOrigin::Genesis, aligned(1, 20)).unwrap();
+        open_through(&mut set, checkpoint(join), aligned(12, 130)).unwrap();
         // Block 100 straddles the join and is not yet covered by either side.
         assert_eq!(blocks(&set), vec![Some(0..=19), Some(101..=129)]);
 
         // Reaching map 9 with a different resume pointer is an integrity fault, not a merge.
         let wrong = anchor(9, 100, 10 * VPM - 6);
         assert_eq!(
-            set.extend(aligned(1, 20), wrong),
+            extend_through(&mut set, aligned(1, 20), wrong),
             Err(PublishError::ContinuityMismatch { expected: wrong, actual: Some(join) })
         );
         assert_eq!(set.segments().len(), 2);
 
         // Reaching into the checkpoint's maps is an overlap.
         assert_eq!(
-            set.extend(aligned(1, 20), aligned(10, 105)),
+            extend_through(&mut set, aligned(1, 20), aligned(10, 105)),
             Err(PublishError::BlockOverlap { left_end: 104, right_start: 101 })
         );
 
-        set.extend(aligned(1, 20), join).unwrap();
+        extend_through(&mut set, aligned(1, 20), join).unwrap();
         assert_eq!(blocks(&set), vec![Some(0..=129)]);
         assert_eq!(set.segments()[0].origin(), &SegmentOrigin::Genesis);
         assert!(set.covers(100));
@@ -415,21 +459,21 @@ mod tests {
     #[test]
     fn a_new_segment_merges_into_the_one_it_continues() {
         let mut set = CoverageSet::new(identity());
-        set.open_segment(SegmentOrigin::Genesis, aligned(1, 20)).unwrap();
-        set.open_segment(checkpoint(aligned(1, 20)), aligned(4, 50)).unwrap();
+        open_through(&mut set, SegmentOrigin::Genesis, aligned(1, 20)).unwrap();
+        open_through(&mut set, checkpoint(aligned(1, 20)), aligned(4, 50)).unwrap();
         assert_eq!(blocks(&set), vec![Some(0..=49)]);
     }
 
     #[test]
     fn overlapping_publication_is_rejected() {
         let mut set = CoverageSet::new(identity());
-        set.open_segment(SegmentOrigin::Genesis, aligned(5, 60)).unwrap();
+        open_through(&mut set, SegmentOrigin::Genesis, aligned(5, 60)).unwrap();
         assert!(matches!(
-            set.open_segment(checkpoint(aligned(2, 30)), aligned(8, 90)),
+            open_through(&mut set, checkpoint(aligned(2, 30)), aligned(8, 90)),
             Err(PublishError::BlockOverlap { .. })
         ));
         assert!(matches!(
-            set.open_segment(SegmentOrigin::Genesis, aligned(1, 10)),
+            open_through(&mut set, SegmentOrigin::Genesis, aligned(1, 10)),
             Err(PublishError::BlockOverlap { .. })
         ));
         assert_eq!(set.segments().len(), 1);
@@ -442,7 +486,7 @@ mod tests {
         other.chain_id = 2;
         let foreign = VerifiedCheckpoint::derived(other, aligned(9, 100));
         assert!(matches!(
-            set.open_segment(SegmentOrigin::Checkpoint(foreign), aligned(12, 130)),
+            open_through(&mut set, SegmentOrigin::Checkpoint(foreign), aligned(12, 130)),
             Err(PublishError::Segment(SegmentError::Identity(_)))
         ));
 
@@ -450,7 +494,7 @@ mod tests {
         other.params = ParamsId::RangeTest;
         let foreign = VerifiedCheckpoint::derived(other, aligned(9, 100));
         assert!(matches!(
-            set.open_segment(SegmentOrigin::Checkpoint(foreign), aligned(12, 130)),
+            open_through(&mut set, SegmentOrigin::Checkpoint(foreign), aligned(12, 130)),
             Err(PublishError::Segment(SegmentError::Identity(_)))
         ));
     }
@@ -459,8 +503,8 @@ mod tests {
     fn reorg_contracts_to_the_preceding_safe_anchor() {
         let mut set = CoverageSet::new(identity());
         let safe = aligned(2, 30);
-        set.open_segment(SegmentOrigin::Genesis, safe).unwrap();
-        set.extend(safe, aligned(5, 60)).unwrap();
+        open_through(&mut set, SegmentOrigin::Genesis, safe).unwrap();
+        extend_through(&mut set, safe, aligned(5, 60)).unwrap();
 
         // Block 33 lives in map 3; the anchor of map 2 excludes it.
         let outcome = set.contract_for_reorg(33, Some(safe)).unwrap();
@@ -474,7 +518,7 @@ mod tests {
     #[test]
     fn reorg_rejects_an_anchor_whose_map_holds_the_changed_block() {
         let mut set = CoverageSet::new(identity());
-        set.open_segment(SegmentOrigin::Genesis, aligned(5, 60)).unwrap();
+        open_through(&mut set, SegmentOrigin::Genesis, aligned(5, 60)).unwrap();
         let before = set.clone();
 
         // Block 33 started inside map 3, so map 3's anchor is not safe for a change at 33.
@@ -487,7 +531,7 @@ mod tests {
 
         // Plausible values do not establish that an anchor was published.
         assert!(matches!(
-            set.contract_for_reorg(33, Some(aligned(2, 30))),
+            set.contract_for_reorg(33, Some(anchor(2, 30, 3 * VPM - 1))),
             Err(ContractionError::Segment(SegmentError::AnchorOutsideSegment { .. }))
         ));
         assert_eq!(set, before);
@@ -496,7 +540,7 @@ mod tests {
     #[test]
     fn reorg_without_a_safe_anchor_disables_the_segment() {
         let mut set = CoverageSet::new(identity());
-        set.open_segment(SegmentOrigin::Genesis, aligned(5, 60)).unwrap();
+        open_through(&mut set, SegmentOrigin::Genesis, aligned(5, 60)).unwrap();
         let outcome = set.contract_for_reorg(33, None).unwrap();
         assert_eq!(outcome.rebuild_from, None);
         assert_eq!(outcome.disabled.len(), 1);
@@ -506,12 +550,12 @@ mod tests {
     #[test]
     fn reorg_disables_segments_that_lie_beyond_the_change_and_keeps_earlier_ones() {
         let mut set = CoverageSet::new(identity());
-        set.open_segment(SegmentOrigin::Genesis, aligned(1, 20)).unwrap();
+        open_through(&mut set, SegmentOrigin::Genesis, aligned(1, 20)).unwrap();
         let second_origin = aligned(9, 100);
         let safe = aligned(10, 110);
-        set.open_segment(checkpoint(second_origin), safe).unwrap();
-        set.extend(safe, aligned(12, 130)).unwrap();
-        set.open_segment(checkpoint(aligned(20, 200)), aligned(22, 220)).unwrap();
+        open_through(&mut set, checkpoint(second_origin), safe).unwrap();
+        extend_through(&mut set, safe, aligned(12, 130)).unwrap();
+        open_through(&mut set, checkpoint(aligned(20, 200)), aligned(22, 220)).unwrap();
 
         let outcome = set.contract_for_reorg(115, Some(safe)).unwrap();
         assert_eq!(outcome.rebuild_from, Some(safe));
@@ -523,7 +567,7 @@ mod tests {
     fn reorg_at_a_checkpoint_segment_origin_removes_it_and_keeps_the_origin() {
         let origin = aligned(9, 100);
         let mut set = CoverageSet::new(identity());
-        set.open_segment(checkpoint(origin), aligned(12, 130)).unwrap();
+        open_through(&mut set, checkpoint(origin), aligned(12, 130)).unwrap();
         let outcome = set.contract_for_reorg(105, Some(origin)).unwrap();
         assert_eq!(outcome.rebuild_from, Some(origin));
         assert_eq!(outcome.disabled.len(), 1);
@@ -534,9 +578,9 @@ mod tests {
     fn retention_contraction_immediately_removes_visibility() {
         let mut set = CoverageSet::new(identity());
         let tail = anchor(2, 30, 3 * VPM - 1);
-        set.open_segment(SegmentOrigin::Genesis, tail).unwrap();
-        set.extend(tail, aligned(5, 60)).unwrap();
-        set.open_segment(checkpoint(aligned(9, 100)), aligned(12, 130)).unwrap();
+        open_through(&mut set, SegmentOrigin::Genesis, tail).unwrap();
+        extend_through(&mut set, tail, aligned(5, 60)).unwrap();
+        open_through(&mut set, checkpoint(aligned(9, 100)), aligned(12, 130)).unwrap();
 
         set.retain_after(tail).unwrap();
         assert!(!set.covers(29));
@@ -554,11 +598,11 @@ mod tests {
     #[test]
     fn retention_rejects_an_anchor_the_set_did_not_publish() {
         let mut set = CoverageSet::new(identity());
-        set.open_segment(SegmentOrigin::Genesis, aligned(1, 20)).unwrap();
-        set.open_segment(checkpoint(aligned(9, 100)), aligned(12, 130)).unwrap();
+        open_through(&mut set, SegmentOrigin::Genesis, aligned(1, 20)).unwrap();
+        open_through(&mut set, checkpoint(aligned(9, 100)), aligned(12, 130)).unwrap();
         let before = set.clone();
 
-        for tail in [aligned(0, 10), aligned(5, 60)] {
+        for tail in [anchor(0, 10, VPM - 1), aligned(5, 60)] {
             assert_eq!(
                 set.retain_after(tail),
                 Err(ContractionError::Segment(SegmentError::AnchorOutsideSegment { anchor: tail }))
@@ -573,7 +617,7 @@ mod tests {
         use alloy_eips::BlockNumHash;
 
         let mut set = CoverageSet::new(identity());
-        set.open_segment(SegmentOrigin::Genesis, aligned(5, 60)).unwrap();
+        open_through(&mut set, SegmentOrigin::Genesis, aligned(5, 60)).unwrap();
 
         // Block 60 retained only selected receipts: construction stops before releasing it, so
         // the segment ends at the last safely publishable map.
@@ -596,7 +640,7 @@ mod tests {
 
         // A recognized checkpoint may originate a separate segment, which stays independent of
         // the segment before the hole.
-        set.open_segment(checkpoint(aligned(9, 100)), aligned(12, 130)).unwrap();
+        open_through(&mut set, checkpoint(aligned(9, 100)), aligned(12, 130)).unwrap();
         assert_eq!(blocks(&set), vec![Some(0..=59), Some(100..=129)]);
         assert!(!set.covers(60));
         assert!(!set.covers(99));
@@ -606,8 +650,12 @@ mod tests {
     fn restore_fails_closed_on_identity_mismatch() {
         let mut stored = identity();
         stored.params = ParamsId::RangeTest;
-        let segment =
-            ValidatedSegment::new(&stored, SegmentOrigin::Genesis, anchor(3, 3, 4)).unwrap();
+        let segment = ValidatedSegment::new_batch(
+            &stored,
+            SegmentOrigin::Genesis,
+            [anchor(0, 0, 0), anchor(1, 0, 0), anchor(2, 0, 0), anchor(3, 3, 4)],
+        )
+        .unwrap();
         assert!(matches!(
             CoverageSet::restore(&identity(), stored, [segment]),
             Err(RestoreError::Identity(IdentityMismatch::Params { .. }))
@@ -616,10 +664,9 @@ mod tests {
 
     #[test]
     fn restore_rejects_overlapping_stored_segments() {
-        let first =
-            ValidatedSegment::new(&identity(), SegmentOrigin::Genesis, aligned(5, 60)).unwrap();
+        let first = segment_through(&identity(), SegmentOrigin::Genesis, aligned(5, 60)).unwrap();
         let second =
-            ValidatedSegment::new(&identity(), checkpoint(aligned(3, 40)), aligned(8, 90)).unwrap();
+            segment_through(&identity(), checkpoint(aligned(3, 40)), aligned(8, 90)).unwrap();
         assert!(matches!(
             CoverageSet::restore(&identity(), identity(), [first, second]),
             Err(RestoreError::Corrupt(PublishError::BlockOverlap { .. }))
@@ -630,8 +677,7 @@ mod tests {
     fn restore_rejects_a_segment_built_under_another_identity() {
         let mut foreign = identity();
         foreign.genesis_hash = hash(99);
-        let segment =
-            ValidatedSegment::new(&foreign, SegmentOrigin::Genesis, aligned(5, 60)).unwrap();
+        let segment = segment_through(&foreign, SegmentOrigin::Genesis, aligned(5, 60)).unwrap();
         assert!(matches!(
             CoverageSet::restore(&identity(), identity(), [segment]),
             Err(RestoreError::Corrupt(PublishError::Identity(_)))
@@ -640,11 +686,9 @@ mod tests {
 
     #[test]
     fn restore_rejects_block_overlap_even_when_maps_are_disjoint() {
-        let first =
-            ValidatedSegment::new(&identity(), SegmentOrigin::Genesis, aligned(1, 100)).unwrap();
+        let first = segment_through(&identity(), SegmentOrigin::Genesis, aligned(1, 100)).unwrap();
         let second =
-            ValidatedSegment::new(&identity(), checkpoint(aligned(9, 50)), aligned(12, 130))
-                .unwrap();
+            segment_through(&identity(), checkpoint(aligned(9, 50)), aligned(12, 130)).unwrap();
         assert!(matches!(
             CoverageSet::restore(&identity(), identity(), [first, second]),
             Err(RestoreError::Corrupt(PublishError::BlockOverlap { .. }))
@@ -654,9 +698,8 @@ mod tests {
     #[test]
     fn restore_orders_and_merges_stored_segments() {
         let later =
-            ValidatedSegment::new(&identity(), checkpoint(aligned(5, 60)), aligned(8, 90)).unwrap();
-        let earlier =
-            ValidatedSegment::new(&identity(), SegmentOrigin::Genesis, aligned(5, 60)).unwrap();
+            segment_through(&identity(), checkpoint(aligned(5, 60)), aligned(8, 90)).unwrap();
+        let earlier = segment_through(&identity(), SegmentOrigin::Genesis, aligned(5, 60)).unwrap();
         let set = CoverageSet::restore(&identity(), identity(), [later, earlier]).unwrap();
         assert_eq!(blocks(&set), vec![Some(0..=89)]);
     }

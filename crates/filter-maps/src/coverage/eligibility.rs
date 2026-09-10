@@ -65,20 +65,30 @@ impl BlockReceiptEvidence {
         Ok(())
     }
 
-    const fn reject(&self, reason: IneligibilityReason) -> Result<(), IneligibleBlock> {
+    const fn reject<T>(&self, reason: IneligibilityReason) -> Result<T, IneligibleBlock> {
         Err(IneligibleBlock { block: self.block, reason })
     }
 
-    /// Releases the block's complete logs as stream input, or nothing at all.
+    /// Releases the block's receipt-grouped logs as stream input, or nothing at all.
     ///
-    /// `logs` must be every log of every receipt, ordered first by receipt and then by position
-    /// within the receipt. The adapter must not call this with a subset.
-    pub fn release(
-        self,
-        logs: impl IntoIterator<Item = LogInput>,
-    ) -> Result<BlockInput, IneligibleBlock> {
+    /// Receipt and log iteration order becomes canonical stream order. The accepted receipt
+    /// provider remains responsible for supplying every log within each receipt; the grouping lets
+    /// this boundary independently enforce that exactly one receipt was supplied per transaction.
+    pub fn release<R, L>(self, receipts: R) -> Result<BlockInput, IneligibleBlock>
+    where
+        R: IntoIterator<Item = L>,
+        L: IntoIterator<Item = LogInput>,
+    {
         self.check()?;
-        Ok(BlockInput::new(self.block.number, self.block.hash, logs))
+        let expected = self.receipt_count.unwrap_or_default();
+        let mut actual = 0u64;
+        let logs = receipts.into_iter().inspect(|_| actual += 1).flatten();
+        let block = BlockInput::new(self.block.number, self.block.hash, logs);
+        if actual != expected {
+            return self
+                .reject(IneligibilityReason::ReleasedReceiptCountMismatch { expected, actual })
+        }
+        Ok(block)
     }
 }
 
@@ -113,6 +123,14 @@ pub enum IneligibilityReason {
     /// The provider returned no receipts for a block that has transactions.
     #[error("receipts are unavailable")]
     ReceiptsUnavailable,
+    /// Released receipt groups do not match the count established by the provider.
+    #[error("released {actual} receipt groups, expected {expected}")]
+    ReleasedReceiptCountMismatch {
+        /// Receipt count established by eligibility evidence.
+        expected: u64,
+        /// Receipt groups supplied for release.
+        actual: u64,
+    },
     /// The receipt count does not match the body's transaction count.
     #[error("{receipts} receipts do not match {transactions} transactions")]
     ReceiptCountMismatch {
@@ -162,6 +180,19 @@ mod tests {
     }
 
     #[test]
+    fn release_rechecks_the_number_of_receipt_groups() {
+        let receipt = [LogInput::new(Address::ZERO, [])];
+        assert_eq!(
+            complete(0).release([receipt]).unwrap_err().reason,
+            IneligibilityReason::ReleasedReceiptCountMismatch { expected: 0, actual: 1 }
+        );
+        assert_eq!(
+            complete(1).release(std::iter::empty::<[LogInput; 0]>()).unwrap_err().reason,
+            IneligibilityReason::ReleasedReceiptCountMismatch { expected: 1, actual: 0 }
+        );
+    }
+
+    #[test]
     fn ambiguous_empty_result_remains_unavailable() {
         let mut evidence = complete(3);
         evidence.receipt_count = None;
@@ -176,7 +207,7 @@ mod tests {
             reason(evidence),
             IneligibilityReason::ReceiptCountMismatch { transactions: 3, receipts: 2 }
         );
-        assert!(evidence.release([LogInput::new(Address::ZERO, [])]).is_err());
+        assert!(evidence.release([[LogInput::new(Address::ZERO, [])]]).is_err());
     }
 
     #[test]
@@ -214,7 +245,7 @@ mod tests {
     #[test]
     fn release_produces_the_whole_block() {
         let logs = [LogInput::new(Address::repeat_byte(1), [B256::repeat_byte(2)])];
-        let input = complete(1).release(logs.clone()).unwrap();
+        let input = complete(1).release([logs.clone()]).unwrap();
         assert_eq!(input, BlockInput::new(7, B256::repeat_byte(7), logs));
     }
 }

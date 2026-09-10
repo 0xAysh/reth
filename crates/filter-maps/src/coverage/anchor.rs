@@ -1,6 +1,9 @@
 //! Durable map and value-space anchors.
 
-use crate::{coverage::IndexIdentity, BlockPointer, MapBoundary, Params, ValueSpaceAnchor};
+use crate::{
+    coverage::IndexIdentity, BlockPointer, MapBoundary, Params, ValueSpaceAnchor,
+    ValueSpaceVersion, GETH_V1,
+};
 
 /// Durable restart metadata for one completed filter map.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -9,6 +12,8 @@ pub struct MapResumeAnchor {
     pub completed_map_index: u32,
     /// Canonical block from which construction resumes.
     pub pointer: BlockPointer,
+    /// Semantic rules under which the numerical pointer was derived.
+    pub value_space_version: ValueSpaceVersion,
 }
 
 impl MapResumeAnchor {
@@ -17,12 +22,21 @@ impl MapResumeAnchor {
         boundary: MapBoundary,
         pointer: BlockPointer,
     ) -> Result<Self, ResumeAnchorMismatch> {
+        Self::new_versioned(boundary, pointer, GETH_V1)
+    }
+
+    /// Pairs a boundary and pointer under an explicit value-space version.
+    pub const fn new_versioned(
+        boundary: MapBoundary,
+        pointer: BlockPointer,
+        value_space_version: ValueSpaceVersion,
+    ) -> Result<Self, ResumeAnchorMismatch> {
         if boundary.resume_block_number != pointer.block_number ||
             !boundary.resume_block_hash.const_eq(&pointer.block_hash)
         {
             return Err(ResumeAnchorMismatch { boundary, pointer })
         }
-        Ok(Self { completed_map_index: boundary.completed_map_index, pointer })
+        Ok(Self { completed_map_index: boundary.completed_map_index, pointer, value_space_version })
     }
 
     /// Returns the anchor at which streaming resumes.
@@ -76,11 +90,16 @@ pub struct ResumeAnchorMismatch {
 pub struct ValueSpaceCheckpoint {
     identity: IndexIdentity,
     anchor: MapResumeAnchor,
+    provenance: CheckpointProvenance,
 }
 
 impl ValueSpaceCheckpoint {
-    pub(super) const fn new(identity: IndexIdentity, anchor: MapResumeAnchor) -> Self {
-        Self { identity, anchor }
+    pub(super) const fn new(
+        identity: IndexIdentity,
+        anchor: MapResumeAnchor,
+        provenance: CheckpointProvenance,
+    ) -> Self {
+        Self { identity, anchor, provenance }
     }
 
     /// Returns the identity under which the checkpoint was derived.
@@ -92,6 +111,28 @@ impl ValueSpaceCheckpoint {
     pub const fn anchor(&self) -> MapResumeAnchor {
         self.anchor
     }
+
+    /// Returns how the checkpoint's numerical pointer acquired trust.
+    pub const fn provenance(&self) -> CheckpointProvenance {
+        self.provenance
+    }
+}
+
+/// Durable provenance for a checkpoint's numerical pointer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CheckpointProvenance {
+    /// Produced from complete history already published by this node.
+    PublishedCoverage,
+    /// Shipped or otherwise recognized by a checkpoint registry.
+    Recognized {
+        /// Stable identifier interpreted by the registry that supplied the checkpoint.
+        id: u64,
+    },
+    /// Independently derived by counting forward from an already trusted predecessor.
+    DerivedFrom {
+        /// Trusted predecessor used for the derivation.
+        predecessor: MapResumeAnchor,
+    },
 }
 
 /// A trusted, canonical checkpoint that may originate a validated segment.
@@ -100,7 +141,21 @@ pub struct VerifiedCheckpoint(ValueSpaceCheckpoint);
 
 impl VerifiedCheckpoint {
     pub(super) const fn derived(identity: IndexIdentity, anchor: MapResumeAnchor) -> Self {
-        Self(ValueSpaceCheckpoint::new(identity, anchor))
+        Self(ValueSpaceCheckpoint::new(identity, anchor, CheckpointProvenance::PublishedCoverage))
+    }
+
+    #[cfg(test)]
+    pub(super) const fn recognized(
+        identity: IndexIdentity,
+        anchor: MapResumeAnchor,
+        id: u64,
+    ) -> Self {
+        Self(ValueSpaceCheckpoint::new(identity, anchor, CheckpointProvenance::Recognized { id }))
+    }
+
+    /// Returns the identity under which this checkpoint was verified.
+    pub const fn identity(&self) -> &IndexIdentity {
+        self.0.identity()
     }
 
     /// Returns the checkpoint record.
@@ -117,7 +172,9 @@ impl VerifiedCheckpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ParamsId, DEFAULT_PARAMS, GETH_V1, RANGE_TEST_PARAMS};
+    use crate::{
+        coverage::STORAGE_FORMAT_V1, ParamsId, DEFAULT_PARAMS, GETH_V1, RANGE_TEST_PARAMS,
+    };
     use alloy_primitives::B256;
 
     fn hash(byte: u8) -> B256 {
@@ -125,7 +182,7 @@ mod tests {
     }
 
     fn identity() -> IndexIdentity {
-        IndexIdentity::new(1, hash(0xd4), GETH_V1, ParamsId::Default)
+        IndexIdentity::new(STORAGE_FORMAT_V1, 1, hash(0xd4), GETH_V1, ParamsId::Default)
     }
 
     fn checkpoint() -> ValueSpaceCheckpoint {
@@ -134,7 +191,7 @@ mod tests {
             BlockPointer::new(1000, hash(0x10), 123_456),
         )
         .unwrap();
-        ValueSpaceCheckpoint::new(identity(), anchor)
+        ValueSpaceCheckpoint::new(identity(), anchor, CheckpointProvenance::Recognized { id: 7 })
     }
 
     #[test]
@@ -201,6 +258,7 @@ mod tests {
     fn checkpoint_binds_identity_and_anchor() {
         let checkpoint = checkpoint();
         assert_eq!(checkpoint.identity(), &identity());
+        assert_eq!(checkpoint.provenance(), CheckpointProvenance::Recognized { id: 7 });
         assert_eq!(
             checkpoint.anchor().resume_anchor(),
             ValueSpaceAnchor::new(1000, hash(0x10), 123_456)

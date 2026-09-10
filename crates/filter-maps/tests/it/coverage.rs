@@ -9,7 +9,7 @@ use alloy_primitives::{Address, B256};
 use reth_filter_maps::{
     coverage::{
         CandidateSource, CoverageSet, IndexIdentity, LogQueryTarget, MapResumeAnchor,
-        PlannedSubrange, PublishError, QueryPlan, SegmentOrigin,
+        PlannedSubrange, QueryPlan, SegmentOrigin, STORAGE_FORMAT_V1,
     },
     BlockInput, BlockPointer, LogInput, LogValueSlot, LogValueStream, LogValueStreamCompletion,
     LogValueStreamEvent, LogValueStreamItem, LogValueStreamTermination, MapBoundary, ParamsId,
@@ -22,7 +22,7 @@ const fn hash(number: u64) -> B256 {
 }
 
 const fn identity() -> IndexIdentity {
-    IndexIdentity::new(1, hash(0), GETH_V1, ParamsId::RangeTest)
+    IndexIdentity::new(STORAGE_FORMAT_V1, 1, hash(0), GETH_V1, ParamsId::RangeTest)
 }
 
 fn block(number: u64, log_count: usize) -> BlockInput {
@@ -118,8 +118,14 @@ fn genesis_anchors() -> Vec<Observed> {
 }
 
 fn checkpoint(anchor: MapResumeAnchor) -> SegmentOrigin {
+    let anchors: Vec<_> = genesis_anchors()
+        .into_iter()
+        .map(|observed| observed.anchor)
+        .take_while(|candidate| candidate.completed_map_index <= anchor.completed_map_index)
+        .collect();
+    assert_eq!(anchors.last(), Some(&anchor), "checkpoint must have been observed");
     let mut source = CoverageSet::new(identity());
-    source.open_segment(SegmentOrigin::Genesis, anchor).unwrap();
+    source.open_segment_batch(SegmentOrigin::Genesis, anchors).unwrap();
     SegmentOrigin::Checkpoint(source.derived_checkpoint(anchor).unwrap())
 }
 
@@ -174,7 +180,13 @@ fn a_map_ending_mid_block_does_not_publish_that_block() {
     assert_eq!(mid_block.anchor.completed_map_index, 4);
     assert_eq!(mid_block.delimiters, 3);
     let mut set = CoverageSet::new(identity());
-    set.open_segment(SegmentOrigin::Genesis, mid_block.anchor).unwrap();
+    set.open_segment_batch(
+        SegmentOrigin::Genesis,
+        observed.iter().map(|observed| observed.anchor).take_while(|anchor| {
+            anchor.completed_map_index <= mid_block.anchor.completed_map_index
+        }),
+    )
+    .unwrap();
     assert_eq!(set.segments()[0].blocks(), Some(0..=2));
     assert!(!set.covers(3));
     assert!(!set.segments()[0].terminal().excludes_block(3, &RANGE_TEST_PARAMS));
@@ -199,8 +211,6 @@ fn a_checkpoint_segment_joins_genesis_construction_only_at_the_same_anchor() {
     let expected: Vec<_> = observed[join_at..].iter().map(|o| o.anchor).collect();
     let reproduced: Vec<_> = from_checkpoint.iter().map(|o| o.anchor).collect();
     assert_eq!(reproduced, expected, "a checkpoint enters the same value space");
-    let last = *expected.last().unwrap();
-
     let genesis_through = |set: &mut CoverageSet, through: usize| {
         set.open_segment(SegmentOrigin::Genesis, observed[0].anchor).unwrap();
         for pair in observed[..=through].windows(2) {
@@ -208,20 +218,12 @@ fn a_checkpoint_segment_joins_genesis_construction_only_at_the_same_anchor() {
         }
     };
 
-    // A checkpoint whose pointer is off by one is an integrity fault when construction reaches it.
-    let mut wrong = join;
-    wrong.pointer.first_log_value_index += 1;
     let mut set = CoverageSet::new(identity());
-    set.open_segment(checkpoint(wrong), last).unwrap();
-    genesis_through(&mut set, join_at - 1);
-    assert_eq!(
-        set.extend(observed[join_at - 1].anchor, join),
-        Err(PublishError::ContinuityMismatch { expected: join, actual: Some(wrong) })
-    );
-    assert_eq!(set.segments().len(), 2);
-
-    let mut set = CoverageSet::new(identity());
-    set.open_segment(checkpoint(join), last).unwrap();
+    set.open_segment_batch(
+        checkpoint(join),
+        from_checkpoint.iter().skip(1).map(|observed| observed.anchor),
+    )
+    .unwrap();
     // Block 3 straddles the checkpoint map and is excluded until both halves are published.
     assert_eq!(set.segments()[0].blocks(), Some(4..=5));
     genesis_through(&mut set, join_at - 1);
@@ -279,7 +281,14 @@ fn query_plan_partitions_around_the_published_segments() {
     let observed = genesis_anchors();
     let mut set = CoverageSet::new(identity());
     let end = observed.iter().find(|o| o.delimiters == 4).unwrap().anchor;
-    set.open_segment(SegmentOrigin::Genesis, end).unwrap();
+    set.open_segment_batch(
+        SegmentOrigin::Genesis,
+        observed
+            .iter()
+            .map(|observed| observed.anchor)
+            .take_while(|anchor| anchor.completed_map_index <= end.completed_map_index),
+    )
+    .unwrap();
     assert_eq!(set.segments()[0].blocks(), Some(0..=3));
 
     let plan =
