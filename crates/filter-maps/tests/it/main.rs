@@ -4,6 +4,7 @@ mod boundary_padding;
 mod coverage;
 mod genesis_stream;
 mod golden;
+mod golden_pipeline;
 mod golden_stream;
 mod log_values;
 mod map_boundaries;
