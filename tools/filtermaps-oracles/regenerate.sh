@@ -11,11 +11,11 @@ elif [[ $# == 3 ]]; then
   geth_arg=$2
   reth_arg=$3
 else
-  echo "usage: $0 [mapping|stream|all] <geth-checkout> <reth-checkout>" >&2
+  echo "usage: $0 [mapping|stream|pipeline|all] <geth-checkout> <reth-checkout>" >&2
   exit 2
 fi
 case "$mode" in
-  mapping|stream|all) ;;
+  mapping|stream|pipeline|all) ;;
   *) echo "unknown generation mode: $mode" >&2; exit 2 ;;
 esac
 
@@ -56,6 +56,15 @@ if [[ $mode == stream || $mode == all ]]; then
   export STREAM_OUT="$reth/crates/filter-maps/tests/it/golden_stream/fixtures"
   mkdir -p -- "$STREAM_OUT"
   run=${run:+$run|}TestGenStream
+fi
+if [[ $mode == pipeline || $mode == all ]]; then
+  pipeline="$geth/core/filtermaps/gen_pipeline_test.go"
+  [[ ! -e "$pipeline" ]] || { echo "Refusing to overwrite $pipeline" >&2; exit 1; }
+  cp -- "$source_dir/pipeline/gen_pipeline_test.go" "$pipeline"
+  copied+=("$pipeline")
+  export PIPELINE_OUT="$reth/crates/filter-maps/tests/it/golden_pipeline/fixtures"
+  mkdir -p -- "$PIPELINE_OUT"
+  run=${run:+$run|}TestGenPipeline
 fi
 
 (cd -- "$geth" && go test ./core/filtermaps -run "^($run)$" -count=1 -v)

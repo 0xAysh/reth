@@ -15,7 +15,8 @@ public oracle generator
         │ copied temporarily into the same Go package
         ▼
 pinned Geth core/filtermaps
-        │ executes Geth's private mapping functions and logIterator
+        │ executes Geth's private mapping functions, logIterator,
+        │ logical renderer, and public matcher
         ▼
 committed Rust vectors and text fixtures
 ```
@@ -23,7 +24,8 @@ committed Rust vectors and text fixtures
 Normal Reth testing uses only the committed outputs:
 
 ```text
-committed fixture → Rust parser → LogValueStream → exact event/index comparison
+FORMAT 1 fixture → Rust parser → LogValueStream → exact event/index comparison
+FORMAT 2 fixture → strict Rust parser and structural integrity checks
 ```
 
 The split keeps the reference source reviewable without adding Go tooling or a
@@ -62,7 +64,10 @@ bash "$REFERENCE/tools/filtermaps-oracles/regenerate.sh" stream "$GETH" "$RETH"
 # PR1 mapping vectors only.
 bash "$REFERENCE/tools/filtermaps-oracles/regenerate.sh" mapping "$GETH" "$RETH"
 
-# Both output families. Omitting the mode also means all.
+# Milestone 2 rendered-map and candidate pipeline fixtures.
+bash "$REFERENCE/tools/filtermaps-oracles/regenerate.sh" pipeline "$GETH" "$RETH"
+
+# Every output family. Omitting the mode also means all.
 bash "$REFERENCE/tools/filtermaps-oracles/regenerate.sh" all "$GETH" "$RETH"
 
 # Normal Rust verification needs no Go or Geth.
@@ -77,13 +82,15 @@ its copied files on exit, and runs nightly formatting for the Rust crate.
 Outputs are written to:
 
 ```text
-mapping → crates/filter-maps/tests/it/golden/vectors.rs
-stream  → crates/filter-maps/tests/it/golden_stream/fixtures/*.txt
+mapping  → crates/filter-maps/tests/it/golden/vectors.rs
+stream   → crates/filter-maps/tests/it/golden_stream/fixtures/*.txt
+pipeline → crates/filter-maps/tests/it/golden_pipeline/fixtures/{MANIFEST.txt,**/*.txt}
 ```
 
 To verify determinism, regenerate from clean inputs twice and compare output
-hashes byte-for-byte. Generated outputs are never hand-edited. Neither generator
-reimplements the layout rules; both execute actual unexported Geth functions.
+hashes byte-for-byte. Generated outputs are never hand-edited. The generators
+execute actual Geth implementation surfaces rather than deriving expected output
+from Reth.
 
 ## Mapping oracle
 
@@ -150,3 +157,52 @@ skipping its 131,073 values.
 Geth does not emit Rust enums. `P`, `M`, value kinds, and `H`/`B` completion are
 explicit normalizations of observed iterator state. Rust's independent
 uninterrupted-versus-batched tests establish its continuation contract.
+
+## Render-and-match pipeline oracle
+
+`pipeline/gen_pipeline_test.go` drives Geth's private `mapRenderer.renderCurrentMap`
+from the same package and copies each resulting sparse logical map before it can
+be mutated. It then passes those exact rows to a synthetic `MatcherBackend` and
+calls Geth's public `GetPotentialMatches`. The backend records value-index log
+lookups under synchronization. Arrival order is intentionally discarded because
+Geth processes epochs concurrently; fixtures contain the sorted, deduplicated
+indices.
+
+The pipeline generator writes strict line-oriented `FORMAT 2` scenario bundles.
+Fourteen curated bundles cover focused boundaries and end-to-end behavior, and
+sixteen bounded stress bundles use an explicit SplitMix64 implementation seeded
+with `0xaf7c0fd8ee09de71`. A generated `MANIFEST.txt` lists every scenario in
+lexical order with its byte length, SHA-256, and structural counts. Full pipeline
+generation removes obsolete scenario files, writes through temporary files, and
+publishes the manifest last. `PIPELINE_GROUP=curated` or `PIPELINE_GROUP=stress`
+may be used for focused maintainer runs; only the default complete run writes the
+manifest.
+
+Direct Geth observations include logical row contents and insertion order,
+renderer completion state, iterator state, derived address/topic hashes, matcher
+row consumption, candidate index lookups, returned potential logs, and
+`ErrMatchAll`. Explicit normalization is limited to boundary labels, epoch and
+count annotations, pointer identity pairing, sorted/deduplicated candidate
+indices, candidate-block resolution from the authoritative pointer table, exact
+Ethereum-shaped matches used for the subset safety assertion, and checksums.
+No database row encoding or Reth production representation is exercised.
+
+Every scenario is generated twice in one process and must be byte-identical.
+The harness also validates contiguous deterministic input, row and mark counts,
+pointer references, candidate bounds, public-log identities, and the invariant
+that exact matching blocks are a subset of candidate blocks. The curated
+false-positive case pins a preselected collision and asserts that it still
+produces an extra candidate; regeneration performs no collision search.
+
+A full deterministic check is:
+
+```sh
+bash "$REFERENCE/tools/filtermaps-oracles/regenerate.sh" pipeline "$GETH" "$RETH"
+find "$RETH/crates/filter-maps/tests/it/golden_pipeline/fixtures" -type f -print0 \
+  | sort -z | xargs -0 shasum -a 256 > /tmp/pipeline-first.sha256
+bash "$REFERENCE/tools/filtermaps-oracles/regenerate.sh" pipeline "$GETH" "$RETH"
+find "$RETH/crates/filter-maps/tests/it/golden_pipeline/fixtures" -type f -print0 \
+  | sort -z | xargs -0 shasum -a 256 > /tmp/pipeline-second.sha256
+cmp /tmp/pipeline-first.sha256 /tmp/pipeline-second.sha256
+git -C "$GETH" status --short # must remain empty
+```
