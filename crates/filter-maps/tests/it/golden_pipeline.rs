@@ -6,8 +6,11 @@
 //! `replay` drives every fixture through the pure log value stream and checks only recorded
 //! pointer, boundary, termination, and slot-classification evidence against emitted events.
 
-mod manifest;
-mod parser;
+#[path = "golden_pipeline/manifest.rs"]
+pub(crate) mod manifest;
+#[path = "golden_pipeline/parser.rs"]
+pub(crate) mod parser;
+#[path = "golden_pipeline/replay.rs"]
 mod replay;
 
 use parser::{BoundaryEnding, FixtureClass, Origin, ParamsName, Planner, TopicConstraint};
