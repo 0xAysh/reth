@@ -245,9 +245,10 @@ pub(crate) struct Query {
 }
 
 impl Query {
-    /// Whether Geth normalizes this query to `ErrMatchAll`: no address and no topic constraint.
-    pub(crate) const fn is_match_all(&self) -> bool {
-        self.addresses.is_empty() && self.topics.is_empty()
+    /// Whether Geth normalizes this query to `ErrMatchAll`: no searchable address or topic value.
+    pub(crate) fn is_match_all(&self) -> bool {
+        self.addresses.is_empty() &&
+            self.topics.iter().all(|topic| matches!(topic, TopicConstraint::Any))
     }
 }
 
