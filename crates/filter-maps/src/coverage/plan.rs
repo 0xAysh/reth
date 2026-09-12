@@ -1,6 +1,6 @@
 //! Query partitioning into indexed and bloom subranges.
 
-use crate::coverage::CoverageSet;
+use crate::{coverage::CoverageSet, ParamsId};
 use alloy_primitives::B256;
 use std::ops::RangeInclusive;
 
@@ -14,13 +14,14 @@ pub struct QueryPlan<G> {
 impl<G> QueryPlan<G> {
     /// Plans `target` against `coverage` as observed under canonical `generation`.
     ///
-    /// `constrained` says whether the filter carries any address or topic constraint. A filter
-    /// without one has no searchable values, so every block in the range is a candidate; that is a
-    /// planner decision, never an empty matcher result. A block-hash query already knows its one
+    /// `has_searchable_values` says whether the filter carries any address or topic value that
+    /// can be looked up. Wildcard-only topic positions are not searchable, so every block in the
+    /// range is a candidate. That is a planner decision, never an empty matcher result. A
+    /// block-hash query already knows its one
     /// candidate and does not consult coverage at all.
     pub fn new(
         target: LogQueryTarget,
-        constrained: bool,
+        has_searchable_values: bool,
         coverage: &CoverageSet,
         generation: G,
     ) -> Result<Self, PlanError> {
@@ -30,7 +31,7 @@ impl<G> QueryPlan<G> {
                 if from > to {
                     return Err(PlanError::EmptyRange { from, to })
                 }
-                if constrained {
+                if has_searchable_values {
                     CandidateSource::Partitioned(partition(from..=to, coverage))
                 } else {
                     CandidateSource::EveryBlock(from..=to)
@@ -114,6 +115,8 @@ pub enum PlannedSubrange {
         blocks: RangeInclusive<u64>,
         /// Maps of the supporting segment; the matcher narrows them with block pointers.
         maps: RangeInclusive<u32>,
+        /// Parameter identity under which those rows were rendered.
+        params_id: ParamsId,
     },
     /// Served by the existing bloom scan.
     Bloom {
@@ -157,6 +160,7 @@ pub struct CanonicalityChanged;
 
 fn partition(blocks: RangeInclusive<u64>, coverage: &CoverageSet) -> Vec<PlannedSubrange> {
     let mut subranges = Vec::new();
+    let params_id = coverage.identity().params;
     // `None` once the covered ranges have consumed the whole numeric domain. Validated segments
     // cannot reach that far in practice, but the partition must not wrap if one ever did.
     let mut next = Some(*blocks.start());
@@ -166,7 +170,11 @@ fn partition(blocks: RangeInclusive<u64>, coverage: &CoverageSet) -> Vec<Planned
             subranges.push(PlannedSubrange::Bloom { blocks: start..=covered.blocks.start() - 1 });
         }
         next = covered.blocks.end().checked_add(1);
-        subranges.push(PlannedSubrange::Indexed { blocks: covered.blocks, maps: covered.maps });
+        subranges.push(PlannedSubrange::Indexed {
+            blocks: covered.blocks,
+            maps: covered.maps,
+            params_id,
+        });
     }
     if let Some(start) = next &&
         start <= *blocks.end()
@@ -207,7 +215,11 @@ mod tests {
     fn wholly_indexed_range_uses_the_matcher_only() {
         assert_eq!(
             partitioned(5, 15),
-            vec![PlannedSubrange::Indexed { blocks: 5..=15, maps: 0..=1 }]
+            vec![PlannedSubrange::Indexed {
+                blocks: 5..=15,
+                maps: 0..=1,
+                params_id: ParamsId::Default,
+            }]
         );
     }
 
@@ -221,9 +233,17 @@ mod tests {
         assert_eq!(
             partitioned(10, 140),
             vec![
-                PlannedSubrange::Indexed { blocks: 10..=19, maps: 0..=1 },
+                PlannedSubrange::Indexed {
+                    blocks: 10..=19,
+                    maps: 0..=1,
+                    params_id: ParamsId::Default,
+                },
                 PlannedSubrange::Bloom { blocks: 20..=99 },
-                PlannedSubrange::Indexed { blocks: 100..=129, maps: 10..=12 },
+                PlannedSubrange::Indexed {
+                    blocks: 100..=129,
+                    maps: 10..=12,
+                    params_id: ParamsId::Default,
+                },
                 PlannedSubrange::Bloom { blocks: 130..=140 },
             ]
         );
