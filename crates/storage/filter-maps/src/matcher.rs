@@ -3,7 +3,7 @@
 use crate::{error::FilterMapStorageError, snapshot::ActivatedFilterMapSnapshot};
 use reth_db_api::{
     models::{FilterMapBaseRowKey, FilterMapExtendedRowKey},
-    tables::{FilterMapBaseRows, FilterMapBlockPointers, FilterMapExtendedRows},
+    tables::{FilterMapBaseRows, FilterMapExtendedRows},
     transaction::DbTx,
 };
 use reth_filter_maps::{FilterMapMatchSource, ParamsId};
@@ -83,6 +83,15 @@ impl<TX: DbTx + 'static> FilterMapMatchSource for FilterMapSegmentSource<TX> {
             let directory = &self.snapshot.directories[&map_index];
             if directory.is_nonempty(row_index) {
                 let key = FilterMapBaseRowKey::new(params_id, map_index, row_index)?;
+                let coordinates = key.validate(params_id)?;
+                if coordinates.group_start != params.map_group_index(map_index) ||
+                    coordinates.row_index != row_index
+                {
+                    return Err(FilterMapStorageError::KeyValueMismatch {
+                        kind: "base row key",
+                        key: key.get(),
+                    })
+                }
                 if let std::collections::btree_map::Entry::Vacant(entry) = groups.entry(key) {
                     let group =
                         self.snapshot.tx.get::<FilterMapBaseRows>(key)?.ok_or(
@@ -123,6 +132,13 @@ impl<TX: DbTx + 'static> FilterMapMatchSource for FilterMapSegmentSource<TX> {
             let mut row = base.iter().copied().take(limit).collect::<Vec<_>>();
             if directory.is_extended(row_index) && row.len() < limit {
                 let extension_key = FilterMapExtendedRowKey::new(params_id, map_index, row_index)?;
+                let coordinates = extension_key.validate(params_id)?;
+                if coordinates.map_index != map_index || coordinates.row_index != row_index {
+                    return Err(FilterMapStorageError::KeyValueMismatch {
+                        kind: "extension row key",
+                        key: extension_key.get(),
+                    })
+                }
                 let extension = self
                     .snapshot
                     .tx
@@ -149,8 +165,8 @@ impl<TX: DbTx + 'static> FilterMapMatchSource for FilterMapSegmentSource<TX> {
             })
         }
         self.snapshot
-            .tx
-            .get::<FilterMapBlockPointers>(block_number)?
+            .pointers
+            .get(&block_number)
             .map(|pointer| pointer.first_log_value_index)
             .ok_or(FilterMapStorageError::MissingPointer(block_number))
     }

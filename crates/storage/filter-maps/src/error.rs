@@ -5,9 +5,6 @@ use reth_filter_maps::coverage::{
     ContractionError, IdentityMismatch, PersistedCoverageError, PublishError,
 };
 
-/// Result returned by durable `FilterMaps` operations.
-pub type Result<T> = std::result::Result<T, FilterMapStorageError>;
-
 /// Durable `FilterMaps` storage error.
 #[derive(Debug, thiserror::Error)]
 pub enum FilterMapStorageError {
@@ -116,6 +113,20 @@ pub enum FilterMapStorageError {
     /// A required block pointer is absent.
     #[error("required FilterMaps block pointer {0} is missing")]
     MissingPointer(u64),
+    /// A pointer hash or numerical index disagrees with canonical or anchor evidence.
+    #[error("FilterMaps block pointer {0} is semantically inconsistent")]
+    PointerMismatch(u64),
+    /// Row payload cardinality disagrees with its authoritative map directory.
+    #[error("FilterMaps payload count disagrees with directory for map {0}")]
+    PayloadCountMismatch(u32),
+    /// Physical payload exists where the authoritative directory declares an empty row.
+    #[error("FilterMaps stale payload contradicts map {map_index}, row {row_index}")]
+    ContradictedPayload {
+        /// Map index.
+        map_index: u32,
+        /// Row index.
+        row_index: u32,
+    },
     /// Existing records only partially match an idempotent retry.
     #[error("FilterMaps store contains incomplete prior publication state")]
     IncompletePriorState,
@@ -123,3 +134,6 @@ pub enum FilterMapStorageError {
     #[error("FilterMaps range arithmetic overflow")]
     Arithmetic,
 }
+
+/// Result returned by durable `FilterMaps` operations.
+pub type Result<T> = std::result::Result<T, FilterMapStorageError>;

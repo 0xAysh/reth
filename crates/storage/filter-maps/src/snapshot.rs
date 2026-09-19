@@ -1,20 +1,19 @@
 //! Coherent structural snapshots and canonically activated matcher sources.
 
 use crate::{
-    codec::{anchor_from_db, catalog_from_db, identity_from_db},
     error::{FilterMapStorageError, Result},
+    restore::{load_directories, load_metadata},
 };
 use reth_db_api::{
-    models::StoredMapRowDirectory,
-    tables::{FilterMapAnchors, FilterMapCoverage, FilterMapDirectories, FilterMapIdentity},
+    models::{StoredBlockPointer, StoredMapRowDirectory},
+    tables::FilterMapBlockPointers,
     transaction::DbTx,
 };
 use reth_filter_maps::coverage::{
-    CanonicalActivationError, IndexIdentity, QueryableCoverage, StructurallyRestoredCoverage,
+    CanonicalActivationError, IndexIdentity, QueryableCoverage, SegmentOrigin,
+    StructurallyRestoredCoverage,
 };
 use std::collections::BTreeMap;
-
-const SINGLETON_KEY: u8 = 0;
 
 /// One coherent read transaction with eagerly validated `FilterMaps` metadata.
 #[derive(Debug)]
@@ -26,53 +25,11 @@ pub struct FilterMapReadSnapshot<TX> {
 }
 
 impl<TX: DbTx> FilterMapReadSnapshot<TX> {
-    /// Loads and structurally validates identity, coverage, anchors, and directories from `tx`.
+    /// Loads and structurally validates identity, coverage, anchors, directories, and row counts.
     pub fn new(tx: TX, running: &IndexIdentity) -> Result<Self> {
-        if tx.entries::<FilterMapIdentity>()? != 1 || tx.entries::<FilterMapCoverage>()? > 1 {
-            return Err(FilterMapStorageError::IncompleteStore)
-        }
-        let identity = tx
-            .get::<FilterMapIdentity>(SINGLETON_KEY)?
-            .ok_or(FilterMapStorageError::MissingIdentity)
-            .and_then(identity_from_db)?;
-        running.check_compatible(&identity)?;
-
-        let catalog = tx
-            .get::<FilterMapCoverage>(SINGLETON_KEY)?
-            .unwrap_or(reth_db_api::models::StoredCoverageCatalog { segments: Vec::new() });
-        let record = catalog_from_db(identity, catalog)?;
-        let mut anchors = Vec::new();
-        let mut directories = BTreeMap::new();
-        for segment in &record.segments {
-            for map_index in segment.first_map..=segment.terminal_map {
-                let stored = tx.get::<FilterMapAnchors>(map_index)?.ok_or(
-                    FilterMapStorageError::Coverage(
-                        reth_filter_maps::coverage::PersistedCoverageError::MissingAnchor {
-                            map_index,
-                        },
-                    ),
-                )?;
-                if stored.completed_map_index != map_index {
-                    return Err(FilterMapStorageError::KeyValueMismatch {
-                        kind: "anchor",
-                        key: u64::from(map_index),
-                    })
-                }
-                anchors.push(anchor_from_db(stored)?);
-                let directory = tx
-                    .get::<FilterMapDirectories>(map_index)?
-                    .ok_or(FilterMapStorageError::MissingDirectory(map_index))?;
-                if directory.params_id != u8::from(identity.params) {
-                    return Err(FilterMapStorageError::KeyValueMismatch {
-                        kind: "directory parameter identity",
-                        key: u64::from(map_index),
-                    })
-                }
-                directories.insert(map_index, directory);
-            }
-        }
-        let restored = StructurallyRestoredCoverage::restore(running, record, anchors)?;
-        Ok(Self { tx, identity, restored, directories })
+        let metadata = load_metadata(&tx, running)?;
+        let directories = load_directories(&tx, &metadata)?;
+        Ok(Self { tx, identity: metadata.identity, restored: metadata.coverage, directories })
     }
 
     /// Returns the snapshot identity.
@@ -85,17 +42,23 @@ impl<TX: DbTx> FilterMapReadSnapshot<TX> {
         &self.restored
     }
 
-    /// Checks current canonical hashes and returns an activated snapshot.
+    /// Checks current canonical hashes and validates every permitted pointer record.
     pub fn activate<E>(
         self,
-        canonical_hash: impl FnMut(u64) -> std::result::Result<Option<alloy_primitives::B256>, E>,
-    ) -> std::result::Result<ActivatedFilterMapSnapshot<TX>, CanonicalActivationError<E>> {
-        let queryable = self.restored.activate(canonical_hash)?;
+        mut canonical_hash: impl FnMut(u64) -> std::result::Result<Option<alloy_primitives::B256>, E>,
+    ) -> std::result::Result<ActivatedFilterMapSnapshot<TX>, FilterMapActivationError<E>> {
+        let queryable = self
+            .restored
+            .activate(&mut canonical_hash)
+            .map_err(FilterMapActivationError::Canonical)?;
+        let pointers =
+            validate_pointers(&self.tx, &self.identity, &queryable, &mut canonical_hash)?;
         Ok(ActivatedFilterMapSnapshot {
             tx: self.tx,
             identity: self.identity,
             queryable,
             directories: self.directories,
+            pointers,
         })
     }
 }
@@ -107,6 +70,7 @@ pub struct ActivatedFilterMapSnapshot<TX> {
     pub(crate) identity: IndexIdentity,
     pub(crate) queryable: QueryableCoverage,
     pub(crate) directories: BTreeMap<u32, StoredMapRowDirectory>,
+    pub(crate) pointers: BTreeMap<u64, StoredBlockPointer>,
 }
 
 impl<TX: DbTx> ActivatedFilterMapSnapshot<TX> {
@@ -122,4 +86,109 @@ impl<TX: DbTx> ActivatedFilterMapSnapshot<TX> {
     ) -> Result<crate::matcher::FilterMapSegmentSource<TX>> {
         crate::matcher::FilterMapSegmentSource::new(self, segment_index)
     }
+}
+
+/// Failure while activating a structurally restored snapshot.
+#[derive(Debug, thiserror::Error)]
+pub enum FilterMapActivationError<E> {
+    /// Segment endpoint canonical verification failed.
+    #[error(transparent)]
+    Canonical(#[from] CanonicalActivationError<E>),
+    /// Canonical lookup failed while validating normalized pointers.
+    #[error("canonical hash lookup failed while validating FilterMaps pointers")]
+    Lookup(#[source] E),
+    /// Pointer storage or cross-table validation failed.
+    #[error(transparent)]
+    Storage(#[from] FilterMapStorageError),
+}
+
+fn validate_pointers<TX: DbTx, E>(
+    tx: &TX,
+    identity: &IndexIdentity,
+    queryable: &QueryableCoverage,
+    canonical_hash: &mut impl FnMut(u64) -> std::result::Result<Option<alloy_primitives::B256>, E>,
+) -> std::result::Result<BTreeMap<u64, StoredBlockPointer>, FilterMapActivationError<E>> {
+    let mut expected = BTreeMap::new();
+    for segment in queryable.coverage().segments() {
+        match segment.origin() {
+            SegmentOrigin::Genesis => {
+                insert_expected(
+                    &mut expected,
+                    0,
+                    StoredBlockPointer {
+                        block_hash: identity.genesis_hash,
+                        first_log_value_index: 0,
+                    },
+                )?;
+            }
+            origin => {
+                let anchor = origin.anchor().expect("non-genesis origins have anchors");
+                insert_expected(
+                    &mut expected,
+                    anchor.pointer.block_number,
+                    StoredBlockPointer {
+                        block_hash: anchor.pointer.block_hash,
+                        first_log_value_index: anchor.pointer.first_log_value_index,
+                    },
+                )?;
+            }
+        }
+        for anchor in segment.anchors() {
+            insert_expected(
+                &mut expected,
+                anchor.pointer.block_number,
+                StoredBlockPointer {
+                    block_hash: anchor.pointer.block_hash,
+                    first_log_value_index: anchor.pointer.first_log_value_index,
+                },
+            )?;
+        }
+    }
+
+    let mut pointers = BTreeMap::new();
+    for segment in queryable.coverage().segments() {
+        let Some(blocks) = segment.blocks() else { continue };
+        let successor = blocks.end().checked_add(1).ok_or(FilterMapStorageError::Arithmetic)?;
+        let mut previous_index = None;
+        for block_number in *blocks.start()..=successor {
+            let pointer = tx
+                .get::<FilterMapBlockPointers>(block_number)
+                .map_err(FilterMapStorageError::from)?
+                .ok_or(FilterMapStorageError::MissingPointer(block_number))?;
+            if canonical_hash(block_number).map_err(FilterMapActivationError::Lookup)? !=
+                Some(pointer.block_hash) ||
+                previous_index.is_some_and(|index| index >= pointer.first_log_value_index)
+            {
+                return Err(FilterMapStorageError::PointerMismatch(block_number).into())
+            }
+            if expected.get(&block_number).is_some_and(|expected| *expected != pointer) {
+                return Err(FilterMapStorageError::PointerMismatch(block_number).into())
+            }
+            previous_index = Some(pointer.first_log_value_index);
+            pointers.insert(block_number, pointer);
+        }
+    }
+    for (block_number, expected) in expected {
+        let stored = tx
+            .get::<FilterMapBlockPointers>(block_number)
+            .map_err(FilterMapStorageError::from)?
+            .ok_or(FilterMapStorageError::MissingPointer(block_number))?;
+        if stored != expected {
+            return Err(FilterMapStorageError::PointerMismatch(block_number).into())
+        }
+    }
+    Ok(pointers)
+}
+
+fn insert_expected<E>(
+    pointers: &mut BTreeMap<u64, StoredBlockPointer>,
+    block_number: u64,
+    pointer: StoredBlockPointer,
+) -> std::result::Result<(), FilterMapActivationError<E>> {
+    if let Some(existing) = pointers.insert(block_number, pointer) &&
+        existing != pointer
+    {
+        return Err(FilterMapStorageError::PointerMismatch(block_number).into())
+    }
+    Ok(())
 }

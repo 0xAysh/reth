@@ -192,10 +192,35 @@ impl FilterMapBaseRowKey {
         linearized_key(params, group, row_index).map(Self)
     }
 
+    /// Validates and decodes this key under a recognized parameter identity.
+    pub fn validate(
+        self,
+        params_id: u8,
+    ) -> Result<FilterMapBaseRowCoordinates, FilterMapModelError> {
+        let params = params(params_id)?;
+        let coordinates = decode_linearized_key(params, self.0)?;
+        if !coordinates.map_index.is_multiple_of(params.group_size) {
+            return Err(FilterMapModelError::GroupMisalignment)
+        }
+        Ok(FilterMapBaseRowCoordinates {
+            group_start: coordinates.map_index,
+            row_index: coordinates.row_index,
+        })
+    }
+
     /// Returns the raw ordered key.
     pub const fn get(self) -> u64 {
         self.0
     }
+}
+
+/// Decoded coordinates of a validated grouped base-row key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FilterMapBaseRowCoordinates {
+    /// First map represented by the 32-slot group.
+    pub group_start: u32,
+    /// Logical row index.
+    pub row_index: u32,
 }
 
 /// Linearized key for one individual extended row.
@@ -210,10 +235,24 @@ impl FilterMapExtendedRowKey {
         linearized_key(params(params_id)?, map_index, row_index).map(Self)
     }
 
+    /// Validates and decodes this key under a recognized parameter identity.
+    pub fn validate(self, params_id: u8) -> Result<FilterMapRowCoordinates, FilterMapModelError> {
+        decode_linearized_key(params(params_id)?, self.0)
+    }
+
     /// Returns the raw ordered key.
     pub const fn get(self) -> u64 {
         self.0
     }
+}
+
+/// Decoded coordinates of a validated individual row key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FilterMapRowCoordinates {
+    /// Individual map index.
+    pub map_index: u32,
+    /// Logical row index.
+    pub row_index: u32,
 }
 
 /// The base portions of one row for 32 adjacent maps.
@@ -342,6 +381,9 @@ pub enum FilterMapModelError {
     /// A grouped row does not have 32 explicit slots.
     #[error("FilterMaps base group must have 32 slots")]
     GroupCardinality,
+    /// A base-row key does not begin at a 32-map boundary.
+    #[error("FilterMaps base-row key is not group aligned")]
+    GroupMisalignment,
     /// A base slot exceeds the recognized base-row length.
     #[error("FilterMaps base slot exceeds its bound")]
     ExcessRowLength,
@@ -411,6 +453,29 @@ fn linearized_key(
         })
         .and_then(|value| value.checked_add(u64::from(offset)))
         .ok_or(FilterMapModelError::Arithmetic)
+}
+
+fn decode_linearized_key(
+    params: PhysicalParams,
+    key: u64,
+) -> Result<FilterMapRowCoordinates, FilterMapModelError> {
+    let epoch_span = u64::from(params.map_height)
+        .checked_mul(u64::from(params.maps_per_epoch))
+        .ok_or(FilterMapModelError::Arithmetic)?;
+    let epoch = key / epoch_span;
+    let within_epoch = key % epoch_span;
+    let row_index = within_epoch / u64::from(params.maps_per_epoch);
+    let map_offset = within_epoch % u64::from(params.maps_per_epoch);
+    let map_index = epoch
+        .checked_mul(u64::from(params.maps_per_epoch))
+        .and_then(|first| first.checked_add(map_offset))
+        .and_then(|map| u32::try_from(map).ok())
+        .ok_or(FilterMapModelError::Arithmetic)?;
+    let row_index = u32::try_from(row_index).map_err(|_| FilterMapModelError::Arithmetic)?;
+    if row_index >= params.map_height {
+        return Err(FilterMapModelError::RowOutOfRange)
+    }
+    Ok(FilterMapRowCoordinates { map_index, row_index })
 }
 
 fn validate_columns(columns: &[u32], map_width: u32) -> Result<(), FilterMapModelError> {
@@ -815,6 +880,10 @@ mod tests {
         let row1_map0 = FilterMapExtendedRowKey::new(1, 0, 1).unwrap();
         assert!(row0_map0 < row0_map1);
         assert!(row0_map1 < row1_map0);
+        assert_eq!(FilterMapBaseRowKey(1).validate(1), Err(FilterMapModelError::GroupMisalignment));
+        let aligned = FilterMapBaseRowKey::new(1, 32, 7).unwrap().validate(1).unwrap();
+        assert_eq!(aligned.group_start, 32);
+        assert_eq!(aligned.row_index, 7);
 
         let epoch0 = FilterMapRowKeyRange::complete_epoch(1, 0).unwrap();
         let epoch1 = FilterMapRowKeyRange::complete_epoch(1, 1).unwrap();

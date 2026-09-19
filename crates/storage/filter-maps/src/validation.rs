@@ -1,6 +1,7 @@
 use crate::{
-    codec::{anchor_from_db, anchor_to_db, catalog_from_db, catalog_to_db, identity_from_db},
+    codec::{anchor_to_db, catalog_to_db},
     error::{FilterMapStorageError, Result},
+    restore::{load_directories, load_metadata, read_map_rows},
     store::PublicationStart,
 };
 use reth_db_api::{
@@ -8,10 +9,7 @@ use reth_db_api::{
         FilterMapBaseRowKey, FilterMapExtendedRowKey, StoredBaseRowGroup, StoredBlockPointer,
         StoredExtendedRow, StoredMapResumeAnchor, StoredMapRowDirectory,
     },
-    tables::{
-        FilterMapAnchors, FilterMapBaseRows, FilterMapBlockPointers, FilterMapCoverage,
-        FilterMapDirectories, FilterMapExtendedRows, FilterMapIdentity,
-    },
+    tables::{FilterMapAnchors, FilterMapBaseRows, FilterMapBlockPointers, FilterMapDirectories},
     transaction::DbTx,
 };
 use reth_filter_maps::{
@@ -20,7 +18,6 @@ use reth_filter_maps::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-const SINGLETON_KEY: u8 = 0;
 const MAX_BATCH: usize = 32;
 
 #[derive(Debug)]
@@ -45,10 +42,11 @@ pub(crate) fn build_publication<TX: DbTx>(
     start: &PublicationStart,
     maps: &[AnchoredCompletedMap],
 ) -> Result<PublicationProposal> {
-    let identity = load_identity(tx, running)?;
-    validate_shape(&identity, start, maps)?;
-    let current = load_coverage(tx, &identity)?;
-    validate_current_directories(tx, &identity, &current)?;
+    let metadata = load_metadata(tx, running)?;
+    validate_shape(&metadata.identity, start, maps)?;
+    load_directories(tx, &metadata)?;
+    let identity = metadata.identity;
+    let current = metadata.coverage;
     let params = identity.params.params();
     let params_id = u8::from(identity.params);
 
@@ -110,7 +108,8 @@ pub(crate) fn build_publication<TX: DbTx>(
         .collect::<Vec<_>>();
     if target_covered.iter().any(|covered| *covered) {
         if target_covered.iter().all(|covered| *covered) &&
-            publication_matches(tx, params_id, &logical_rows, &directories, &anchors, &pointers)?
+            retry_coverage_matches(&current, start, maps) &&
+            publication_matches(tx, &identity, &logical_rows, &directories, &anchors, &pointers)?
         {
             return Ok(PublicationProposal::Noop)
         }
@@ -188,69 +187,6 @@ pub(crate) fn build_publication<TX: DbTx>(
         anchors,
         coverage: catalog_to_db(proposed.stored_record()),
     }))
-}
-
-pub(crate) fn load_identity<TX: DbTx>(tx: &TX, running: &IndexIdentity) -> Result<IndexIdentity> {
-    if tx.entries::<FilterMapIdentity>()? != 1 {
-        return Err(FilterMapStorageError::IncompleteStore)
-    }
-    let stored = tx
-        .get::<FilterMapIdentity>(SINGLETON_KEY)?
-        .ok_or(FilterMapStorageError::MissingIdentity)
-        .and_then(identity_from_db)?;
-    running.check_compatible(&stored)?;
-    Ok(stored)
-}
-
-pub(crate) fn load_coverage<TX: DbTx>(
-    tx: &TX,
-    identity: &IndexIdentity,
-) -> Result<StructurallyRestoredCoverage> {
-    if tx.entries::<FilterMapCoverage>()? > 1 {
-        return Err(FilterMapStorageError::IncompleteStore)
-    }
-    let catalog = tx
-        .get::<FilterMapCoverage>(SINGLETON_KEY)?
-        .unwrap_or(reth_db_api::models::StoredCoverageCatalog { segments: Vec::new() });
-    let record = catalog_from_db(*identity, catalog)?;
-    let mut anchors = Vec::new();
-    for segment in &record.segments {
-        for map_index in segment.first_map..=segment.terminal_map {
-            let stored =
-                tx.get::<FilterMapAnchors>(map_index)?.ok_or(FilterMapStorageError::Coverage(
-                    reth_filter_maps::coverage::PersistedCoverageError::MissingAnchor { map_index },
-                ))?;
-            if stored.completed_map_index != map_index {
-                return Err(FilterMapStorageError::KeyValueMismatch {
-                    kind: "anchor",
-                    key: u64::from(map_index),
-                })
-            }
-            anchors.push(anchor_from_db(stored)?);
-        }
-    }
-    Ok(StructurallyRestoredCoverage::restore(identity, record, anchors)?)
-}
-
-fn validate_current_directories<TX: DbTx>(
-    tx: &TX,
-    identity: &IndexIdentity,
-    coverage: &StructurallyRestoredCoverage,
-) -> Result<()> {
-    for segment in coverage.segments() {
-        for map_index in segment.maps() {
-            let directory = tx
-                .get::<FilterMapDirectories>(map_index)?
-                .ok_or(FilterMapStorageError::MissingDirectory(map_index))?;
-            if directory.params_id != u8::from(identity.params) {
-                return Err(FilterMapStorageError::KeyValueMismatch {
-                    kind: "directory parameter identity",
-                    key: u64::from(map_index),
-                })
-            }
-        }
-    }
-    Ok(())
 }
 
 fn validate_shape(
@@ -374,9 +310,31 @@ fn validate_protected_pointers<TX: DbTx>(
     Ok(())
 }
 
+fn retry_coverage_matches(
+    coverage: &StructurallyRestoredCoverage,
+    start: &PublicationStart,
+    maps: &[AnchoredCompletedMap],
+) -> bool {
+    let first = maps[0].map().map_index();
+    let last = maps.last().expect("nonempty publication").map().map_index();
+    coverage.segments().iter().any(|segment| {
+        segment.maps().contains(&first) &&
+            segment.terminal().completed_map_index == last &&
+            match start {
+                PublicationStart::Open { origin } => {
+                    segment.first_map() == first && segment.origin() == origin
+                }
+                PublicationStart::Extend { from } => {
+                    from.completed_map_index.checked_add(1) == Some(first) &&
+                        segment.contains_anchor(*from)
+                }
+            }
+    })
+}
+
 fn publication_matches<TX: DbTx>(
     tx: &TX,
-    params_id: u8,
+    identity: &IndexIdentity,
     rows: &BTreeMap<u32, BTreeMap<u32, Vec<u32>>>,
     directories: &BTreeMap<u32, StoredMapRowDirectory>,
     anchors: &BTreeMap<u32, StoredMapResumeAnchor>,
@@ -388,24 +346,13 @@ fn publication_matches<TX: DbTx>(
         {
             return Ok(false)
         }
-        for (&row_index, columns) in &rows[&map_index] {
-            let base_key = FilterMapBaseRowKey::new(params_id, map_index, row_index)?;
-            let Some(group) = tx.get::<FilterMapBaseRows>(base_key)? else { return Ok(false) };
-            let params = reth_filter_maps::ParamsId::try_from(params_id)
-                .map_err(|_| FilterMapStorageError::UnknownIdentity("parameter set"))?
-                .params();
-            let slot = params.map_group_offset(map_index) as usize;
-            let mut actual = group.slots.get(slot).cloned().unwrap_or_default();
-            if expected.is_extended(row_index) {
-                let key = FilterMapExtendedRowKey::new(params_id, map_index, row_index)?;
-                let Some(extension) = tx.get::<FilterMapExtendedRows>(key)? else {
-                    return Ok(false)
-                };
-                actual.extend(extension.columns);
-            }
-            if &actual != columns {
-                return Ok(false)
-            }
+        let actual = match read_map_rows(tx, identity, map_index, expected, true) {
+            Ok(actual) => actual,
+            Err(FilterMapStorageError::ContradictedPayload { .. }) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if &actual != rows.get(&map_index).expect("publication rows are complete") {
+            return Ok(false)
         }
     }
     for (&number, expected) in pointers {

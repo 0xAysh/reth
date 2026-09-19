@@ -3,7 +3,7 @@
 use crate::{
     codec::catalog_to_db,
     error::{FilterMapStorageError, Result},
-    validation::{load_coverage, load_identity},
+    restore::load_metadata,
 };
 use reth_db_api::{
     models::FilterMapRowKeyRange,
@@ -25,8 +25,7 @@ pub fn contract_for_reorg<TX>(
 where
     TX: DbTx + DbTxMut,
 {
-    let stored = load_identity(tx, identity)?;
-    let mut coverage = load_coverage(tx, &stored)?;
+    let mut coverage = load_metadata(tx, identity)?.coverage;
     let outcome = coverage.contract_for_reorg(earliest_changed, safe_anchor)?;
     tx.put::<FilterMapCoverage>(SINGLETON_KEY, catalog_to_db(coverage.stored_record()))?;
     Ok(outcome)
@@ -37,8 +36,7 @@ pub fn retain_after<TX>(tx: &TX, identity: &IndexIdentity, tail: MapResumeAnchor
 where
     TX: DbTx + DbTxMut,
 {
-    let stored = load_identity(tx, identity)?;
-    let mut coverage = load_coverage(tx, &stored)?;
+    let mut coverage = load_metadata(tx, identity)?.coverage;
     coverage.retain_after(tail)?;
     tx.put::<FilterMapCoverage>(SINGLETON_KEY, catalog_to_db(coverage.stored_record()))?;
     Ok(())
