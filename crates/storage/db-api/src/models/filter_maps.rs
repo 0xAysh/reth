@@ -171,7 +171,17 @@ impl StoredMapRowDirectory {
                     .ok_or(FilterMapModelError::Arithmetic)?,
             )
             .ok_or(FilterMapModelError::Arithmetic)?;
-        if self.logical_mark_count < minimum_marks {
+        let base_maximum = params.base_row_length.min(params.map_width);
+        let extended_maximum = params.max_row_length.min(params.map_width);
+        let maximum_marks = u64::from(base_only)
+            .checked_mul(u64::from(base_maximum))
+            .and_then(|count| {
+                u64::from(extended_count)
+                    .checked_mul(u64::from(extended_maximum))
+                    .and_then(|extended| count.checked_add(extended))
+            })
+            .ok_or(FilterMapModelError::Arithmetic)?;
+        if !(minimum_marks..=maximum_marks).contains(&self.logical_mark_count) {
             return Err(FilterMapModelError::CountMismatch)
         }
         Ok(())
@@ -883,11 +893,30 @@ mod tests {
     }
 
     #[test]
-    fn directory_rejects_extended_empty_rows() {
+    fn directory_rejects_impossible_states_and_counts() {
         assert_eq!(
             StoredMapRowDirectory::new(2, vec![0, 0], vec![1, 0], 0, 0),
             Err(FilterMapModelError::ImpossibleDirectoryState)
         );
+        assert_eq!(
+            StoredMapRowDirectory::new(2, vec![0, 0], vec![0, 0], 0, 1),
+            Err(FilterMapModelError::CountMismatch)
+        );
+        assert_eq!(
+            StoredMapRowDirectory::new(2, vec![1, 0], vec![0, 0], 1, 2),
+            Err(FilterMapModelError::CountMismatch)
+        );
+        let mut nonempty = vec![0; 65_536 / 8];
+        nonempty[0] = 1;
+        assert_eq!(
+            StoredMapRowDirectory::new(1, nonempty.clone(), nonempty, 1, 8_193),
+            Err(FilterMapModelError::CountMismatch)
+        );
+
+        let empty = StoredMapRowDirectory::new(2, vec![0, 0], vec![0, 0], 0, 0).unwrap();
+        let mut malformed = empty.compress();
+        *malformed.last_mut().unwrap() = 1;
+        assert!(StoredMapRowDirectory::decompress(&malformed).is_err());
     }
 
     #[test]
@@ -952,7 +981,7 @@ mod tests {
         assert_eq!(StoredExtendedRow::decompress(&encoded).unwrap(), extension);
         assert!(StoredExtendedRow::decompress(&encoded[..encoded.len() - 1]).is_err());
 
-        let directory = StoredMapRowDirectory::new(2, vec![1, 0], vec![1, 0], 1, 2).unwrap();
+        let directory = StoredMapRowDirectory::new(2, vec![1, 0], vec![0, 0], 1, 1).unwrap();
         assert_eq!(
             StoredMapRowDirectory::decompress(&directory.clone().compress()).unwrap(),
             directory

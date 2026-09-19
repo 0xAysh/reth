@@ -33,7 +33,10 @@ mod tests {
     use reth_db::{init_db, mdbx::DatabaseArguments, test_utils::create_test_rw_db};
     use reth_db_api::{
         database::Database,
-        models::{FilterMapBaseRowKey, StoredBaseRowGroup, StoredCoverageCatalog},
+        models::{
+            FilterMapBaseRowKey, StoredBaseRowGroup, StoredCoverageCatalog, StoredMapRowDirectory,
+        },
+        table::{Compress, Table},
         tables::{
             FilterMapBaseRows, FilterMapBlockPointers, FilterMapCoverage, FilterMapDirectories,
             FilterMapIdentity,
@@ -50,6 +53,16 @@ mod tests {
         LogInput, LogValueStream, LogValueStreamTermination, MatchPattern, ParamsId,
         RendererOutput, ValueSpaceAnchor, DEFAULT_PARAMS, GETH_V1, RANGE_TEST_PARAMS,
     };
+
+    #[derive(Debug)]
+    struct RawFilterMapDirectories;
+
+    impl Table for RawFilterMapDirectories {
+        const NAME: &'static str = <FilterMapDirectories as Table>::NAME;
+        const DUPSORT: bool = false;
+        type Key = u32;
+        type Value = Vec<u8>;
+    }
 
     fn identity() -> IndexIdentity {
         IndexIdentity::new(STORAGE_FORMAT_V1, 1, B256::ZERO, GETH_V1, ParamsId::RangeTest)
@@ -98,6 +111,32 @@ mod tests {
             start = PublicationStart::Extend { from: map.resume_anchor() };
         }
         Ok(())
+    }
+
+    fn production_map() -> (reth_filter_maps::AnchoredCompletedMap, Address) {
+        let mut searched = [0u8; 20];
+        searched[12..].copy_from_slice(&42u64.to_be_bytes());
+        let address = Address::from(searched);
+        let logs = (0u64..65_535).map(|index| {
+            let mut bytes = [0u8; 20];
+            bytes[12..].copy_from_slice(&index.to_be_bytes());
+            LogInput::new(Address::from(bytes), [])
+        });
+        let stream = LogValueStream::new(
+            DEFAULT_PARAMS,
+            ValueSpaceAnchor::new(0, B256::ZERO, 0),
+            vec![
+                BlockInput::new(0, B256::ZERO, logs),
+                BlockInput::new(1, B256::repeat_byte(1), []),
+            ],
+            LogValueStreamTermination::ReachedHead,
+        );
+        let mut renderer = FilterMapRenderer::from_genesis(stream).unwrap();
+        let rendered = match renderer.render_next().unwrap().unwrap() {
+            RendererOutput::Map(map) => map,
+            RendererOutput::Complete(_) => panic!("expected a completed production map"),
+        };
+        (rendered, address)
     }
 
     fn maps_with_address(address: u8, count: usize) -> Vec<reth_filter_maps::AnchoredCompletedMap> {
@@ -495,7 +534,7 @@ mod tests {
     }
 
     #[test]
-    fn lazy_row_access_rejects_inexact_directory_mark_count() {
+    fn snapshot_rejects_empty_directory_with_positive_mark_count() {
         let db = create_test_rw_db();
         let maps = maps();
         let tx = db.tx_mut().unwrap();
@@ -509,12 +548,48 @@ mod tests {
         .unwrap();
         tx.commit().unwrap();
 
+        let empty = StoredMapRowDirectory::new(
+            ParamsId::RangeTest.into(),
+            vec![0; RANGE_TEST_PARAMS.map_height() as usize / 8],
+            vec![0; RANGE_TEST_PARAMS.map_height() as usize / 8],
+            0,
+            0,
+        )
+        .unwrap();
+        let mut malformed = empty.compress();
+        *malformed.last_mut().unwrap() = 1;
         let tx = db.tx_mut().unwrap();
+        tx.put::<RawFilterMapDirectories>(0, malformed).unwrap();
+        tx.commit().unwrap();
+
+        assert!(matches!(
+            FilterMapReadSnapshot::new(db.tx().unwrap(), &identity()),
+            Err(FilterMapStorageError::Database(reth_db_api::DatabaseError::Decode))
+        ));
+    }
+
+    #[test]
+    fn lazy_row_access_rejects_inexact_directory_mark_count() {
+        let db = create_test_rw_db();
+        let (map, _) = production_map();
+        let row = map.map().rows().iter().find(|row| row.columns().len() > 1).unwrap().row_index();
+        let production_identity =
+            IndexIdentity::new(STORAGE_FORMAT_V1, 1, B256::ZERO, GETH_V1, ParamsId::Default);
+        let tx = db.tx_mut().unwrap();
+        initialize_identity(&tx, &production_identity).unwrap();
+        publish(
+            &tx,
+            &production_identity,
+            PublicationStart::Open { origin: SegmentOrigin::Genesis },
+            std::slice::from_ref(&map),
+        )
+        .unwrap();
         let mut directory = tx.get::<FilterMapDirectories>(0).unwrap().unwrap();
-        directory.logical_mark_count += 1;
+        directory.logical_mark_count = u64::from(directory.nonempty_row_count);
         tx.put::<FilterMapDirectories>(0, directory).unwrap();
         tx.commit().unwrap();
-        let snapshot = FilterMapReadSnapshot::new(db.tx().unwrap(), &identity()).unwrap();
+
+        let snapshot = FilterMapReadSnapshot::new(db.tx().unwrap(), &production_identity).unwrap();
         let activated = snapshot
             .activate(|number| {
                 Ok::<_, std::convert::Infallible>(Some(if number == 0 {
@@ -525,7 +600,6 @@ mod tests {
             })
             .unwrap();
         let mut source = activated.into_segment_source(0).unwrap();
-        let row = maps[0].map().rows()[0].row_index();
         assert!(matches!(
             source.read_row_prefixes(&[0], row, 1),
             Err(FilterMapStorageError::PayloadCountMismatch(0))
@@ -535,27 +609,31 @@ mod tests {
     #[test]
     fn lazy_access_requires_declared_extension_for_short_prefixes() {
         let db = create_test_rw_db();
-        let maps = maps();
-        let row = maps[0].map().rows()[0].row_index();
+        let (map, _) = production_map();
+        let row = map
+            .map()
+            .rows()
+            .iter()
+            .find(|row| row.columns().len() == DEFAULT_PARAMS.base_row_length() as usize)
+            .unwrap()
+            .row_index();
+        let production_identity =
+            IndexIdentity::new(STORAGE_FORMAT_V1, 1, B256::ZERO, GETH_V1, ParamsId::Default);
         let tx = db.tx_mut().unwrap();
-        initialize_identity(&tx, &identity()).unwrap();
-        publish_maps(
+        initialize_identity(&tx, &production_identity).unwrap();
+        publish(
             &tx,
-            &identity(),
+            &production_identity,
             PublicationStart::Open { origin: SegmentOrigin::Genesis },
-            &maps,
+            std::slice::from_ref(&map),
         )
         .unwrap();
-        tx.commit().unwrap();
-
-        let tx = db.tx_mut().unwrap();
         let mut directory = tx.get::<FilterMapDirectories>(0).unwrap().unwrap();
         directory.extended[row as usize / 8] |= 1 << (row % 8);
-        directory.logical_mark_count = 2;
         tx.put::<FilterMapDirectories>(0, directory).unwrap();
         tx.commit().unwrap();
 
-        let snapshot = FilterMapReadSnapshot::new(db.tx().unwrap(), &identity()).unwrap();
+        let snapshot = FilterMapReadSnapshot::new(db.tx().unwrap(), &production_identity).unwrap();
         let activated = snapshot
             .activate(|number| {
                 Ok::<_, std::convert::Infallible>(Some(if number == 0 {
@@ -761,29 +839,7 @@ mod tests {
     #[test]
     fn production_renderer_survives_publication_reopen_and_matcher_query() {
         let directory = tempfile::tempdir().unwrap();
-        let mut searched = [0u8; 20];
-        searched[12..].copy_from_slice(&42u64.to_be_bytes());
-        let address = Address::from(searched);
-        let logs = (0u64..65_535).map(|index| {
-            let mut bytes = [0u8; 20];
-            bytes[12..].copy_from_slice(&index.to_be_bytes());
-            LogInput::new(Address::from(bytes), [])
-        });
-        let blocks = vec![
-            BlockInput::new(0, B256::ZERO, logs),
-            BlockInput::new(1, B256::repeat_byte(1), []),
-        ];
-        let stream = LogValueStream::new(
-            DEFAULT_PARAMS,
-            ValueSpaceAnchor::new(0, B256::ZERO, 0),
-            blocks,
-            LogValueStreamTermination::ReachedHead,
-        );
-        let mut renderer = FilterMapRenderer::from_genesis(stream).unwrap();
-        let rendered = match renderer.render_next().unwrap().unwrap() {
-            RendererOutput::Map(map) => map,
-            RendererOutput::Complete(_) => panic!("expected a completed production map"),
-        };
+        let (rendered, address) = production_map();
         assert_eq!(rendered.map().map_index(), 0);
         let production_identity =
             IndexIdentity::new(STORAGE_FORMAT_V1, 1, B256::ZERO, GETH_V1, ParamsId::Default);
