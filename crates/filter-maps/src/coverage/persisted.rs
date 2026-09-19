@@ -58,8 +58,15 @@ impl StructurallyRestoredCoverage {
         anchors: impl IntoIterator<Item = MapResumeAnchor>,
     ) -> Result<Self, PersistedCoverageError> {
         running.check_compatible(&record.identity)?;
-        let mut anchors: BTreeMap<_, _> =
-            anchors.into_iter().map(|anchor| (anchor.completed_map_index, anchor)).collect();
+        let mut anchors_by_map = BTreeMap::new();
+        for anchor in anchors {
+            if anchors_by_map.insert(anchor.completed_map_index, anchor).is_some() {
+                return Err(PersistedCoverageError::DuplicateAnchor {
+                    map_index: anchor.completed_map_index,
+                })
+            }
+        }
+        let mut anchors = anchors_by_map;
         let mut coverage = CoverageSet::new(record.identity);
         let mut previous_terminal = None;
 
@@ -77,7 +84,7 @@ impl StructurallyRestoredCoverage {
                 })
             }
 
-            let origin = descriptor.origin.restore(record.identity);
+            let origin = descriptor.origin.restore(record.identity)?;
             let expected_first = origin.anchor().map_or(Ok(0), |anchor| {
                 anchor
                     .completed_map_index
@@ -91,11 +98,7 @@ impl StructurallyRestoredCoverage {
                 })
             }
 
-            let mut segment_anchors = Vec::with_capacity(
-                usize::try_from(descriptor.terminal_map - descriptor.first_map)
-                    .unwrap_or(usize::MAX)
-                    .saturating_add(1),
-            );
+            let mut segment_anchors = Vec::new();
             for map_index in descriptor.first_map..=descriptor.terminal_map {
                 segment_anchors.push(
                     anchors
@@ -139,6 +142,14 @@ impl StructurallyRestoredCoverage {
                 canonical &= canonical_hash(origin.pointer.block_number)
                     .map_err(CanonicalActivationError::Lookup)? ==
                     Some(origin.pointer.block_hash);
+                if let SegmentOrigin::Checkpoint(checkpoint) = segment.origin() &&
+                    let CheckpointProvenance::DerivedFrom { predecessor } =
+                        checkpoint.checkpoint().provenance()
+                {
+                    canonical &= canonical_hash(predecessor.pointer.block_number)
+                        .map_err(CanonicalActivationError::Lookup)? ==
+                        Some(predecessor.pointer.block_hash);
+                }
             } else {
                 canonical &= canonical_hash(0).map_err(CanonicalActivationError::Lookup)? ==
                     Some(self.identity().genesis_hash);
@@ -249,10 +260,32 @@ impl StoredSegmentOrigin {
         }
     }
 
-    const fn restore(self, identity: IndexIdentity) -> SegmentOrigin {
-        match self {
-            Self::Genesis => SegmentOrigin::Genesis,
+    fn restore(self, identity: IndexIdentity) -> Result<SegmentOrigin, PersistedCoverageError> {
+        let anchor = match &self {
+            Self::Genesis => return Ok(SegmentOrigin::Genesis),
+            Self::Checkpoint { origin_anchor, .. } | Self::Retained { origin_anchor } => {
+                *origin_anchor
+            }
+        };
+        if anchor.value_space_version != identity.value_space_version {
+            return Err(PersistedCoverageError::InvalidOrigin)
+        }
+        Ok(match self {
+            Self::Genesis => unreachable!("returned above"),
             Self::Checkpoint { origin_anchor, provenance } => {
+                if let CheckpointProvenance::DerivedFrom { predecessor } = provenance &&
+                    (predecessor.value_space_version != identity.value_space_version ||
+                        predecessor.completed_map_index >= origin_anchor.completed_map_index ||
+                        predecessor.pointer.block_number > origin_anchor.pointer.block_number ||
+                        predecessor.pointer.first_log_value_index >
+                            origin_anchor.pointer.first_log_value_index ||
+                        (predecessor.pointer.block_number ==
+                            origin_anchor.pointer.block_number &&
+                            predecessor.pointer.block_hash !=
+                                origin_anchor.pointer.block_hash))
+                {
+                    return Err(PersistedCoverageError::InvalidOrigin)
+                }
                 SegmentOrigin::Checkpoint(VerifiedCheckpoint::restore(ValueSpaceCheckpoint::new(
                     identity,
                     origin_anchor,
@@ -262,7 +295,7 @@ impl StoredSegmentOrigin {
             Self::Retained { origin_anchor } => {
                 SegmentOrigin::Retained(RetainedAnchor::restore(origin_anchor))
             }
-        }
+        })
     }
 }
 
@@ -296,10 +329,19 @@ pub enum PersistedCoverageError {
         /// Stored first map.
         actual: u32,
     },
+    /// An inline origin or its provenance is internally inconsistent.
+    #[error("invalid stored segment origin")]
+    InvalidOrigin,
     /// A covered map has no durable resume anchor.
     #[error("missing durable anchor for map {map_index}")]
     MissingAnchor {
         /// Missing map.
+        map_index: u32,
+    },
+    /// More than one anchor record names the same map.
+    #[error("duplicate durable anchor for map {map_index}")]
+    DuplicateAnchor {
+        /// Duplicated map.
         map_index: u32,
     },
     /// An anchor is not named by any segment descriptor.
@@ -403,6 +445,29 @@ mod tests {
     }
 
     #[test]
+    fn derived_checkpoint_activation_verifies_its_predecessor() {
+        let origin = aligned(9, 100);
+        let predecessor = aligned(5, 60);
+        let anchors = anchors_through(10, aligned(12, 130));
+        let record = StoredCoverageRecord {
+            identity: identity(),
+            segments: vec![StoredSegmentRecord {
+                origin: StoredSegmentOrigin::Checkpoint {
+                    origin_anchor: origin,
+                    provenance: CheckpointProvenance::DerivedFrom { predecessor },
+                },
+                first_map: 10,
+                terminal_map: 12,
+            }],
+        };
+        let restored = StructurallyRestoredCoverage::restore(&identity(), record, anchors).unwrap();
+        let queryable = restored.activate_infallible(|number| {
+            Some(if number == 60 { B256::ZERO } else { hash(number) })
+        });
+        assert!(queryable.coverage().segments().is_empty());
+    }
+
+    #[test]
     fn restoration_rejects_missing_and_unexpected_anchors() {
         let record = StoredCoverageRecord {
             identity: identity(),
@@ -417,6 +482,14 @@ mod tests {
             Err(PersistedCoverageError::MissingAnchor { map_index: 1 })
         ));
         let empty = StoredCoverageRecord { identity: identity(), segments: Vec::new() };
+        assert!(matches!(
+            StructurallyRestoredCoverage::restore(
+                &identity(),
+                empty.clone(),
+                [aligned(0, 10), aligned(0, 10)],
+            ),
+            Err(PersistedCoverageError::DuplicateAnchor { map_index: 0 })
+        ));
         assert!(matches!(
             StructurallyRestoredCoverage::restore(&identity(), empty, [aligned(0, 10)]),
             Err(PersistedCoverageError::UnexpectedAnchor { map_index: 0 })

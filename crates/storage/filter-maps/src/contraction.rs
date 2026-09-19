@@ -47,8 +47,9 @@ where
 /// Checked physical key ranges that a later cleanup scheduler may consume.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CleanupRanges {
-    /// Complete row-key epochs safe for bounded row-table traversal.
-    pub row_epochs: Vec<FilterMapRowKeyRange>,
+    params_id: reth_filter_maps::ParamsId,
+    /// Complete epochs safe for bounded row-table traversal.
+    pub row_epochs: RangeInclusive<u32>,
     /// Directory keys.
     pub directories: RangeInclusive<u32>,
     /// Anchor keys.
@@ -69,12 +70,23 @@ impl CleanupRanges {
         if first_epoch > last_epoch || maps.is_empty() || pointers.is_empty() {
             return Err(FilterMapStorageError::Arithmetic)
         }
-        let mut row_epochs = Vec::with_capacity(
-            usize::try_from(last_epoch - first_epoch).unwrap_or(usize::MAX).saturating_add(1),
-        );
-        for epoch in first_epoch..=last_epoch {
-            row_epochs.push(FilterMapRowKeyRange::complete_epoch(params_id.into(), epoch)?);
+        // Validate both endpoints now; intermediate epochs use the same checked formula.
+        FilterMapRowKeyRange::complete_epoch(params_id.into(), first_epoch)?;
+        FilterMapRowKeyRange::complete_epoch(params_id.into(), last_epoch)?;
+        Ok(Self {
+            params_id,
+            row_epochs: first_epoch..=last_epoch,
+            directories: maps.clone(),
+            anchors: maps,
+            pointers,
+        })
+    }
+
+    /// Returns the checked physical row-key interval for a selected complete epoch.
+    pub fn row_epoch_range(&self, epoch: u32) -> Result<FilterMapRowKeyRange> {
+        if !self.row_epochs.contains(&epoch) {
+            return Err(FilterMapStorageError::Arithmetic)
         }
-        Ok(Self { row_epochs, directories: maps.clone(), anchors: maps, pointers })
+        Ok(FilterMapRowKeyRange::complete_epoch(self.params_id.into(), epoch)?)
     }
 }

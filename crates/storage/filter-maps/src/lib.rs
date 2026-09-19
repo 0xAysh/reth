@@ -73,6 +73,15 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_epoch_ranges_are_bounded_and_non_overlapping() {
+        let ranges = CleanupRanges::checked(ParamsId::Default, 0, 1, 0..=2_047, 0..=100).unwrap();
+        let first = ranges.row_epoch_range(0).unwrap();
+        let second = ranges.row_epoch_range(1).unwrap();
+        assert!(first.end < second.start);
+        assert!(ranges.row_epoch_range(2).is_err());
+    }
+
+    #[test]
     fn identity_initialization_is_explicit_and_idempotent() {
         let db = create_test_rw_db();
         let tx = db.tx_mut().unwrap();

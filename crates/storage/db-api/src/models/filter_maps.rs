@@ -276,6 +276,13 @@ impl StoredExtendedRow {
         if self.columns.is_empty() {
             return Err(FilterMapModelError::EmptyExtension)
         }
+        let max_extension = params
+            .max_row_length
+            .checked_sub(params.base_row_length)
+            .ok_or(FilterMapModelError::Arithmetic)?;
+        if self.columns.len() > max_extension as usize {
+            return Err(FilterMapModelError::ExcessRowLength)
+        }
         validate_columns(&self.columns, params.map_width)
     }
 }
@@ -358,6 +365,7 @@ struct PhysicalParams {
     map_width: u32,
     maps_per_epoch: u32,
     base_row_length: u32,
+    max_row_length: u32,
     group_size: u32,
 }
 
@@ -368,6 +376,7 @@ const fn params(id: u8) -> Result<PhysicalParams, FilterMapModelError> {
             map_width: 16_777_216,
             maps_per_epoch: 1_024,
             base_row_length: 8,
+            max_row_length: 8_192,
             group_size: 32,
         }),
         2 => Ok(PhysicalParams {
@@ -375,6 +384,7 @@ const fn params(id: u8) -> Result<PhysicalParams, FilterMapModelError> {
             map_width: 16_777_216,
             maps_per_epoch: 1,
             base_row_length: 1,
+            max_row_length: 1,
             group_size: 32,
         }),
         _ => Err(FilterMapModelError::UnknownParams),
@@ -724,6 +734,10 @@ impl_value!(
         let mut input = value;
         let count =
             usize::try_from(take_u32(&mut input)?).map_err(|_| FilterMapModelError::Arithmetic)?;
+        // Every descriptor has at least an origin tag and two map indices.
+        if count > input.len() / 9 {
+            return Err(FilterMapModelError::Length)
+        }
         let mut segments = Vec::with_capacity(count);
         let mut previous = None;
         for _ in 0..count {
