@@ -65,7 +65,7 @@ pub(crate) fn load_metadata<TX: DbTx>(
     Ok(RestoredMetadata { identity, coverage })
 }
 
-/// Loads every covered directory and reconciles its exact count with required payloads.
+/// Loads and validates every covered directory without touching row payload tables.
 pub(crate) fn load_directories<TX: DbTx>(
     tx: &TX,
     metadata: &RestoredMetadata,
@@ -82,7 +82,6 @@ pub(crate) fn load_directories<TX: DbTx>(
                     key: u64::from(map_index),
                 })
             }
-            read_map_rows(tx, &metadata.identity, map_index, &directory, false)?;
             directories.insert(map_index, directory);
         }
     }

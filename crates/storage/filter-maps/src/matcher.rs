@@ -16,6 +16,7 @@ pub struct FilterMapSegmentSource<TX> {
     maps: RangeInclusive<u32>,
     blocks: RangeInclusive<u64>,
     pointers: RangeInclusive<u64>,
+    validated_counts: BTreeMap<u32, ValidatedMapCount>,
 }
 
 impl<TX: DbTx> FilterMapSegmentSource<TX> {
@@ -33,13 +34,95 @@ impl<TX: DbTx> FilterMapSegmentSource<TX> {
         })?;
         let successor = blocks.end().checked_add(1).ok_or(FilterMapStorageError::Arithmetic)?;
         let pointers = *blocks.start()..=successor;
-        Ok(Self { snapshot, maps, blocks, pointers })
+        Ok(Self { snapshot, maps, blocks, pointers, validated_counts: BTreeMap::new() })
     }
 
     /// Returns the covered block interval pinned by this source.
     pub const fn blocks(&self) -> &RangeInclusive<u64> {
         &self.blocks
     }
+
+    fn validate_directory_count(
+        &mut self,
+        map_index: u32,
+        row_index: u32,
+        row_length: usize,
+    ) -> Result<(), FilterMapStorageError> {
+        let directory = &self.snapshot.directories[&map_index];
+        let params = self.snapshot.identity.params.params();
+        let extended_count = directory.extended.iter().map(|byte| byte.count_ones()).sum::<u32>();
+        let base_only_count = directory
+            .nonempty_row_count
+            .checked_sub(extended_count)
+            .ok_or(FilterMapStorageError::PayloadCountMismatch(map_index))?;
+        let state = match self.validated_counts.entry(map_index) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                let minimum = u64::from(base_only_count)
+                    .checked_add(
+                        u64::from(extended_count)
+                            .checked_mul(u64::from(params.base_row_length()) + 1)
+                            .ok_or(FilterMapStorageError::Arithmetic)?,
+                    )
+                    .ok_or(FilterMapStorageError::Arithmetic)?;
+                let maximum = u64::from(base_only_count)
+                    .checked_mul(u64::from(params.base_row_length()))
+                    .and_then(|count| {
+                        u64::from(extended_count)
+                            .checked_mul(u64::from(
+                                params.max_row_length(params.log_maps_per_epoch()),
+                            ))
+                            .and_then(|extended| count.checked_add(extended))
+                    })
+                    .ok_or(FilterMapStorageError::Arithmetic)?;
+                entry.insert(ValidatedMapCount { row_lengths: BTreeMap::new(), minimum, maximum })
+            }
+        };
+        let row_length =
+            u64::try_from(row_length).map_err(|_| FilterMapStorageError::Arithmetic)?;
+        if let Some(previous) = state.row_lengths.insert(row_index, row_length) {
+            state.minimum = state
+                .minimum
+                .checked_sub(previous)
+                .and_then(|count| count.checked_add(row_length))
+                .ok_or(FilterMapStorageError::Arithmetic)?;
+            state.maximum = state
+                .maximum
+                .checked_sub(previous)
+                .and_then(|count| count.checked_add(row_length))
+                .ok_or(FilterMapStorageError::Arithmetic)?;
+        } else {
+            let extended = directory.is_extended(row_index);
+            let generic_minimum =
+                if extended { u64::from(params.base_row_length()) + 1 } else { 1 };
+            let generic_maximum = if extended {
+                u64::from(params.max_row_length(params.log_maps_per_epoch()))
+            } else {
+                u64::from(params.base_row_length())
+            };
+            state.minimum = state
+                .minimum
+                .checked_sub(generic_minimum)
+                .and_then(|count| count.checked_add(row_length))
+                .ok_or(FilterMapStorageError::Arithmetic)?;
+            state.maximum = state
+                .maximum
+                .checked_sub(generic_maximum)
+                .and_then(|count| count.checked_add(row_length))
+                .ok_or(FilterMapStorageError::Arithmetic)?;
+        }
+        if !(state.minimum..=state.maximum).contains(&directory.logical_mark_count) {
+            return Err(FilterMapStorageError::PayloadCountMismatch(map_index))
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct ValidatedMapCount {
+    row_lengths: BTreeMap<u32, u64>,
+    minimum: u64,
+    maximum: u64,
 }
 
 impl<TX: DbTx + 'static> FilterMapMatchSource for FilterMapSegmentSource<TX> {
@@ -119,6 +202,7 @@ impl<TX: DbTx + 'static> FilterMapMatchSource for FilterMapSegmentSource<TX> {
                 rows.push(Vec::new());
                 continue
             }
+            let extended = directory.is_extended(row_index);
             let key = FilterMapBaseRowKey::new(params_id, map_index, row_index)?;
             let group = &groups[&key];
             let slot_index = FilterMapBaseRowKey::slot(params_id, map_index)?;
@@ -126,34 +210,42 @@ impl<TX: DbTx + 'static> FilterMapMatchSource for FilterMapSegmentSource<TX> {
                 .slots
                 .get(slot_index)
                 .ok_or(FilterMapStorageError::MissingBaseRow { map_index, row_index })?;
-            if base.is_empty() ||
-                (directory.is_extended(row_index) &&
-                    base.len() != params.base_row_length() as usize)
-            {
+            if base.is_empty() || (extended && base.len() != params.base_row_length() as usize) {
                 return Err(FilterMapStorageError::MissingBaseRow { map_index, row_index })
             }
+
+            let extension_key = FilterMapExtendedRowKey::new(params_id, map_index, row_index)?;
+            let coordinates = extension_key.validate(params_id)?;
+            if coordinates.map_index != map_index || coordinates.row_index != row_index {
+                return Err(FilterMapStorageError::KeyValueMismatch {
+                    kind: "extension row key",
+                    key: extension_key.get(),
+                })
+            }
+            let extension = self.snapshot.tx.get::<FilterMapExtendedRows>(extension_key)?;
+            if extension.as_ref().is_some_and(|extension| extension.params_id != params_id) {
+                return Err(FilterMapStorageError::KeyValueMismatch {
+                    kind: "extension parameter identity",
+                    key: extension_key.get(),
+                })
+            }
+            let extension = match (extended, extension) {
+                (true, Some(extension)) => extension.columns,
+                (true, None) => {
+                    return Err(FilterMapStorageError::MissingExtension { map_index, row_index })
+                }
+                (false, Some(_)) => {
+                    return Err(FilterMapStorageError::ContradictedPayload { map_index, row_index })
+                }
+                (false, None) => Vec::new(),
+            };
+            let row_length =
+                base.len().checked_add(extension.len()).ok_or(FilterMapStorageError::Arithmetic)?;
+            self.validate_directory_count(map_index, row_index, row_length)?;
+
             let mut row = base.iter().copied().take(limit).collect::<Vec<_>>();
-            if directory.is_extended(row_index) && row.len() < limit {
-                let extension_key = FilterMapExtendedRowKey::new(params_id, map_index, row_index)?;
-                let coordinates = extension_key.validate(params_id)?;
-                if coordinates.map_index != map_index || coordinates.row_index != row_index {
-                    return Err(FilterMapStorageError::KeyValueMismatch {
-                        kind: "extension row key",
-                        key: extension_key.get(),
-                    })
-                }
-                let extension = self
-                    .snapshot
-                    .tx
-                    .get::<FilterMapExtendedRows>(extension_key)?
-                    .ok_or(FilterMapStorageError::MissingExtension { map_index, row_index })?;
-                if extension.params_id != params_id {
-                    return Err(FilterMapStorageError::KeyValueMismatch {
-                        kind: "extension parameter identity",
-                        key: extension_key.get(),
-                    })
-                }
-                row.extend(extension.columns.into_iter().take(limit - row.len()));
+            if row.len() < limit {
+                row.extend(extension.into_iter().take(limit - row.len()));
             }
             rows.push(row);
         }

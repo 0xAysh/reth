@@ -495,7 +495,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_rejects_inexact_directory_mark_count() {
+    fn lazy_row_access_rejects_inexact_directory_mark_count() {
         let db = create_test_rw_db();
         let maps = maps();
         let tx = db.tx_mut().unwrap();
@@ -514,9 +514,102 @@ mod tests {
         directory.logical_mark_count += 1;
         tx.put::<FilterMapDirectories>(0, directory).unwrap();
         tx.commit().unwrap();
+        let snapshot = FilterMapReadSnapshot::new(db.tx().unwrap(), &identity()).unwrap();
+        let activated = snapshot
+            .activate(|number| {
+                Ok::<_, std::convert::Infallible>(Some(if number == 0 {
+                    B256::ZERO
+                } else {
+                    B256::repeat_byte(number as u8)
+                }))
+            })
+            .unwrap();
+        let mut source = activated.into_segment_source(0).unwrap();
+        let row = maps[0].map().rows()[0].row_index();
         assert!(matches!(
-            FilterMapReadSnapshot::new(db.tx().unwrap(), &identity()),
+            source.read_row_prefixes(&[0], row, 1),
             Err(FilterMapStorageError::PayloadCountMismatch(0))
+        ));
+    }
+
+    #[test]
+    fn lazy_access_requires_declared_extension_for_short_prefixes() {
+        let db = create_test_rw_db();
+        let maps = maps();
+        let row = maps[0].map().rows()[0].row_index();
+        let tx = db.tx_mut().unwrap();
+        initialize_identity(&tx, &identity()).unwrap();
+        publish_maps(
+            &tx,
+            &identity(),
+            PublicationStart::Open { origin: SegmentOrigin::Genesis },
+            &maps,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let tx = db.tx_mut().unwrap();
+        let mut directory = tx.get::<FilterMapDirectories>(0).unwrap().unwrap();
+        directory.extended[row as usize / 8] |= 1 << (row % 8);
+        directory.logical_mark_count = 2;
+        tx.put::<FilterMapDirectories>(0, directory).unwrap();
+        tx.commit().unwrap();
+
+        let snapshot = FilterMapReadSnapshot::new(db.tx().unwrap(), &identity()).unwrap();
+        let activated = snapshot
+            .activate(|number| {
+                Ok::<_, std::convert::Infallible>(Some(if number == 0 {
+                    B256::ZERO
+                } else {
+                    B256::repeat_byte(number as u8)
+                }))
+            })
+            .unwrap();
+        let mut source = activated.into_segment_source(0).unwrap();
+        assert!(matches!(
+            source.read_row_prefixes(&[0], row, 1),
+            Err(FilterMapStorageError::MissingExtension { map_index: 0, row_index })
+                if row_index == row
+        ));
+    }
+
+    #[test]
+    fn snapshot_defers_missing_required_payload_until_row_access() {
+        let db = create_test_rw_db();
+        let maps = maps();
+        let row = maps[0].map().rows()[0].row_index();
+        let key = FilterMapBaseRowKey::new(ParamsId::RangeTest.into(), 0, row).unwrap();
+        let tx = db.tx_mut().unwrap();
+        initialize_identity(&tx, &identity()).unwrap();
+        publish_maps(
+            &tx,
+            &identity(),
+            PublicationStart::Open { origin: SegmentOrigin::Genesis },
+            &maps,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let tx = db.tx_mut().unwrap();
+        tx.delete::<FilterMapBaseRows>(key, None).unwrap();
+        tx.commit().unwrap();
+
+        // Snapshot construction is metadata-only and must not touch the missing row payload.
+        let snapshot = FilterMapReadSnapshot::new(db.tx().unwrap(), &identity()).unwrap();
+        let activated = snapshot
+            .activate(|number| {
+                Ok::<_, std::convert::Infallible>(Some(if number == 0 {
+                    B256::ZERO
+                } else {
+                    B256::repeat_byte(number as u8)
+                }))
+            })
+            .unwrap();
+        let mut source = activated.into_segment_source(0).unwrap();
+        assert!(matches!(
+            source.read_row_prefixes(&[0], row, 1),
+            Err(FilterMapStorageError::MissingBaseRow { map_index: 0, row_index })
+                if row_index == row
         ));
     }
 

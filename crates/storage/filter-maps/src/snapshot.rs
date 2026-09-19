@@ -25,7 +25,7 @@ pub struct FilterMapReadSnapshot<TX> {
 }
 
 impl<TX: DbTx> FilterMapReadSnapshot<TX> {
-    /// Loads and structurally validates identity, coverage, anchors, directories, and row counts.
+    /// Eagerly validates identity, coverage, anchors, and directory metadata only.
     pub fn new(tx: TX, running: &IndexIdentity) -> Result<Self> {
         let metadata = load_metadata(&tx, running)?;
         let directories = load_directories(&tx, &metadata)?;
