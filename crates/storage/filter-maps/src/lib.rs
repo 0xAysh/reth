@@ -29,7 +29,7 @@ pub use store::{initialize_identity, publish, PublicationStart};
 mod tests {
     use super::*;
     use alloy_primitives::{Address, B256};
-    use reth_db::test_utils::create_test_rw_db;
+    use reth_db::{init_db, mdbx::DatabaseArguments, test_utils::create_test_rw_db};
     use reth_db_api::{
         database::Database,
         tables::{FilterMapBlockPointers, FilterMapCoverage, FilterMapDirectories},
@@ -142,6 +142,30 @@ mod tests {
         assert_eq!(source.block_pointer(0).unwrap(), 0);
         assert_eq!(source.block_pointer(1).unwrap(), 2);
         assert!(source.block_pointer(2).is_err());
+    }
+
+    #[test]
+    fn committed_state_restores_after_database_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        {
+            let db = init_db(directory.path(), DatabaseArguments::test()).unwrap();
+            let tx = db.tx_mut().unwrap();
+            initialize_identity(&tx, &identity()).unwrap();
+            publish(
+                &tx,
+                &identity(),
+                PublicationStart::Open { origin: SegmentOrigin::Genesis },
+                &maps(),
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+        {
+            let db = init_db(directory.path(), DatabaseArguments::test()).unwrap();
+            let snapshot = FilterMapReadSnapshot::new(db.tx().unwrap(), &identity()).unwrap();
+            assert_eq!(snapshot.restored().segments().len(), 1);
+            assert_eq!(snapshot.restored().segments()[0].terminal().completed_map_index, 1);
+        }
     }
 
     #[test]
