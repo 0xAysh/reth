@@ -162,7 +162,7 @@ pub(crate) fn build_publication<TX: DbTx>(
                 entry.insert(group);
             }
             let group = base_groups.get_mut(&base_key).expect("inserted above");
-            let slot = params.map_group_offset(map_index) as usize;
+            let slot = FilterMapBaseRowKey::slot(params_id, map_index)?;
             group.slots[slot].clear();
             let extension_key = FilterMapExtendedRowKey::new(params_id, map_index, row_index)?;
             extensions.insert(extension_key, None);
@@ -200,10 +200,11 @@ fn validate_shape(
     if maps.len() > MAX_BATCH {
         return Err(FilterMapStorageError::OversizedPublication(maps.len()))
     }
-    let params = identity.params.params();
     let first = maps[0].map().map_index();
     let last = maps.last().expect("nonempty").map().map_index();
-    if params.map_group_index(first) != params.map_group_index(last) {
+    if FilterMapBaseRowKey::new(u8::from(identity.params), first, 0)? !=
+        FilterMapBaseRowKey::new(u8::from(identity.params), last, 0)?
+    {
         return Err(FilterMapStorageError::InvalidMapSequence)
     }
     let expected_first = match start {
@@ -318,17 +319,30 @@ fn retry_coverage_matches(
     let first = maps[0].map().map_index();
     let last = maps.last().expect("nonempty publication").map().map_index();
     coverage.segments().iter().any(|segment| {
-        segment.maps().contains(&first) &&
-            segment.terminal().completed_map_index == last &&
-            match start {
-                PublicationStart::Open { origin } => {
-                    segment.first_map() == first && segment.origin() == origin
+        if !segment.maps().contains(&first) || !segment.maps().contains(&last) {
+            return false
+        }
+        let predecessor_matches = match start {
+            PublicationStart::Open { origin } => match origin.anchor() {
+                None => segment.first_map() == 0 && segment.origin() == origin,
+                Some(anchor) => {
+                    anchor.completed_map_index.checked_add(1) == Some(first) &&
+                        segment.contains_anchor(anchor)
                 }
-                PublicationStart::Extend { from } => {
-                    from.completed_map_index.checked_add(1) == Some(first) &&
-                        segment.contains_anchor(*from)
-                }
+            },
+            PublicationStart::Extend { from } => {
+                from.completed_map_index.checked_add(1) == Some(first) &&
+                    segment.contains_anchor(*from)
             }
+        };
+        if !predecessor_matches {
+            return false
+        }
+        maps.iter().all(|map| {
+            let anchor = map.resume_anchor();
+            segment.anchors().get((anchor.completed_map_index - segment.first_map()) as usize) ==
+                Some(&anchor)
+        })
     })
 }
 

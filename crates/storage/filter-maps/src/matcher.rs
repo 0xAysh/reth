@@ -84,7 +84,10 @@ impl<TX: DbTx + 'static> FilterMapMatchSource for FilterMapSegmentSource<TX> {
             if directory.is_nonempty(row_index) {
                 let key = FilterMapBaseRowKey::new(params_id, map_index, row_index)?;
                 let coordinates = key.validate(params_id)?;
-                if coordinates.group_start != params.map_group_index(map_index) ||
+                let slot = FilterMapBaseRowKey::slot(params_id, map_index)?;
+                if coordinates.group_start.checked_add(
+                    u32::try_from(slot).map_err(|_| FilterMapStorageError::Arithmetic)?,
+                ) != Some(map_index) ||
                     coordinates.row_index != row_index
                 {
                     return Err(FilterMapStorageError::KeyValueMismatch {
@@ -118,7 +121,7 @@ impl<TX: DbTx + 'static> FilterMapMatchSource for FilterMapSegmentSource<TX> {
             }
             let key = FilterMapBaseRowKey::new(params_id, map_index, row_index)?;
             let group = &groups[&key];
-            let slot_index = params.map_group_offset(map_index) as usize;
+            let slot_index = FilterMapBaseRowKey::slot(params_id, map_index)?;
             let base = group
                 .slots
                 .get(slot_index)

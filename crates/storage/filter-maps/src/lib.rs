@@ -33,14 +33,19 @@ mod tests {
     use reth_db::{init_db, mdbx::DatabaseArguments, test_utils::create_test_rw_db};
     use reth_db_api::{
         database::Database,
-        models::{FilterMapBaseRowKey, StoredBaseRowGroup},
+        models::{FilterMapBaseRowKey, StoredBaseRowGroup, StoredCoverageCatalog},
         tables::{
             FilterMapBaseRows, FilterMapBlockPointers, FilterMapCoverage, FilterMapDirectories,
+            FilterMapIdentity,
         },
         transaction::{DbTx, DbTxMut},
     };
     use reth_filter_maps::{
-        coverage::{IndexIdentity, SegmentOrigin, STORAGE_FORMAT_V1},
+        coverage::{
+            CheckpointProvenance, IndexIdentity, SegmentOrigin, StoredCoverageRecord,
+            StoredSegmentOrigin, StoredSegmentRecord, StructurallyRestoredCoverage,
+            STORAGE_FORMAT_V1,
+        },
         BlockInput, FilterMapMatchSource, FilterMapMatcher, FilterMapRenderer, IndexedMatchRange,
         LogInput, LogValueStream, LogValueStreamTermination, MatchPattern, ParamsId,
         RendererOutput, ValueSpaceAnchor, DEFAULT_PARAMS, GETH_V1, RANGE_TEST_PARAMS,
@@ -51,10 +56,51 @@ mod tests {
     }
 
     fn maps() -> Vec<reth_filter_maps::AnchoredCompletedMap> {
-        maps_with_address(1)
+        maps_with_address(1, 2)
     }
 
-    fn maps_with_address(address: u8) -> Vec<reth_filter_maps::AnchoredCompletedMap> {
+    fn checkpoint_origin(
+        identity: IndexIdentity,
+        origin_anchor: reth_filter_maps::coverage::MapResumeAnchor,
+        terminal: reth_filter_maps::coverage::MapResumeAnchor,
+    ) -> SegmentOrigin {
+        let first_map = origin_anchor.completed_map_index + 1;
+        let restored = StructurallyRestoredCoverage::restore(
+            &identity,
+            StoredCoverageRecord {
+                identity,
+                segments: vec![StoredSegmentRecord {
+                    origin: StoredSegmentOrigin::Checkpoint {
+                        origin_anchor,
+                        provenance: CheckpointProvenance::Recognized { id: 1 },
+                    },
+                    first_map,
+                    terminal_map: terminal.completed_map_index,
+                }],
+            },
+            [terminal],
+        )
+        .unwrap();
+        restored.segments()[0].origin().clone()
+    }
+
+    fn publish_maps<TX>(
+        tx: &TX,
+        identity: &IndexIdentity,
+        mut start: PublicationStart,
+        maps: &[reth_filter_maps::AnchoredCompletedMap],
+    ) -> Result<()>
+    where
+        TX: DbTx + DbTxMut,
+    {
+        for map in maps {
+            publish(tx, identity, start, std::slice::from_ref(map))?;
+            start = PublicationStart::Extend { from: map.resume_anchor() };
+        }
+        Ok(())
+    }
+
+    fn maps_with_address(address: u8, count: usize) -> Vec<reth_filter_maps::AnchoredCompletedMap> {
         let blocks = vec![
             BlockInput::new(0, B256::ZERO, [LogInput::new(Address::repeat_byte(address), [])]),
             BlockInput::new(1, B256::repeat_byte(1), []),
@@ -67,7 +113,7 @@ mod tests {
         );
         let mut renderer = FilterMapRenderer::from_genesis(stream).unwrap();
         let mut maps = Vec::new();
-        while maps.len() < 2 {
+        while maps.len() < count {
             match renderer.render_next().unwrap().unwrap() {
                 RendererOutput::Map(map) => maps.push(map),
                 RendererOutput::Complete(_) => panic!("expected two maps"),
@@ -83,6 +129,9 @@ mod tests {
         let second = ranges.row_epoch_range(1).unwrap();
         assert!(first.end < second.start);
         assert!(ranges.row_epoch_range(2).is_err());
+
+        let ranges = CleanupRanges::checked(ParamsId::RangeTest, 0, 1, 0..=1, 0..=1).unwrap();
+        assert!(ranges.row_epoch_range(0).unwrap().end < ranges.row_epoch_range(1).unwrap().start);
     }
 
     #[test]
@@ -117,6 +166,28 @@ mod tests {
     }
 
     #[test]
+    fn singleton_rows_under_nonzero_keys_fail_closed() {
+        let db = create_test_rw_db();
+        let tx = db.tx_mut().unwrap();
+        tx.put::<FilterMapIdentity>(1, crate::codec::identity_to_db(&identity())).unwrap();
+        tx.commit().unwrap();
+        assert!(matches!(
+            FilterMapReadSnapshot::new(db.tx().unwrap(), &identity()),
+            Err(FilterMapStorageError::IncompleteStore)
+        ));
+
+        let db = create_test_rw_db();
+        let tx = db.tx_mut().unwrap();
+        tx.put::<FilterMapIdentity>(0, crate::codec::identity_to_db(&identity())).unwrap();
+        tx.put::<FilterMapCoverage>(1, StoredCoverageCatalog { segments: Vec::new() }).unwrap();
+        tx.commit().unwrap();
+        assert!(matches!(
+            FilterMapReadSnapshot::new(db.tx().unwrap(), &identity()),
+            Err(FilterMapStorageError::IncompleteStore)
+        ));
+    }
+
+    #[test]
     fn publish_reopen_and_matcher_reads_exact_rows() {
         let db = create_test_rw_db();
         let maps = maps();
@@ -126,8 +197,13 @@ mod tests {
 
         let tx = db.tx_mut().unwrap();
         initialize_identity(&tx, &identity()).unwrap();
-        publish(&tx, &identity(), PublicationStart::Open { origin: SegmentOrigin::Genesis }, &maps)
-            .unwrap();
+        publish_maps(
+            &tx,
+            &identity(),
+            PublicationStart::Open { origin: SegmentOrigin::Genesis },
+            &maps,
+        )
+        .unwrap();
         tx.commit().unwrap();
 
         let snapshot = FilterMapReadSnapshot::new(db.tx().unwrap(), &identity()).unwrap();
@@ -155,7 +231,7 @@ mod tests {
             let db = init_db(directory.path(), DatabaseArguments::test()).unwrap();
             let tx = db.tx_mut().unwrap();
             initialize_identity(&tx, &identity()).unwrap();
-            publish(
+            publish_maps(
                 &tx,
                 &identity(),
                 PublicationStart::Open { origin: SegmentOrigin::Genesis },
@@ -180,7 +256,7 @@ mod tests {
         tx.commit().unwrap();
 
         let tx = db.tx_mut().unwrap();
-        publish(
+        publish_maps(
             &tx,
             &identity(),
             PublicationStart::Open { origin: SegmentOrigin::Genesis },
@@ -199,8 +275,13 @@ mod tests {
         let maps = maps();
         let tx = db.tx_mut().unwrap();
         initialize_identity(&tx, &identity()).unwrap();
-        publish(&tx, &identity(), PublicationStart::Open { origin: SegmentOrigin::Genesis }, &maps)
-            .unwrap();
+        publish_maps(
+            &tx,
+            &identity(),
+            PublicationStart::Open { origin: SegmentOrigin::Genesis },
+            &maps,
+        )
+        .unwrap();
         tx.commit().unwrap();
 
         let tx = db.tx_mut().unwrap();
@@ -213,7 +294,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            publish(
+            publish_maps(
                 &tx,
                 &identity(),
                 PublicationStart::Open { origin: SegmentOrigin::Genesis },
@@ -230,8 +311,13 @@ mod tests {
         let maps = maps();
         let tx = db.tx_mut().unwrap();
         initialize_identity(&tx, &identity()).unwrap();
-        publish(&tx, &identity(), PublicationStart::Open { origin: SegmentOrigin::Genesis }, &maps)
-            .unwrap();
+        publish_maps(
+            &tx,
+            &identity(),
+            PublicationStart::Open { origin: SegmentOrigin::Genesis },
+            &maps,
+        )
+        .unwrap();
         tx.commit().unwrap();
 
         let tx = db.tx_mut().unwrap();
@@ -259,8 +345,13 @@ mod tests {
         let maps = maps();
         let tx = db.tx_mut().unwrap();
         initialize_identity(&tx, &identity()).unwrap();
-        publish(&tx, &identity(), PublicationStart::Open { origin: SegmentOrigin::Genesis }, &maps)
-            .unwrap();
+        publish_maps(
+            &tx,
+            &identity(),
+            PublicationStart::Open { origin: SegmentOrigin::Genesis },
+            &maps,
+        )
+        .unwrap();
         tx.commit().unwrap();
 
         let activated = FilterMapReadSnapshot::new(db.tx().unwrap(), &identity())
@@ -276,14 +367,83 @@ mod tests {
         let maps = maps();
         let tx = db.tx_mut().unwrap();
         initialize_identity(&tx, &identity()).unwrap();
-        publish(&tx, &identity(), PublicationStart::Open { origin: SegmentOrigin::Genesis }, &maps)
-            .unwrap();
+        publish_maps(
+            &tx,
+            &identity(),
+            PublicationStart::Open { origin: SegmentOrigin::Genesis },
+            &maps,
+        )
+        .unwrap();
         tx.commit().unwrap();
 
         let tx = db.tx_mut().unwrap();
-        publish(&tx, &identity(), PublicationStart::Open { origin: SegmentOrigin::Genesis }, &maps)
+        publish_maps(
+            &tx,
+            &identity(),
+            PublicationStart::Open { origin: SegmentOrigin::Genesis },
+            &maps,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn retries_survive_adjacent_segment_merges() {
+        let maps = maps();
+        let checkpoint =
+            checkpoint_origin(identity(), maps[0].resume_anchor(), maps[1].resume_anchor());
+
+        // Opening an adjacent checkpoint segment merges it into its predecessor. Retrying the
+        // original open publication still compares the exact batch subrange.
+        let db = create_test_rw_db();
+        let tx = db.tx_mut().unwrap();
+        initialize_identity(&tx, &identity()).unwrap();
+        publish(
+            &tx,
+            &identity(),
+            PublicationStart::Open { origin: SegmentOrigin::Genesis },
+            &maps[..1],
+        )
+        .unwrap();
+        publish(
+            &tx,
+            &identity(),
+            PublicationStart::Open { origin: checkpoint.clone() },
+            &maps[1..],
+        )
+        .unwrap();
+        publish(&tx, &identity(), PublicationStart::Open { origin: checkpoint }, &maps[1..])
             .unwrap();
         tx.commit().unwrap();
+        let snapshot = FilterMapReadSnapshot::new(db.tx().unwrap(), &identity()).unwrap();
+        assert_eq!(snapshot.restored().segments().len(), 1);
+
+        // Publishing the predecessor after the following checkpoint segment also merges. An
+        // equivalent extension retry recognizes its predecessor anchor inside the merged segment.
+        let checkpoint =
+            checkpoint_origin(identity(), maps[0].resume_anchor(), maps[1].resume_anchor());
+        let db = create_test_rw_db();
+        let tx = db.tx_mut().unwrap();
+        initialize_identity(&tx, &identity()).unwrap();
+        publish(&tx, &identity(), PublicationStart::Open { origin: checkpoint }, &maps[1..])
+            .unwrap();
+        publish(
+            &tx,
+            &identity(),
+            PublicationStart::Open { origin: SegmentOrigin::Genesis },
+            &maps[..1],
+        )
+        .unwrap();
+        publish(
+            &tx,
+            &identity(),
+            PublicationStart::Extend { from: maps[0].resume_anchor() },
+            &maps[1..],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let snapshot = FilterMapReadSnapshot::new(db.tx().unwrap(), &identity()).unwrap();
+        assert_eq!(snapshot.restored().segments().len(), 1);
     }
 
     #[test]
@@ -292,8 +452,13 @@ mod tests {
         let maps = maps();
         let tx = db.tx_mut().unwrap();
         initialize_identity(&tx, &identity()).unwrap();
-        publish(&tx, &identity(), PublicationStart::Open { origin: SegmentOrigin::Genesis }, &maps)
-            .unwrap();
+        publish_maps(
+            &tx,
+            &identity(),
+            PublicationStart::Open { origin: SegmentOrigin::Genesis },
+            &maps,
+        )
+        .unwrap();
         tx.commit().unwrap();
 
         let map_index = 0;
@@ -311,13 +476,14 @@ mod tests {
             .get::<FilterMapBaseRows>(key)
             .unwrap()
             .unwrap_or_else(|| StoredBaseRowGroup::empty(ParamsId::RangeTest.into()).unwrap());
-        group.slots[RANGE_TEST_PARAMS.map_group_offset(map_index) as usize] = vec![0];
+        group.slots[FilterMapBaseRowKey::slot(ParamsId::RangeTest.into(), map_index).unwrap()] =
+            vec![0];
         tx.put::<FilterMapBaseRows>(key, group).unwrap();
         tx.commit().unwrap();
 
         let tx = db.tx_mut().unwrap();
         assert!(matches!(
-            publish(
+            publish_maps(
                 &tx,
                 &identity(),
                 PublicationStart::Open { origin: SegmentOrigin::Genesis },
@@ -334,8 +500,13 @@ mod tests {
         let maps = maps();
         let tx = db.tx_mut().unwrap();
         initialize_identity(&tx, &identity()).unwrap();
-        publish(&tx, &identity(), PublicationStart::Open { origin: SegmentOrigin::Genesis }, &maps)
-            .unwrap();
+        publish_maps(
+            &tx,
+            &identity(),
+            PublicationStart::Open { origin: SegmentOrigin::Genesis },
+            &maps,
+        )
+        .unwrap();
         tx.commit().unwrap();
 
         let tx = db.tx_mut().unwrap();
@@ -356,7 +527,7 @@ mod tests {
             let maps = maps();
             let tx = db.tx_mut().unwrap();
             initialize_identity(&tx, &identity()).unwrap();
-            publish(
+            publish_maps(
                 &tx,
                 &identity(),
                 PublicationStart::Open { origin: SegmentOrigin::Genesis },
@@ -400,7 +571,7 @@ mod tests {
         let old = FilterMapReadSnapshot::new(db.tx().unwrap(), &identity()).unwrap();
 
         let tx = db.tx_mut().unwrap();
-        publish(
+        publish_maps(
             &tx,
             &identity(),
             PublicationStart::Open { origin: SegmentOrigin::Genesis },
@@ -417,14 +588,14 @@ mod tests {
     #[test]
     fn uncovered_stale_maps_can_be_replaced() {
         let db = create_test_rw_db();
-        let original = maps_with_address(1);
-        let replacement = maps_with_address(2);
+        let original = maps_with_address(1, 2);
+        let replacement = maps_with_address(2, 2);
         let old_row = original[0].map().rows()[0].row_index();
         let new_row = replacement[0].map().rows()[0].row_index();
         let expected = replacement[0].map().rows()[0].columns().to_vec();
         let tx = db.tx_mut().unwrap();
         initialize_identity(&tx, &identity()).unwrap();
-        publish(
+        publish_maps(
             &tx,
             &identity(),
             PublicationStart::Open { origin: SegmentOrigin::Genesis },
@@ -437,7 +608,7 @@ mod tests {
         contract_for_reorg(&tx, &identity(), 0, None).unwrap();
         tx.commit().unwrap();
         let tx = db.tx_mut().unwrap();
-        publish(
+        publish_maps(
             &tx,
             &identity(),
             PublicationStart::Open { origin: SegmentOrigin::Genesis },
@@ -473,8 +644,13 @@ mod tests {
         let terminal = maps[1].resume_anchor();
         let tx = db.tx_mut().unwrap();
         initialize_identity(&tx, &identity()).unwrap();
-        publish(&tx, &identity(), PublicationStart::Open { origin: SegmentOrigin::Genesis }, &maps)
-            .unwrap();
+        publish_maps(
+            &tx,
+            &identity(),
+            PublicationStart::Open { origin: SegmentOrigin::Genesis },
+            &maps,
+        )
+        .unwrap();
         tx.commit().unwrap();
 
         let tx = db.tx_mut().unwrap();
@@ -562,8 +738,13 @@ mod tests {
         let maps = maps();
         let tx = db.tx_mut().unwrap();
         initialize_identity(&tx, &identity()).unwrap();
-        publish(&tx, &identity(), PublicationStart::Open { origin: SegmentOrigin::Genesis }, &maps)
-            .unwrap();
+        publish_maps(
+            &tx,
+            &identity(),
+            PublicationStart::Open { origin: SegmentOrigin::Genesis },
+            &maps,
+        )
+        .unwrap();
         tx.commit().unwrap();
 
         let tx = db.tx_mut().unwrap();

@@ -185,11 +185,17 @@ impl StoredMapRowDirectory {
 pub struct FilterMapBaseRowKey(pub u64);
 
 impl FilterMapBaseRowKey {
-    /// Computes the aligned grouped-row key for `map_index` and `row_index`.
+    /// Computes the epoch-local aligned grouped-row key for `map_index` and `row_index`.
     pub fn new(params_id: u8, map_index: u32, row_index: u32) -> Result<Self, FilterMapModelError> {
         let params = params(params_id)?;
-        let group = map_index & !(params.group_size - 1);
-        linearized_key(params, group, row_index).map(Self)
+        linearized_key(params, base_group_start(params, map_index)?, row_index).map(Self)
+    }
+
+    /// Returns the slot occupied by `map_index` in its epoch-local base group.
+    pub fn slot(params_id: u8, map_index: u32) -> Result<usize, FilterMapModelError> {
+        let params = params(params_id)?;
+        let offset = map_index % params.maps_per_epoch;
+        usize::try_from(offset % params.group_size).map_err(|_| FilterMapModelError::Arithmetic)
     }
 
     /// Validates and decodes this key under a recognized parameter identity.
@@ -199,7 +205,8 @@ impl FilterMapBaseRowKey {
     ) -> Result<FilterMapBaseRowCoordinates, FilterMapModelError> {
         let params = params(params_id)?;
         let coordinates = decode_linearized_key(params, self.0)?;
-        if !coordinates.map_index.is_multiple_of(params.group_size) {
+        let epoch_offset = coordinates.map_index % params.maps_per_epoch;
+        if !epoch_offset.is_multiple_of(params.group_size) {
             return Err(FilterMapModelError::GroupMisalignment)
         }
         Ok(FilterMapBaseRowCoordinates {
@@ -431,6 +438,16 @@ const fn params(id: u8) -> Result<PhysicalParams, FilterMapModelError> {
         }),
         _ => Err(FilterMapModelError::UnknownParams),
     }
+}
+
+fn base_group_start(params: PhysicalParams, map_index: u32) -> Result<u32, FilterMapModelError> {
+    let epoch_start = (map_index / params.maps_per_epoch)
+        .checked_mul(params.maps_per_epoch)
+        .ok_or(FilterMapModelError::Arithmetic)?;
+    let epoch_offset = map_index % params.maps_per_epoch;
+    epoch_start
+        .checked_add(epoch_offset & !(params.group_size - 1))
+        .ok_or(FilterMapModelError::Arithmetic)
 }
 
 fn linearized_key(
@@ -885,9 +902,19 @@ mod tests {
         assert_eq!(aligned.group_start, 32);
         assert_eq!(aligned.row_index, 7);
 
-        let epoch0 = FilterMapRowKeyRange::complete_epoch(1, 0).unwrap();
-        let epoch1 = FilterMapRowKeyRange::complete_epoch(1, 1).unwrap();
-        assert!(epoch0.end < epoch1.start);
+        for params_id in [1, 2] {
+            let epoch0 = FilterMapRowKeyRange::complete_epoch(params_id, 0).unwrap();
+            let epoch1 = FilterMapRowKeyRange::complete_epoch(params_id, 1).unwrap();
+            assert!(epoch0.end < epoch1.start);
+        }
+
+        let range_map0 = FilterMapBaseRowKey::new(2, 0, 7).unwrap();
+        let range_map1 = FilterMapBaseRowKey::new(2, 1, 7).unwrap();
+        assert_ne!(range_map0, range_map1);
+        assert_eq!(FilterMapBaseRowKey::slot(2, 0).unwrap(), 0);
+        assert_eq!(FilterMapBaseRowKey::slot(2, 1).unwrap(), 0);
+        assert_eq!(range_map1.validate(2).unwrap().group_start, 1);
+        assert_eq!(range_map1.validate(2).unwrap().row_index, 7);
     }
 
     #[test]

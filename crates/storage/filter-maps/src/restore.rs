@@ -29,18 +29,21 @@ pub(crate) fn load_metadata<TX: DbTx>(
     tx: &TX,
     running: &IndexIdentity,
 ) -> Result<RestoredMetadata> {
-    if tx.entries::<FilterMapIdentity>()? != 1 || tx.entries::<FilterMapCoverage>()? > 1 {
+    let identity_entries = tx.entries::<FilterMapIdentity>()?;
+    let identity = tx.get::<FilterMapIdentity>(SINGLETON_KEY)?;
+    if identity_entries != 1 || identity.is_none() {
         return Err(FilterMapStorageError::IncompleteStore)
     }
-    let identity = tx
-        .get::<FilterMapIdentity>(SINGLETON_KEY)?
-        .ok_or(FilterMapStorageError::MissingIdentity)
-        .and_then(identity_from_db)?;
+    let identity = identity_from_db(identity.expect("checked as present"))?;
     running.check_compatible(&identity)?;
 
-    let catalog = tx
-        .get::<FilterMapCoverage>(SINGLETON_KEY)?
-        .unwrap_or(reth_db_api::models::StoredCoverageCatalog { segments: Vec::new() });
+    let coverage_entries = tx.entries::<FilterMapCoverage>()?;
+    let catalog = tx.get::<FilterMapCoverage>(SINGLETON_KEY)?;
+    if coverage_entries > 1 || (coverage_entries == 1 && catalog.is_none()) {
+        return Err(FilterMapStorageError::IncompleteStore)
+    }
+    let catalog =
+        catalog.unwrap_or(reth_db_api::models::StoredCoverageCatalog { segments: Vec::new() });
     let record = catalog_from_db(identity, catalog)?;
     let mut anchors = Vec::new();
     for segment in &record.segments {
@@ -110,7 +113,11 @@ pub(crate) fn read_map_rows<TX: DbTx>(
 
         let base_key = FilterMapBaseRowKey::new(params_id, map_index, row_index)?;
         let coordinates = base_key.validate(params_id)?;
-        if coordinates.group_start != params.map_group_index(map_index) ||
+        let slot = FilterMapBaseRowKey::slot(params_id, map_index)?;
+        if coordinates
+            .group_start
+            .checked_add(u32::try_from(slot).map_err(|_| FilterMapStorageError::Arithmetic)?) !=
+            Some(map_index) ||
             coordinates.row_index != row_index
         {
             return Err(FilterMapStorageError::KeyValueMismatch {
@@ -125,9 +132,7 @@ pub(crate) fn read_map_rows<TX: DbTx>(
                 key: base_key.get(),
             })
         }
-        let base = group
-            .as_ref()
-            .and_then(|group| group.slots.get(params.map_group_offset(map_index) as usize));
+        let base = group.as_ref().and_then(|group| group.slots.get(slot));
 
         let extension_key = FilterMapExtendedRowKey::new(params_id, map_index, row_index)?;
         let extension_coordinates = extension_key.validate(params_id)?;
