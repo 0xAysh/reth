@@ -334,6 +334,29 @@ mod tests {
     }
 
     #[test]
+    fn retention_contraction_persists_without_deletion() {
+        let db = create_test_rw_db();
+        let maps = maps();
+        let terminal = maps[1].resume_anchor();
+        let tx = db.tx_mut().unwrap();
+        initialize_identity(&tx, &identity()).unwrap();
+        publish(&tx, &identity(), PublicationStart::Open { origin: SegmentOrigin::Genesis }, &maps)
+            .unwrap();
+        tx.commit().unwrap();
+
+        let tx = db.tx_mut().unwrap();
+        retain_after(&tx, &identity(), terminal).unwrap();
+        tx.commit().unwrap();
+        let tx = db.tx().unwrap();
+        assert!(tx.get::<FilterMapDirectories>(0).unwrap().is_some());
+        assert!(FilterMapReadSnapshot::new(tx, &identity())
+            .unwrap()
+            .restored()
+            .segments()
+            .is_empty());
+    }
+
+    #[test]
     fn contraction_only_changes_visibility() {
         let db = create_test_rw_db();
         let maps = maps();
