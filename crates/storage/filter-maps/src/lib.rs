@@ -213,6 +213,16 @@ mod tests {
             FilterMapReadSnapshot::new(db.tx().unwrap(), &identity()),
             Err(FilterMapStorageError::MissingDirectory(0))
         ));
+
+        // Metadata-only contraction remains available to hide corrupt payload state.
+        let tx = db.tx_mut().unwrap();
+        contract_for_reorg(&tx, &identity(), 0, None).unwrap();
+        tx.commit().unwrap();
+        assert!(FilterMapReadSnapshot::new(db.tx().unwrap(), &identity())
+            .unwrap()
+            .restored()
+            .segments()
+            .is_empty());
     }
 
     #[test]

@@ -48,6 +48,7 @@ pub(crate) fn build_publication<TX: DbTx>(
     let identity = load_identity(tx, running)?;
     validate_shape(&identity, start, maps)?;
     let current = load_coverage(tx, &identity)?;
+    validate_current_directories(tx, &identity, &current)?;
     let params = identity.params.params();
     let params_id = u8::from(identity.params);
 
@@ -226,6 +227,18 @@ pub(crate) fn load_coverage<TX: DbTx>(
                 })
             }
             anchors.push(anchor_from_db(stored)?);
+        }
+    }
+    Ok(StructurallyRestoredCoverage::restore(identity, record, anchors)?)
+}
+
+fn validate_current_directories<TX: DbTx>(
+    tx: &TX,
+    identity: &IndexIdentity,
+    coverage: &StructurallyRestoredCoverage,
+) -> Result<()> {
+    for segment in coverage.segments() {
+        for map_index in segment.maps() {
             let directory = tx
                 .get::<FilterMapDirectories>(map_index)?
                 .ok_or(FilterMapStorageError::MissingDirectory(map_index))?;
@@ -237,7 +250,7 @@ pub(crate) fn load_coverage<TX: DbTx>(
             }
         }
     }
-    Ok(StructurallyRestoredCoverage::restore(identity, record, anchors)?)
+    Ok(())
 }
 
 fn validate_shape(
