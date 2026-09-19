@@ -205,7 +205,7 @@ impl CoverageSet {
         Ok(())
     }
 
-    fn insert(&mut self, segment: ValidatedSegment) -> Result<(), PublishError> {
+    pub(super) fn insert(&mut self, segment: ValidatedSegment) -> Result<(), PublishError> {
         self.identity.check_compatible(segment.identity()).map_err(PublishError::Identity)?;
         let index =
             self.segments.partition_point(|existing| existing.first_map() < segment.first_map());

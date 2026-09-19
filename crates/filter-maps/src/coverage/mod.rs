@@ -10,6 +10,7 @@
 mod anchor;
 mod eligibility;
 mod identity;
+mod persisted;
 mod plan;
 mod segment;
 mod set;
@@ -24,6 +25,10 @@ pub use eligibility::{BlockReceiptEvidence, IneligibilityReason, IneligibleBlock
 pub use identity::{
     IdentityMismatch, IndexIdentity, StorageFormatVersion, UnknownStorageFormatVersion,
     STORAGE_FORMAT_V1,
+};
+pub use persisted::{
+    CanonicalActivationError, PersistedCoverageError, QueryableCoverage, StoredCoverageRecord,
+    StoredSegmentOrigin, StoredSegmentRecord, StructurallyRestoredCoverage,
 };
 pub use plan::{
     CandidateSource, CanonicalityChanged, LogQueryTarget, PlanError, PlannedSubrange, QueryPlan,

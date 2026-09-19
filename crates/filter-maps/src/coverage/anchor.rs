@@ -140,6 +140,10 @@ pub enum CheckpointProvenance {
 pub struct VerifiedCheckpoint(ValueSpaceCheckpoint);
 
 impl VerifiedCheckpoint {
+    pub(super) const fn restore(checkpoint: ValueSpaceCheckpoint) -> Self {
+        Self(checkpoint)
+    }
+
     pub(super) const fn derived(identity: IndexIdentity, anchor: MapResumeAnchor) -> Self {
         Self(ValueSpaceCheckpoint::new(identity, anchor, CheckpointProvenance::PublishedCoverage))
     }

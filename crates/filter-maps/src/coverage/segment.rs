@@ -252,6 +252,10 @@ impl SegmentOrigin {
 pub struct RetainedAnchor(MapResumeAnchor);
 
 impl RetainedAnchor {
+    pub(super) const fn restore(anchor: MapResumeAnchor) -> Self {
+        Self(anchor)
+    }
+
     /// Returns the retained anchor.
     pub const fn anchor(&self) -> MapResumeAnchor {
         self.0
