@@ -5,25 +5,25 @@
 //! fails the corpus instead of silently going untested.
 
 use super::parser::{
-    git_revision, identifier, lowercase_hex, number, parse_fixture, Fixture, FixtureClass, Lines,
-    ParamsName, ParseResult, GENERATOR_REVISION, GETH_REVISION,
+    git_revision, identifier, lowercase_hex, number, parse_fixture, Err, Fixture, FixtureClass,
+    Lines, ParamsName, ParseError, ParseResult, GENERATOR_REVISION, GETH_REVISION,
 };
+use reth_fs_util as fs;
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
-    fs,
     path::{Path, PathBuf},
 };
 
 /// Per-fixture content counts recorded by the manifest.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Counts {
-    pub(crate) completed_maps: usize,
-    pub(crate) partial_maps: usize,
-    pub(crate) rows: usize,
-    pub(crate) marks: usize,
-    pub(crate) queries: usize,
-    pub(crate) potential_indices: usize,
+pub struct Counts {
+    pub completed_maps: usize,
+    pub partial_maps: usize,
+    pub rows: usize,
+    pub marks: usize,
+    pub queries: usize,
+    pub potential_indices: usize,
 }
 
 impl Counts {
@@ -63,15 +63,15 @@ impl Counts {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ManifestEntry {
+pub struct ManifestEntry {
     /// Path relative to the corpus root, with `/` separators.
-    pub(crate) path: String,
-    pub(crate) class: FixtureClass,
-    pub(crate) params_name: ParamsName,
-    pub(crate) bytes: usize,
+    pub path: String,
+    pub class: FixtureClass,
+    pub params_name: ParamsName,
+    pub bytes: usize,
     /// Lowercase hex SHA-256 of the file's bytes.
-    pub(crate) digest: String,
-    pub(crate) counts: Counts,
+    pub digest: String,
+    pub counts: Counts,
 }
 
 /// Checks a manifested path against the corpus layout and returns the class its directory
@@ -115,7 +115,7 @@ fn entry_from(fields: &[&str]) -> ParseResult<ManifestEntry> {
 }
 
 /// Parses the manifest text; `path` only labels error messages.
-pub(crate) fn parse_manifest(path: &str, text: &str) -> ParseResult<Vec<ManifestEntry>> {
+pub fn parse_manifest(path: &str, text: &str) -> ParseResult<Vec<ManifestEntry>> {
     let mut lines = Lines::new(path, text)?;
     lines.exact(&["PIPELINE_MANIFEST", "1"])?;
     lines.exact(&["FIXTURE_FORMAT", "2"])?;
@@ -161,24 +161,24 @@ pub(crate) fn parse_manifest(path: &str, text: &str) -> ParseResult<Vec<Manifest
 }
 
 /// The directory holding `MANIFEST.txt` and the manifested fixtures.
-fn corpus_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/it/golden_pipeline/fixtures")
-}
-
-fn io<T>(result: std::io::Result<T>, path: &Path) -> ParseResult<T> {
-    result.map_err(|error| format!("{}: {error}", path.display()))
+pub fn corpus_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../crates/filter-maps/tests/it/golden_pipeline/fixtures")
 }
 
 /// Lists every regular file below `dir` as a `/`-separated path relative to the corpus root.
 fn list_files(dir: &Path, prefix: &str, out: &mut Vec<String>) -> ParseResult<()> {
-    for entry in io(fs::read_dir(dir), dir)? {
-        let entry = io(entry, dir)?;
+    for entry in fs::read_dir(dir)? {
+        let entry = entry
+            .map_err(|source| ParseError::DirectoryEntry { path: dir.to_path_buf(), source })?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
             return Err(format!("{}: non-UTF-8 file name", dir.display()))
         };
         let relative = if prefix.is_empty() { name.to_owned() } else { format!("{prefix}/{name}") };
-        let kind = io(entry.file_type(), &entry.path())?;
+        let kind = entry
+            .file_type()
+            .map_err(|source| ParseError::DirectoryEntry { path: entry.path(), source })?;
         if kind.is_dir() {
             list_files(&entry.path(), &relative, out)?;
         } else if kind.is_file() {
@@ -214,14 +214,18 @@ fn check_entry(entry: &ManifestEntry, fixture: &Fixture) -> ParseResult<()> {
 }
 
 /// Loads the manifest, reconciles it with the directory, and parses every manifested fixture.
-pub(crate) fn load_and_validate_corpus() -> ParseResult<Vec<(ManifestEntry, Fixture)>> {
-    let root = corpus_dir();
+pub fn load_and_validate_corpus() -> ParseResult<Vec<(ManifestEntry, Fixture)>> {
+    load_and_validate_corpus_from(&corpus_dir())
+}
+
+/// Loads and validates a corpus rooted at the directory containing `MANIFEST.txt`.
+pub fn load_and_validate_corpus_from(root: &Path) -> ParseResult<Vec<(ManifestEntry, Fixture)>> {
     let manifest_path = root.join("MANIFEST.txt");
-    let text = io(fs::read_to_string(&manifest_path), &manifest_path)?;
+    let text = fs::read_to_string(&manifest_path)?;
     let entries = parse_manifest("MANIFEST.txt", &text)?;
 
     let mut on_disk = Vec::new();
-    list_files(&root, "", &mut on_disk)?;
+    list_files(root, "", &mut on_disk)?;
     on_disk.sort();
     let mut manifested: Vec<String> = entries.iter().map(|entry| entry.path.clone()).collect();
     manifested.push("MANIFEST.txt".to_owned());
@@ -239,7 +243,7 @@ pub(crate) fn load_and_validate_corpus() -> ParseResult<Vec<(ManifestEntry, Fixt
     let mut scenarios = HashSet::new();
     for entry in entries {
         let path = root.join(&entry.path);
-        let bytes = io(fs::read(&path), &path)?;
+        let bytes = fs::read(&path)?;
         if bytes.len() != entry.bytes {
             let (actual, listed) = (bytes.len(), entry.bytes);
             return Err(format!("{}: {actual} bytes on disk, manifest lists {listed}", entry.path))
@@ -249,7 +253,8 @@ pub(crate) fn load_and_validate_corpus() -> ParseResult<Vec<(ManifestEntry, Fixt
             let listed = &entry.digest;
             return Err(format!("{}: digest {digest} on disk, manifest lists {listed}", entry.path))
         }
-        let text = String::from_utf8(bytes).map_err(|_| format!("{}: not UTF-8", entry.path))?;
+        let text = String::from_utf8(bytes)
+            .map_err(|source| ParseError::Utf8 { path: path.clone(), source })?;
         let fixture = parse_fixture(&entry.path, &text)?;
         check_entry(&entry, &fixture)?;
         if !scenarios.insert(fixture.scenario.clone()) {
@@ -286,7 +291,9 @@ mod tests {
     fn rejects(text: &str, fragment: &str) {
         match parse_manifest("MANIFEST.txt", text) {
             Ok(_) => panic!("accepted a manifest that should fail with {fragment:?}"),
-            Err(error) => assert!(error.contains(fragment), "{error:?} lacks {fragment:?}"),
+            std::result::Result::Err(error) => {
+                assert!(error.to_string().contains(fragment), "{error:?} lacks {fragment:?}")
+            }
         }
     }
 

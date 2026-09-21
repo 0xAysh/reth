@@ -5,10 +5,10 @@ use sha2::{Digest, Sha256};
 
 /// A recognized valid parameter set for the filter map structure.
 ///
-/// Callers currently select one of the exported constants rather than construct arbitrary field
-/// combinations. Future configuration or persistence should identify a recognized parameter set;
-/// it must not deserialize unchecked fields and treat [`validate`](Self::validate) as a complete
-/// checked constructor.
+/// Callers select one of the exported constants rather than construct arbitrary field
+/// combinations. Durable storage records [`ParamsId`] and rejects unknown identities; configuration
+/// must likewise avoid deserializing unchecked fields and treating [`validate`](Self::validate) as
+/// a complete checked constructor.
 ///
 /// Only the source fields are stored. Everything Geth caches in `deriveFields` — map height, maps
 /// per epoch, values per map, base row length — is recomputed by the `const fn` accessors below, so

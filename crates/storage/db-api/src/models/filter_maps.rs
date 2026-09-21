@@ -8,6 +8,7 @@ use alloy_primitives::B256;
 use bytes::BufMut;
 use reth_codecs::DecompressError;
 use serde::{Deserialize, Serialize};
+use std::mem::size_of;
 
 const IDENTITY_BYTES: usize = 44;
 const ANCHOR_BYTES: usize = 4 + 8 + 32 + 8 + 1;
@@ -115,6 +116,8 @@ pub struct StoredMapRowDirectory {
     pub nonempty_row_count: u32,
     /// Complete logical mark count.
     pub logical_mark_count: u64,
+    /// Exact logical length of each nonempty row, ordered by ascending row index.
+    pub row_lengths: Vec<u32>,
 }
 
 impl StoredMapRowDirectory {
@@ -125,8 +128,16 @@ impl StoredMapRowDirectory {
         extended: Vec<u8>,
         nonempty_row_count: u32,
         logical_mark_count: u64,
+        row_lengths: Vec<u32>,
     ) -> Result<Self, FilterMapModelError> {
-        let value = Self { params_id, nonempty, extended, nonempty_row_count, logical_mark_count };
+        let value = Self {
+            params_id,
+            nonempty,
+            extended,
+            nonempty_row_count,
+            logical_mark_count,
+            row_lengths,
+        };
         value.validate()?;
         Ok(value)
     }
@@ -139,6 +150,20 @@ impl StoredMapRowDirectory {
     /// Returns whether a row requires extension data.
     pub fn is_extended(&self, row: u32) -> bool {
         bit(&self.extended, row)
+    }
+
+    /// Returns the exact logical length declared for a nonempty row.
+    pub fn row_length(&self, row: u32) -> Option<u32> {
+        if !self.is_nonempty(row) {
+            return None
+        }
+        let byte = usize::try_from(row / 8).ok()?;
+        let preceding_bytes = self.nonempty.get(..byte)?;
+        let preceding =
+            preceding_bytes.iter().map(|value| value.count_ones() as usize).sum::<usize>();
+        let mask = if row.is_multiple_of(8) { 0 } else { (1u8 << (row % 8)) - 1 };
+        let within_byte = (self.nonempty[byte] & mask).count_ones() as usize;
+        self.row_lengths.get(preceding + within_byte).copied()
     }
 
     fn validate(&self) -> Result<(), FilterMapModelError> {
@@ -160,28 +185,31 @@ impl StoredMapRowDirectory {
                 .checked_add(extended.count_ones())
                 .ok_or(FilterMapModelError::Arithmetic)?;
         }
-        if count != self.nonempty_row_count {
+        if count != self.nonempty_row_count || self.row_lengths.len() != count as usize {
             return Err(FilterMapModelError::CountMismatch)
         }
-        let base_only = count.checked_sub(extended_count).ok_or(FilterMapModelError::Arithmetic)?;
-        let minimum_marks = u64::from(base_only)
-            .checked_add(
-                u64::from(extended_count)
-                    .checked_mul(u64::from(params.base_row_length) + 1)
-                    .ok_or(FilterMapModelError::Arithmetic)?,
-            )
-            .ok_or(FilterMapModelError::Arithmetic)?;
-        let base_maximum = params.base_row_length.min(params.map_width);
-        let extended_maximum = params.max_row_length.min(params.map_width);
-        let maximum_marks = u64::from(base_only)
-            .checked_mul(u64::from(base_maximum))
-            .and_then(|count| {
-                u64::from(extended_count)
-                    .checked_mul(u64::from(extended_maximum))
-                    .and_then(|extended| count.checked_add(extended))
-            })
-            .ok_or(FilterMapModelError::Arithmetic)?;
-        if !(minimum_marks..=maximum_marks).contains(&self.logical_mark_count) {
+        let mut length_index = 0usize;
+        let mut exact_marks = 0u64;
+        for row in 0..params.map_height {
+            if !self.is_nonempty(row) {
+                continue
+            }
+            let length = self.row_lengths[length_index];
+            length_index += 1;
+            let valid = if self.is_extended(row) {
+                length > params.base_row_length &&
+                    length <= params.max_row_length.min(params.map_width)
+            } else {
+                length > 0 && length <= params.base_row_length.min(params.map_width)
+            };
+            if !valid {
+                return Err(FilterMapModelError::ImpossibleDirectoryState)
+            }
+            exact_marks = exact_marks
+                .checked_add(u64::from(length))
+                .ok_or(FilterMapModelError::Arithmetic)?;
+        }
+        if exact_marks != self.logical_mark_count || extended_count > count {
             return Err(FilterMapModelError::CountMismatch)
         }
         Ok(())
@@ -418,19 +446,37 @@ pub enum FilterMapModelError {
     Arithmetic,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct PhysicalParams {
-    map_height: u32,
-    map_width: u32,
-    maps_per_epoch: u32,
-    base_row_length: u32,
-    max_row_length: u32,
-    group_size: u32,
+/// Durable physical geometry mirrored by the storage codecs for a recognized parameter tag.
+///
+/// This deliberately lives in `reth-db-api`, which cannot depend on the higher-level `FilterMaps`
+/// crate. Every recognized tag and derived dimension is exhaustively compared with `ParamsId` by
+/// the storage integration tests; changing either side without a storage-format migration fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FilterMapPhysicalParams {
+    /// Number of rows in one map.
+    pub map_height: u32,
+    /// Number of encoded columns in one map.
+    pub map_width: u32,
+    /// Number of maps in one epoch.
+    pub maps_per_epoch: u32,
+    /// Number of columns stored in a grouped base slot.
+    pub base_row_length: u32,
+    /// Maximum logical row length across all mapping layers.
+    pub max_row_length: u32,
+    /// Number of maps sharing one grouped base-row record.
+    pub group_size: u32,
 }
 
-const fn params(id: u8) -> Result<PhysicalParams, FilterMapModelError> {
+/// Returns the durable physical geometry for a recognized persisted parameter tag.
+pub const fn filter_map_physical_params(
+    id: u8,
+) -> Result<FilterMapPhysicalParams, FilterMapModelError> {
+    params(id)
+}
+
+const fn params(id: u8) -> Result<FilterMapPhysicalParams, FilterMapModelError> {
     match id {
-        1 => Ok(PhysicalParams {
+        1 => Ok(FilterMapPhysicalParams {
             map_height: 65_536,
             map_width: 16_777_216,
             maps_per_epoch: 1_024,
@@ -438,7 +484,7 @@ const fn params(id: u8) -> Result<PhysicalParams, FilterMapModelError> {
             max_row_length: 8_192,
             group_size: 32,
         }),
-        2 => Ok(PhysicalParams {
+        2 => Ok(FilterMapPhysicalParams {
             map_height: 16,
             map_width: 16_777_216,
             maps_per_epoch: 1,
@@ -450,7 +496,10 @@ const fn params(id: u8) -> Result<PhysicalParams, FilterMapModelError> {
     }
 }
 
-fn base_group_start(params: PhysicalParams, map_index: u32) -> Result<u32, FilterMapModelError> {
+fn base_group_start(
+    params: FilterMapPhysicalParams,
+    map_index: u32,
+) -> Result<u32, FilterMapModelError> {
     let epoch_start = (map_index / params.maps_per_epoch)
         .checked_mul(params.maps_per_epoch)
         .ok_or(FilterMapModelError::Arithmetic)?;
@@ -461,7 +510,7 @@ fn base_group_start(params: PhysicalParams, map_index: u32) -> Result<u32, Filte
 }
 
 fn linearized_key(
-    params: PhysicalParams,
+    params: FilterMapPhysicalParams,
     map_index: u32,
     row_index: u32,
 ) -> Result<u64, FilterMapModelError> {
@@ -483,7 +532,7 @@ fn linearized_key(
 }
 
 fn decode_linearized_key(
-    params: PhysicalParams,
+    params: FilterMapPhysicalParams,
     key: u64,
 ) -> Result<FilterMapRowCoordinates, FilterMapModelError> {
     let epoch_span = u64::from(params.map_height)
@@ -686,26 +735,49 @@ impl_value!(
     StoredMapRowDirectory,
     |value: &StoredMapRowDirectory| {
         value.validate().expect("invalid directory must not be persisted");
-        let mut out = Vec::with_capacity(17 + value.nonempty.len() + value.extended.len());
+        let mut out = Vec::with_capacity(
+            17 + value.nonempty.len() + value.extended.len() + value.row_lengths.len() * 4,
+        );
         out.push(value.params_id);
         out.extend_from_slice(&(value.nonempty.len() as u32).to_be_bytes());
         out.extend_from_slice(&value.nonempty);
         out.extend_from_slice(&value.extended);
         out.extend_from_slice(&value.nonempty_row_count.to_be_bytes());
         out.extend_from_slice(&value.logical_mark_count.to_be_bytes());
+        for &length in &value.row_lengths {
+            out.extend_from_slice(&length.to_be_bytes());
+        }
         out
     },
     |value: &[u8]| {
         let mut input = value;
         let params_id = take_u8(&mut input)?;
+        let limits = params(params_id)?;
         let bitmap_len =
             usize::try_from(take_u32(&mut input)?).map_err(|_| FilterMapModelError::Arithmetic)?;
+        let expected_bitmap_len =
+            usize::try_from(limits.map_height / 8).map_err(|_| FilterMapModelError::Arithmetic)?;
+        if bitmap_len != expected_bitmap_len {
+            return Err(FilterMapModelError::BitmapLength)
+        }
         let nonempty = take(&mut input, bitmap_len)?.to_vec();
         let extended = take(&mut input, bitmap_len)?.to_vec();
         let nonempty_row_count = take_u32(&mut input)?;
         let logical_mark_count = take_u64(&mut input)?;
-        if !input.is_empty() {
+        // Bound corruption-controlled counts and prove the exact remaining size before allocating.
+        if nonempty_row_count > limits.map_height {
+            return Err(FilterMapModelError::CountMismatch)
+        }
+        let row_count =
+            usize::try_from(nonempty_row_count).map_err(|_| FilterMapModelError::Arithmetic)?;
+        let row_length_bytes =
+            row_count.checked_mul(size_of::<u32>()).ok_or(FilterMapModelError::Arithmetic)?;
+        if input.len() != row_length_bytes {
             return Err(FilterMapModelError::Length)
+        }
+        let mut row_lengths = Vec::with_capacity(row_count);
+        for _ in 0..row_count {
+            row_lengths.push(take_u32(&mut input)?);
         }
         StoredMapRowDirectory::new(
             params_id,
@@ -713,6 +785,7 @@ impl_value!(
             extended,
             nonempty_row_count,
             logical_mark_count,
+            row_lengths,
         )
     }
 );
@@ -895,28 +968,33 @@ mod tests {
     #[test]
     fn directory_rejects_impossible_states_and_counts() {
         assert_eq!(
-            StoredMapRowDirectory::new(2, vec![0, 0], vec![1, 0], 0, 0),
+            StoredMapRowDirectory::new(2, vec![0, 0], vec![1, 0], 0, 0, vec![]),
             Err(FilterMapModelError::ImpossibleDirectoryState)
         );
         assert_eq!(
-            StoredMapRowDirectory::new(2, vec![0, 0], vec![0, 0], 0, 1),
+            StoredMapRowDirectory::new(2, vec![0, 0], vec![0, 0], 0, 1, vec![]),
             Err(FilterMapModelError::CountMismatch)
         );
         assert_eq!(
-            StoredMapRowDirectory::new(2, vec![1, 0], vec![0, 0], 1, 2),
+            StoredMapRowDirectory::new(2, vec![1, 0], vec![0, 0], 1, 2, vec![1]),
             Err(FilterMapModelError::CountMismatch)
         );
         let mut nonempty = vec![0; 65_536 / 8];
         nonempty[0] = 1;
         assert_eq!(
-            StoredMapRowDirectory::new(1, nonempty.clone(), nonempty, 1, 8_193),
-            Err(FilterMapModelError::CountMismatch)
+            StoredMapRowDirectory::new(1, nonempty.clone(), nonempty, 1, 8_193, vec![8_193]),
+            Err(FilterMapModelError::ImpossibleDirectoryState)
         );
 
-        let empty = StoredMapRowDirectory::new(2, vec![0, 0], vec![0, 0], 0, 0).unwrap();
-        let mut malformed = empty.compress();
+        let empty = StoredMapRowDirectory::new(2, vec![0, 0], vec![0, 0], 0, 0, vec![]).unwrap();
+        let mut malformed = empty.clone().compress();
         *malformed.last_mut().unwrap() = 1;
         assert!(StoredMapRowDirectory::decompress(&malformed).is_err());
+
+        let mut oversized_count = empty.compress();
+        let count_offset = 1 + 4 + 2 * (16 / 8);
+        oversized_count[count_offset..count_offset + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(StoredMapRowDirectory::decompress(&oversized_count).is_err());
     }
 
     #[test]
@@ -981,7 +1059,8 @@ mod tests {
         assert_eq!(StoredExtendedRow::decompress(&encoded).unwrap(), extension);
         assert!(StoredExtendedRow::decompress(&encoded[..encoded.len() - 1]).is_err());
 
-        let directory = StoredMapRowDirectory::new(2, vec![1, 0], vec![0, 0], 1, 1).unwrap();
+        let directory =
+            StoredMapRowDirectory::new(2, vec![1, 0], vec![0, 0], 1, 1, vec![1]).unwrap();
         assert_eq!(
             StoredMapRowDirectory::decompress(&directory.clone().compress()).unwrap(),
             directory

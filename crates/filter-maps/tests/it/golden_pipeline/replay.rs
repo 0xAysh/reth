@@ -5,13 +5,13 @@
 //! independent Geth oracle output; this module deliberately does not reproduce either algorithm.
 
 use super::parser::{
-    Block, BoundaryEnding, Fixture, LogIdentity, Origin, Query, SlotClass, Termination,
+    Block, BoundaryEnding, Fixture, LogIdentity, Origin, ParamsName, Query, SlotClass, Termination,
 };
 use alloy_eips::BlockNumHash;
 use reth_filter_maps::{
     BatchContinuation, BlockInput, BlockPointer, LogInput, LogValueKind, LogValueSlot,
     LogValueStream, LogValueStreamCompletion, LogValueStreamEvent, LogValueStreamItem,
-    LogValueStreamTermination, MapBoundary, ValueSpaceAnchor,
+    LogValueStreamTermination, MapBoundary, ValueSpaceAnchor, DEFAULT_PARAMS, RANGE_TEST_PARAMS,
 };
 use std::collections::BTreeMap;
 
@@ -152,7 +152,10 @@ fn log_identities(block: &Block) -> Vec<LogIdentity> {
 }
 
 fn drive(fixture: &Fixture) -> Result<Replay, String> {
-    let params = fixture.params_name.params();
+    let params = match fixture.params_name {
+        ParamsName::Default => DEFAULT_PARAMS,
+        ParamsName::Range => RANGE_TEST_PARAMS,
+    };
     let blocks = fixture
         .blocks
         .iter()

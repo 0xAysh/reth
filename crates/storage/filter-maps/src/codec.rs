@@ -1,3 +1,8 @@
+//! Translation between storage-independent domain records and strict database models.
+//!
+//! These conversions decode rejecting version and parameter identities; they do not establish
+//! checkpoint provenance or current canonicality.
+
 use crate::error::{FilterMapStorageError, Result};
 use reth_db_api::models::{
     StoredCheckpointProvenance as DbProvenance, StoredCoverageCatalog,

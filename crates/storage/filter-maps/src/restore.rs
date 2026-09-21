@@ -7,12 +7,14 @@ use crate::{
 use reth_db_api::{
     models::{FilterMapBaseRowKey, FilterMapExtendedRowKey, StoredMapRowDirectory},
     tables::{
-        FilterMapAnchors, FilterMapBaseRows, FilterMapCoverage, FilterMapDirectories,
-        FilterMapExtendedRows, FilterMapIdentity,
+        FilterMapAnchors, FilterMapBaseRows, FilterMapBlockPointers, FilterMapCoverage,
+        FilterMapDirectories, FilterMapExtendedRows, FilterMapIdentity,
     },
     transaction::DbTx,
 };
-use reth_filter_maps::coverage::{IndexIdentity, StructurallyRestoredCoverage};
+use reth_filter_maps::coverage::{
+    IndexIdentity, StoredOriginVerifier, StructurallyRestoredCoverage,
+};
 use std::collections::BTreeMap;
 
 const SINGLETON_KEY: u8 = 0;
@@ -28,9 +30,23 @@ pub(crate) struct RestoredMetadata {
 pub(crate) fn load_metadata<TX: DbTx>(
     tx: &TX,
     running: &IndexIdentity,
+    verifier: &mut impl StoredOriginVerifier,
 ) -> Result<RestoredMetadata> {
     let identity_entries = tx.entries::<FilterMapIdentity>()?;
     let identity = tx.get::<FilterMapIdentity>(SINGLETON_KEY)?;
+    if identity_entries == 0 && identity.is_none() {
+        let has_records = tx.entries::<FilterMapCoverage>()? != 0 ||
+            tx.entries::<FilterMapAnchors>()? != 0 ||
+            tx.entries::<FilterMapBlockPointers>()? != 0 ||
+            tx.entries::<FilterMapDirectories>()? != 0 ||
+            tx.entries::<FilterMapBaseRows>()? != 0 ||
+            tx.entries::<FilterMapExtendedRows>()? != 0;
+        return Err(if has_records {
+            FilterMapStorageError::IncompleteStore
+        } else {
+            FilterMapStorageError::MissingIdentity
+        })
+    }
     if identity_entries != 1 || identity.is_none() {
         return Err(FilterMapStorageError::IncompleteStore)
     }
@@ -61,7 +77,7 @@ pub(crate) fn load_metadata<TX: DbTx>(
             anchors.push(anchor_from_db(stored)?);
         }
     }
-    let coverage = StructurallyRestoredCoverage::restore(running, record, anchors)?;
+    let coverage = StructurallyRestoredCoverage::restore(running, record, anchors, verifier)?;
     Ok(RestoredMetadata { identity, coverage })
 }
 

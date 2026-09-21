@@ -15,9 +15,9 @@ use std::iter::Peekable;
 /// A consumer may stop after any event and resume the same in-memory iterator. Dropping it does not
 /// drain the input. A [`MapBoundary`] identifies a completed map and its resume block, but it is
 /// not a durable restart point by itself: durable publication also needs that block's
-/// [`BlockPointer`]. The storage layer must publish the rendered rows, boundary identity, numerical
-/// pointer, and valid-range update atomically. Cloning is available only when the input iterator is
-/// cloneable, and is not a persistence format.
+/// [`BlockPointer`]. `reth-filter-maps-storage` publishes the rendered rows, boundary identity,
+/// numerical pointer, and valid-range update atomically. Cloning is available only when the input
+/// iterator is cloneable, and is not a persistence format.
 ///
 /// Receipt acquisition must handle read failures and supply complete, bounded batches. Never map
 /// a provider error to input exhaustion: [`LogValueStreamTermination::ReachedHead`] trusts the

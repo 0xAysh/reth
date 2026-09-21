@@ -46,16 +46,55 @@ pub enum StoredSegmentOrigin {
     },
 }
 
-/// Coverage whose persisted structure is internally valid but not yet current-chain verified.
+/// Authority that re-establishes trust in persisted segment origins.
+///
+/// Structural decoding deliberately cannot create a [`VerifiedCheckpoint`]. Implementations must
+/// bind recognized identifiers to an exact identity and anchor, prove derived checkpoints against
+/// a trusted predecessor, and authenticate locally published or retained anchors. Returning
+/// `false` fails closed.
+pub trait StoredOriginVerifier {
+    /// Verifies the exact checkpoint record, including its numerical pointer.
+    fn verify_checkpoint(
+        &mut self,
+        identity: &IndexIdentity,
+        anchor: MapResumeAnchor,
+        provenance: CheckpointProvenance,
+    ) -> bool;
+
+    /// Verifies that `anchor` was retained from authenticated local published coverage.
+    fn verify_retained(&mut self, identity: &IndexIdentity, anchor: MapResumeAnchor) -> bool;
+}
+
+/// Verifier used when no checkpoint registry or authenticated local publication state is present.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RejectUntrustedOrigins;
+
+impl StoredOriginVerifier for RejectUntrustedOrigins {
+    fn verify_checkpoint(
+        &mut self,
+        _identity: &IndexIdentity,
+        _anchor: MapResumeAnchor,
+        _provenance: CheckpointProvenance,
+    ) -> bool {
+        false
+    }
+
+    fn verify_retained(&mut self, _identity: &IndexIdentity, _anchor: MapResumeAnchor) -> bool {
+        false
+    }
+}
+
+/// Coverage whose persisted structure and origins are valid but not yet current-chain verified.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructurallyRestoredCoverage(CoverageSet);
 
 impl StructurallyRestoredCoverage {
-    /// Restores a catalog using the independently stored, ordered map anchors.
+    /// Restores a catalog using ordered map anchors and an explicit origin trust resolver.
     pub fn restore(
         running: &IndexIdentity,
         record: StoredCoverageRecord,
         anchors: impl IntoIterator<Item = MapResumeAnchor>,
+        verifier: &mut impl StoredOriginVerifier,
     ) -> Result<Self, PersistedCoverageError> {
         running.check_compatible(&record.identity)?;
         let mut anchors_by_map = BTreeMap::new();
@@ -84,7 +123,7 @@ impl StructurallyRestoredCoverage {
                 })
             }
 
-            let origin = descriptor.origin.restore(record.identity)?;
+            let origin = descriptor.origin.restore(record.identity, verifier)?;
             let expected_first = origin.anchor().map_or(Ok(0), |anchor| {
                 anchor
                     .completed_map_index
@@ -260,7 +299,11 @@ impl StoredSegmentOrigin {
         }
     }
 
-    fn restore(self, identity: IndexIdentity) -> Result<SegmentOrigin, PersistedCoverageError> {
+    fn restore(
+        self,
+        identity: IndexIdentity,
+        verifier: &mut impl StoredOriginVerifier,
+    ) -> Result<SegmentOrigin, PersistedCoverageError> {
         let anchor = match &self {
             Self::Genesis => return Ok(SegmentOrigin::Genesis),
             Self::Checkpoint { origin_anchor, .. } | Self::Retained { origin_anchor } => {
@@ -286,6 +329,9 @@ impl StoredSegmentOrigin {
                 {
                     return Err(PersistedCoverageError::InvalidOrigin)
                 }
+                if !verifier.verify_checkpoint(&identity, origin_anchor, provenance) {
+                    return Err(PersistedCoverageError::UnverifiedOrigin)
+                }
                 SegmentOrigin::Checkpoint(VerifiedCheckpoint::restore(ValueSpaceCheckpoint::new(
                     identity,
                     origin_anchor,
@@ -293,6 +339,9 @@ impl StoredSegmentOrigin {
                 )))
             }
             Self::Retained { origin_anchor } => {
+                if !verifier.verify_retained(&identity, origin_anchor) {
+                    return Err(PersistedCoverageError::UnverifiedOrigin)
+                }
                 SegmentOrigin::Retained(RetainedAnchor::restore(origin_anchor))
             }
         })
@@ -332,6 +381,9 @@ pub enum PersistedCoverageError {
     /// An inline origin or its provenance is internally inconsistent.
     #[error("invalid stored segment origin")]
     InvalidOrigin,
+    /// Persisted origin trust could not be re-established by the supplied verifier.
+    #[error("stored segment origin is not trusted")]
+    UnverifiedOrigin,
     /// A covered map has no durable resume anchor.
     #[error("missing durable anchor for map {map_index}")]
     MissingAnchor {
@@ -404,15 +456,39 @@ mod tests {
     use super::*;
     use crate::coverage::test_utils::*;
 
+    #[derive(Default)]
+    struct TestOriginVerifier;
+
+    impl StoredOriginVerifier for TestOriginVerifier {
+        fn verify_checkpoint(
+            &mut self,
+            identity: &IndexIdentity,
+            anchor: MapResumeAnchor,
+            _provenance: CheckpointProvenance,
+        ) -> bool {
+            *identity == crate::coverage::test_utils::identity() &&
+                anchor.value_space_version == identity.value_space_version
+        }
+
+        fn verify_retained(&mut self, identity: &IndexIdentity, anchor: MapResumeAnchor) -> bool {
+            *identity == crate::coverage::test_utils::identity() &&
+                anchor.value_space_version == identity.value_space_version
+        }
+    }
+
     #[test]
     fn stored_catalog_restores_without_granting_queryability() {
         let mut coverage = CoverageSet::new(identity());
         let anchors = anchors_through(0, aligned(2, 30));
         coverage.open_segment_batch(SegmentOrigin::Genesis, anchors.clone()).unwrap();
 
-        let restored =
-            StructurallyRestoredCoverage::restore(&identity(), coverage.stored_record(), anchors)
-                .unwrap();
+        let restored = StructurallyRestoredCoverage::restore(
+            &identity(),
+            coverage.stored_record(),
+            anchors,
+            &mut TestOriginVerifier,
+        )
+        .unwrap();
         assert_eq!(restored.segments().len(), 1);
         let queryable = restored.activate_infallible(|number| {
             Some(if number == 0 { identity().genesis_hash } else { hash(number) })
@@ -433,6 +509,7 @@ mod tests {
             &identity(),
             coverage.stored_record(),
             all_anchors,
+            &mut TestOriginVerifier,
         )
         .unwrap();
 
@@ -460,11 +537,81 @@ mod tests {
                 terminal_map: 12,
             }],
         };
-        let restored = StructurallyRestoredCoverage::restore(&identity(), record, anchors).unwrap();
+        let restored = StructurallyRestoredCoverage::restore(
+            &identity(),
+            record,
+            anchors,
+            &mut TestOriginVerifier,
+        )
+        .unwrap();
         let queryable = restored.activate_infallible(|number| {
             Some(if number == 60 { B256::ZERO } else { hash(number) })
         });
         assert!(queryable.coverage().segments().is_empty());
+    }
+
+    struct ExactCheckpointVerifier {
+        id: u64,
+        anchor: MapResumeAnchor,
+    }
+
+    impl StoredOriginVerifier for ExactCheckpointVerifier {
+        fn verify_checkpoint(
+            &mut self,
+            identity: &IndexIdentity,
+            anchor: MapResumeAnchor,
+            provenance: CheckpointProvenance,
+        ) -> bool {
+            identity == &crate::coverage::test_utils::identity() &&
+                provenance == CheckpointProvenance::Recognized { id: self.id } &&
+                anchor == self.anchor
+        }
+
+        fn verify_retained(&mut self, _identity: &IndexIdentity, _anchor: MapResumeAnchor) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn persisted_checkpoint_requires_explicit_anchor_verification() {
+        let origin = aligned(9, 100);
+        let terminal = aligned(10, 110);
+        let record = StoredCoverageRecord {
+            identity: identity(),
+            segments: vec![StoredSegmentRecord {
+                origin: StoredSegmentOrigin::Checkpoint {
+                    origin_anchor: origin,
+                    provenance: CheckpointProvenance::Recognized { id: 7 },
+                },
+                first_map: 10,
+                terminal_map: 10,
+            }],
+        };
+        assert!(matches!(
+            StructurallyRestoredCoverage::restore(
+                &identity(),
+                record.clone(),
+                [terminal],
+                &mut RejectUntrustedOrigins,
+            ),
+            Err(PersistedCoverageError::UnverifiedOrigin)
+        ));
+        assert!(StructurallyRestoredCoverage::restore(
+            &identity(),
+            record.clone(),
+            [terminal],
+            &mut ExactCheckpointVerifier { id: 7, anchor: origin },
+        )
+        .is_ok());
+        assert!(matches!(
+            StructurallyRestoredCoverage::restore(
+                &identity(),
+                record,
+                [terminal],
+                &mut ExactCheckpointVerifier { id: 8, anchor: origin },
+            ),
+            Err(PersistedCoverageError::UnverifiedOrigin)
+        ));
     }
 
     #[test]
@@ -478,7 +625,12 @@ mod tests {
             }],
         };
         assert!(matches!(
-            StructurallyRestoredCoverage::restore(&identity(), record, [aligned(0, 10)]),
+            StructurallyRestoredCoverage::restore(
+                &identity(),
+                record,
+                [aligned(0, 10)],
+                &mut TestOriginVerifier,
+            ),
             Err(PersistedCoverageError::MissingAnchor { map_index: 1 })
         ));
         let empty = StoredCoverageRecord { identity: identity(), segments: Vec::new() };
@@ -487,11 +639,17 @@ mod tests {
                 &identity(),
                 empty.clone(),
                 [aligned(0, 10), aligned(0, 10)],
+                &mut TestOriginVerifier,
             ),
             Err(PersistedCoverageError::DuplicateAnchor { map_index: 0 })
         ));
         assert!(matches!(
-            StructurallyRestoredCoverage::restore(&identity(), empty, [aligned(0, 10)]),
+            StructurallyRestoredCoverage::restore(
+                &identity(),
+                empty,
+                [aligned(0, 10)],
+                &mut TestOriginVerifier,
+            ),
             Err(PersistedCoverageError::UnexpectedAnchor { map_index: 0 })
         ));
     }

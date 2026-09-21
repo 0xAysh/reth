@@ -150,6 +150,7 @@ members = [
     "testing/ef-tests/",
     "testing/testing-utils",
     "testing/runner",
+    "testing/filter-maps-test-utils",
     "crates/tracing-otlp",
 ]
 default-members = ["bin/reth"]
@@ -370,6 +371,7 @@ reth-exex-test-utils = { path = "crates/exex/test-utils" }
 reth-exex-types = { path = "crates/exex/types" }
 reth-filter-maps = { path = "crates/filter-maps" }
 reth-filter-maps-storage = { path = "crates/storage/filter-maps" }
+reth-filter-maps-test-utils = { path = "testing/filter-maps-test-utils" }
 reth-fs-util = { path = "crates/fs-util" }
 reth-invalid-block-hooks = { path = "crates/engine/invalid-block-hooks" }
 reth-ipc = { path = "crates/rpc/ipc" }

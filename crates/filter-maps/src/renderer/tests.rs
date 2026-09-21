@@ -430,12 +430,19 @@ fn fixture_blocks(fixture: &crate::golden_pipeline::parser::Fixture) -> Vec<Bloc
         .collect()
 }
 
+const fn fixture_params(name: crate::golden_pipeline::parser::ParamsName) -> crate::Params {
+    match name {
+        crate::golden_pipeline::parser::ParamsName::Default => crate::DEFAULT_PARAMS,
+        crate::golden_pipeline::parser::ParamsName::Range => crate::RANGE_TEST_PARAMS,
+    }
+}
+
 fn fixture_stream(
     fixture: &crate::golden_pipeline::parser::Fixture,
 ) -> LogValueStream<std::vec::IntoIter<BlockInput>> {
     use crate::golden_pipeline::parser::{Origin, Termination};
 
-    let params = fixture.params_name.params();
+    let params = fixture_params(fixture.params_name);
     let blocks = fixture_blocks(fixture);
     let termination = match fixture.termination {
         Termination::Head => LogValueStreamTermination::ReachedHead,
@@ -527,7 +534,7 @@ fn every_format_two_fixture_matches_the_production_event_machine() {
         for ((actual, anchor), expected) in maps.iter().zip(&fixture.completed_maps) {
             assert_eq!(
                 actual.params_id(),
-                ParamsId::of(&fixture.params_name.params()).unwrap(),
+                ParamsId::of(&fixture_params(fixture.params_name)).unwrap(),
                 "{}",
                 entry.path
             );

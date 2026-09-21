@@ -1,30 +1,44 @@
 //! Pinned FORMAT 2 renderer-to-MDBX-to-matcher integration coverage.
 
-#[path = "../../../filter-maps/tests/it/golden_pipeline/parser.rs"]
-mod parser;
-
 use alloy_primitives::B256;
-use parser::{Fixture, Origin, ParamsName, Planner, QueryResult, Termination, TopicConstraint};
 use reth_db::{init_db, mdbx::DatabaseArguments};
 use reth_db_api::{database::Database, transaction::DbTx};
 use reth_filter_maps::{
     coverage::{
         CheckpointProvenance, IndexIdentity, MapResumeAnchor, SegmentOrigin, StoredCoverageRecord,
-        StoredSegmentOrigin, StoredSegmentRecord, StructurallyRestoredCoverage, STORAGE_FORMAT_V1,
+        StoredOriginVerifier, StoredSegmentOrigin, StoredSegmentRecord,
+        StructurallyRestoredCoverage, STORAGE_FORMAT_V1,
     },
     AnchoredCompletedMap, BlockInput, BlockPointer, FilterMapMatchSource, FilterMapMatcher,
     FilterMapRenderer, IndexedMatchRange, LogInput, LogValueStream, LogValueStreamTermination,
     MapBoundary, MatchPattern, ParamsId, RendererOutput, TopicSelection, ValueSpaceAnchor, GETH_V1,
 };
 use reth_filter_maps_storage::{
-    initialize_identity, publish, FilterMapReadSnapshot, PublicationStart,
+    initialize_identity, publish_with_origin_verifier, FilterMapReadSnapshot, PublicationStart,
 };
-use std::{
-    collections::BTreeMap,
-    convert::Infallible,
-    fs,
-    path::{Path, PathBuf},
+use reth_filter_maps_test_utils::{
+    manifest::load_and_validate_corpus,
+    parser::{Fixture, Origin, ParamsName, Planner, QueryResult, Termination, TopicConstraint},
 };
+use std::{collections::BTreeMap, convert::Infallible, path::Path};
+
+#[derive(Default)]
+struct TestOriginVerifier;
+
+impl StoredOriginVerifier for TestOriginVerifier {
+    fn verify_checkpoint(
+        &mut self,
+        identity: &IndexIdentity,
+        anchor: MapResumeAnchor,
+        _provenance: CheckpointProvenance,
+    ) -> bool {
+        anchor.value_space_version == identity.value_space_version
+    }
+
+    fn verify_retained(&mut self, identity: &IndexIdentity, anchor: MapResumeAnchor) -> bool {
+        anchor.value_space_version == identity.value_space_version
+    }
+}
 
 #[derive(Clone)]
 struct MemorySource {
@@ -64,19 +78,13 @@ impl FilterMapMatchSource for MemorySource {
 
 #[test]
 fn applicable_format_two_scenarios_roundtrip_through_mdbx() {
-    let mut paths = Vec::new();
-    fixture_paths(&fixture_root(), &mut paths);
-    paths.sort();
-
     let mut applicable = 0;
-    for path in paths {
-        let text = fs::read_to_string(&path).unwrap();
-        let fixture = parser::parse_fixture(path.to_str().unwrap(), &text).unwrap();
+    for (entry, fixture) in load_and_validate_corpus().unwrap() {
         if !is_applicable(&fixture) {
             continue
         }
         applicable += 1;
-        check_fixture(&path, &fixture);
+        check_fixture(Path::new(&entry.path), &fixture);
     }
     assert_eq!(applicable, 3, "the pinned corpus changed its applicable scenario set");
 }
@@ -84,9 +92,16 @@ fn applicable_format_two_scenarios_roundtrip_through_mdbx() {
 // The public production renderer can be reconstructed only at a completed-map anchor. Synthetic
 // mid-map checkpoints and batch continuations intentionally require private, non-durable renderer
 // state, so they are not applicable to a close/reopen storage test.
+const fn fixture_params(name: ParamsName) -> reth_filter_maps::Params {
+    match name {
+        ParamsName::Default => reth_filter_maps::DEFAULT_PARAMS,
+        ParamsName::Range => reth_filter_maps::RANGE_TEST_PARAMS,
+    }
+}
+
 fn is_applicable(fixture: &Fixture) -> bool {
     let Origin::Checkpoint(origin) = fixture.origin else { return false };
-    let params = fixture.params_name.params();
+    let params = fixture_params(fixture.params_name);
     origin.index > 0 &&
         origin.index.is_multiple_of(params.values_per_map()) &&
         fixture.termination == Termination::Head &&
@@ -96,7 +111,7 @@ fn is_applicable(fixture: &Fixture) -> bool {
 
 fn check_fixture(path: &Path, fixture: &Fixture) {
     let Origin::Checkpoint(origin) = fixture.origin else { unreachable!() };
-    let params = fixture.params_name.params();
+    let params = fixture_params(fixture.params_name);
     let params_id = ParamsId::of(&params).unwrap();
     assert_eq!(fixture.params_name, ParamsName::Range);
 
@@ -140,7 +155,14 @@ fn check_fixture(path: &Path, fixture: &Fixture) {
         initialize_identity(&tx, &identity).unwrap();
         let mut start = PublicationStart::Open { origin: publication_origin };
         for map in &rendered {
-            publish(&tx, &identity, start, std::slice::from_ref(map)).unwrap();
+            publish_with_origin_verifier(
+                &tx,
+                &identity,
+                start,
+                std::slice::from_ref(map),
+                &mut TestOriginVerifier,
+            )
+            .unwrap();
             start = PublicationStart::Extend { from: map.resume_anchor() };
         }
         tx.commit().unwrap();
@@ -186,12 +208,16 @@ fn check_fixture(path: &Path, fixture: &Fixture) {
         assert_eq!(expected.potential_indices(), query.potential_indices);
         assert_eq!(expected.candidate_blocks(), query.candidate_blocks);
 
-        let source = FilterMapReadSnapshot::new(db.tx().unwrap(), &identity)
-            .unwrap()
-            .activate(|number| Ok::<_, Infallible>(canonical.get(&number).copied()))
-            .unwrap()
-            .into_segment_source(0)
-            .unwrap();
+        let source = FilterMapReadSnapshot::new_with_origin_verifier(
+            db.tx().unwrap(),
+            &identity,
+            &mut TestOriginVerifier,
+        )
+        .unwrap()
+        .activate(|number| Ok::<_, Infallible>(canonical.get(&number).copied()))
+        .unwrap()
+        .into_segment_source(0)
+        .unwrap();
         let actual = FilterMapMatcher::new(source).match_subrange(&pattern, range).unwrap();
         assert_eq!(actual, expected, "{}: {}", path.display(), query.id);
         assert_eq!(actual.potential_indices(), query.potential_indices);
@@ -230,25 +256,8 @@ fn checkpoint_origin(
             }],
         },
         [terminal],
+        &mut TestOriginVerifier,
     )
     .unwrap();
     restored.segments()[0].origin().clone()
-}
-
-fn fixture_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../filter-maps/tests/it/golden_pipeline/fixtures")
-}
-
-fn fixture_paths(directory: &Path, paths: &mut Vec<PathBuf>) {
-    for entry in fs::read_dir(directory).unwrap() {
-        let path = entry.unwrap().path();
-        if path.is_dir() {
-            fixture_paths(&path, paths);
-        } else if path.extension().is_some_and(|extension| extension == "txt") &&
-            path.file_name().is_some_and(|name| name != "MANIFEST.txt")
-        {
-            paths.push(path);
-        }
-    }
 }

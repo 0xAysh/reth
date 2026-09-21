@@ -1,3 +1,8 @@
+//! Complete publication validation and write-set derivation.
+//!
+//! The module constructs either a no-op retry or a complete [`PublicationWrites`] proposal before
+//! the store mutates any table. The caller-owned MDBX transaction remains the atomicity boundary.
+
 use crate::{
     codec::{anchor_to_db, catalog_to_db},
     error::{FilterMapStorageError, Result},
@@ -13,7 +18,7 @@ use reth_db_api::{
     transaction::DbTx,
 };
 use reth_filter_maps::{
-    coverage::{IndexIdentity, StructurallyRestoredCoverage},
+    coverage::{IndexIdentity, StoredOriginVerifier, StructurallyRestoredCoverage},
     AnchoredCompletedMap, BlockPointer,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -41,8 +46,9 @@ pub(crate) fn build_publication<TX: DbTx>(
     running: &IndexIdentity,
     start: &PublicationStart,
     maps: &[AnchoredCompletedMap],
+    verifier: &mut impl StoredOriginVerifier,
 ) -> Result<PublicationProposal> {
-    let metadata = load_metadata(tx, running)?;
+    let metadata = load_metadata(tx, running, verifier)?;
     validate_shape(&metadata.identity, start, maps)?;
     load_directories(tx, &metadata)?;
     let identity = metadata.identity;
@@ -61,6 +67,7 @@ pub(crate) fn build_publication<TX: DbTx>(
         let mut rows = BTreeMap::new();
         let mut previous = None;
         let mut marks = 0u64;
+        let mut row_lengths = Vec::new();
         for row in map.rows() {
             let row_index = row.row_index();
             if row_index >= params.map_height() ||
@@ -74,12 +81,12 @@ pub(crate) fn build_publication<TX: DbTx>(
                 })
             }
             previous = Some(row_index);
+            let row_length = u32::try_from(row.columns().len())
+                .map_err(|_| FilterMapStorageError::Arithmetic)?;
             marks = marks
-                .checked_add(
-                    u64::try_from(row.columns().len())
-                        .map_err(|_| FilterMapStorageError::Arithmetic)?,
-                )
+                .checked_add(u64::from(row_length))
                 .ok_or(FilterMapStorageError::Arithmetic)?;
+            row_lengths.push(row_length);
             set_bit(&mut nonempty, row_index);
             if row.columns().len() > params.base_row_length() as usize {
                 set_bit(&mut extended, row_index);
@@ -92,6 +99,7 @@ pub(crate) fn build_publication<TX: DbTx>(
             extended,
             u32::try_from(rows.len()).map_err(|_| FilterMapStorageError::Arithmetic)?,
             marks,
+            row_lengths,
         )?;
         directories.insert(map.map_index(), directory);
         anchors.insert(map.map_index(), anchor_to_db(anchor));

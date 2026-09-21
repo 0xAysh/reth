@@ -1,7 +1,21 @@
 //! Crash-safe MDBX persistence for completed `FilterMaps` output.
 //!
-//! Writes use caller-owned transactions. Coverage is the visibility fence, structural restoration
-//! is distinct from canonical activation, and the existing pure matcher seam remains unchanged.
+//! ```text
+//! AnchoredCompletedMap ──► validate complete proposal ──► stage seven-table write
+//!                                                               │
+//!                                                        caller commits MDBX
+//!                                                               │
+//! FilterMapMatcher ◄── segment source ◄── canonical activation ◄─┘
+//! ```
+//!
+//! Writes use caller-owned transactions. Coverage is the visibility fence: publication makes rows,
+//! pointers, anchors, directories, and coverage visible together, while contraction hides invalid
+//! coverage before later cleanup. Structural restoration is deliberately distinct from canonical
+//! activation, and [`FilterMapSegmentSource`] implements the existing pure matcher seam without
+//! moving candidate logic into storage.
+//!
+//! This crate does not acquire receipts, schedule indexing, detect reorgs, execute bloom fallback,
+//! or integrate RPC. Later lifecycle code composes those operations around these atomic primitives.
 
 #![doc(
     html_logo_url = "https://raw.githubusercontent.com/paradigmxyz/reth/main/assets/reth-docs.png",
@@ -20,38 +34,43 @@ mod snapshot;
 mod store;
 mod validation;
 
-pub use contraction::{contract_for_reorg, retain_after, CleanupRanges};
+pub use contraction::{
+    contract_for_reorg, contract_for_reorg_with_origin_verifier, retain_after,
+    retain_after_with_origin_verifier, CleanupRanges,
+};
 pub use error::{FilterMapStorageError, Result};
 pub use matcher::FilterMapSegmentSource;
 pub use snapshot::{ActivatedFilterMapSnapshot, FilterMapActivationError, FilterMapReadSnapshot};
-pub use store::{initialize_identity, publish, PublicationStart};
+pub use store::{initialize_identity, publish, publish_with_origin_verifier, PublicationStart};
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloy_primitives::{Address, B256};
-    use reth_db::{init_db, mdbx::DatabaseArguments, test_utils::create_test_rw_db};
+    use reth_db::test_utils::create_test_rw_db;
     use reth_db_api::{
         database::Database,
         models::{
-            FilterMapBaseRowKey, StoredBaseRowGroup, StoredCoverageCatalog, StoredMapRowDirectory,
+            filter_map_physical_params, FilterMapBaseRowKey, FilterMapExtendedRowKey,
+            StoredBaseRowGroup, StoredCoverageCatalog, StoredMapRowDirectory,
         },
         table::{Compress, Table},
         tables::{
             FilterMapBaseRows, FilterMapBlockPointers, FilterMapCoverage, FilterMapDirectories,
-            FilterMapIdentity,
+            FilterMapExtendedRows, FilterMapIdentity,
         },
         transaction::{DbTx, DbTxMut},
     };
     use reth_filter_maps::{
+        address_value,
         coverage::{
-            CheckpointProvenance, IndexIdentity, SegmentOrigin, StoredCoverageRecord,
-            StoredSegmentOrigin, StoredSegmentRecord, StructurallyRestoredCoverage,
-            STORAGE_FORMAT_V1,
+            CheckpointProvenance, IndexIdentity, MapResumeAnchor, SegmentOrigin,
+            StoredCoverageRecord, StoredOriginVerifier, StoredSegmentOrigin, StoredSegmentRecord,
+            StructurallyRestoredCoverage, STORAGE_FORMAT_V1,
         },
-        BlockInput, FilterMapMatchSource, FilterMapMatcher, FilterMapRenderer, IndexedMatchRange,
-        LogInput, LogValueStream, LogValueStreamTermination, MatchPattern, ParamsId,
-        RendererOutput, ValueSpaceAnchor, DEFAULT_PARAMS, GETH_V1, RANGE_TEST_PARAMS,
+        BlockInput, FilterMapMatchSource, FilterMapRenderer, LogInput, LogValueStream,
+        LogValueStreamTermination, ParamsId, RendererOutput, ValueSpaceAnchor, DEFAULT_PARAMS,
+        GETH_V1, RANGE_TEST_PARAMS,
     };
 
     #[derive(Debug)]
@@ -66,6 +85,24 @@ mod tests {
 
     fn identity() -> IndexIdentity {
         IndexIdentity::new(STORAGE_FORMAT_V1, 1, B256::ZERO, GETH_V1, ParamsId::RangeTest)
+    }
+
+    #[derive(Default)]
+    struct TestOriginVerifier;
+
+    impl StoredOriginVerifier for TestOriginVerifier {
+        fn verify_checkpoint(
+            &mut self,
+            identity: &IndexIdentity,
+            anchor: MapResumeAnchor,
+            _provenance: CheckpointProvenance,
+        ) -> bool {
+            anchor.value_space_version == identity.value_space_version
+        }
+
+        fn verify_retained(&mut self, identity: &IndexIdentity, anchor: MapResumeAnchor) -> bool {
+            anchor.value_space_version == identity.value_space_version
+        }
     }
 
     fn maps() -> Vec<reth_filter_maps::AnchoredCompletedMap> {
@@ -92,6 +129,7 @@ mod tests {
                 }],
             },
             [terminal],
+            &mut TestOriginVerifier,
         )
         .unwrap();
         restored.segments()[0].origin().clone()
@@ -107,17 +145,27 @@ mod tests {
         TX: DbTx + DbTxMut,
     {
         for map in maps {
-            publish(tx, identity, start, std::slice::from_ref(map))?;
+            publish_with_origin_verifier(
+                tx,
+                identity,
+                start,
+                std::slice::from_ref(map),
+                &mut TestOriginVerifier,
+            )?;
             start = PublicationStart::Extend { from: map.resume_anchor() };
         }
         Ok(())
     }
 
     fn production_map() -> (reth_filter_maps::AnchoredCompletedMap, Address) {
+        production_map_with_seed(0)
+    }
+
+    fn production_map_with_seed(seed: u64) -> (reth_filter_maps::AnchoredCompletedMap, Address) {
         let mut searched = [0u8; 20];
-        searched[12..].copy_from_slice(&42u64.to_be_bytes());
+        searched[12..].copy_from_slice(&seed.wrapping_add(42).to_be_bytes());
         let address = Address::from(searched);
-        let logs = (0u64..65_535).map(|index| {
+        let logs = (seed..seed + 65_535).map(|index| {
             let mut bytes = [0u8; 20];
             bytes[12..].copy_from_slice(&index.to_be_bytes());
             LogInput::new(Address::from(bytes), [])
@@ -137,6 +185,73 @@ mod tests {
             RendererOutput::Complete(_) => panic!("expected a completed production map"),
         };
         (rendered, address)
+    }
+
+    fn render_address_map(
+        addresses: impl IntoIterator<Item = Address>,
+    ) -> reth_filter_maps::AnchoredCompletedMap {
+        let blocks = vec![
+            BlockInput::new(
+                0,
+                B256::ZERO,
+                addresses.into_iter().map(|address| LogInput::new(address, [])),
+            ),
+            BlockInput::new(1, B256::repeat_byte(1), []),
+        ];
+        let stream = LogValueStream::new(
+            DEFAULT_PARAMS,
+            ValueSpaceAnchor::new(0, B256::ZERO, 0),
+            blocks,
+            LogValueStreamTermination::ReachedHead,
+        );
+        let mut renderer = FilterMapRenderer::from_genesis(stream).unwrap();
+        match renderer.render_next().unwrap().unwrap() {
+            RendererOutput::Map(map) => map,
+            RendererOutput::Complete(_) => panic!("expected a completed production map"),
+        }
+    }
+
+    fn replacement_transition_maps(
+    ) -> (reth_filter_maps::AnchoredCompletedMap, reth_filter_maps::AnchoredCompletedMap, u32) {
+        let repeated = Address::repeat_byte(0x6e);
+        let target_row = DEFAULT_PARAMS.row_index(0, 1, address_value(repeated));
+        let single = (2_000_000u64..)
+            .map(|value| {
+                let mut bytes = [0u8; 20];
+                bytes[12..].copy_from_slice(&value.to_be_bytes());
+                Address::from(bytes)
+            })
+            .find(|address| DEFAULT_PARAMS.row_index(0, 0, address_value(*address)) == target_row)
+            .unwrap();
+        let filler = |start: u64, count: u64| {
+            (start..start + count).map(|value| {
+                let mut bytes = [0u8; 20];
+                bytes[12..].copy_from_slice(&value.to_be_bytes());
+                Address::from(bytes)
+            })
+        };
+        let overflow =
+            render_address_map(std::iter::repeat_n(repeated, 137).chain(filler(4_000_000, 65_398)));
+        let base = render_address_map(std::iter::once(single).chain(filler(8_000_000, 65_534)));
+        let overflow_length = overflow
+            .map()
+            .rows()
+            .iter()
+            .find(|row| row.row_index() == target_row)
+            .unwrap()
+            .columns()
+            .len();
+        let base_length = base
+            .map()
+            .rows()
+            .iter()
+            .find(|row| row.row_index() == target_row)
+            .unwrap()
+            .columns()
+            .len();
+        assert!(overflow_length > DEFAULT_PARAMS.base_row_length() as usize);
+        assert!(base_length <= DEFAULT_PARAMS.base_row_length() as usize);
+        (overflow, base, target_row)
     }
 
     fn maps_with_address(address: u8, count: usize) -> Vec<reth_filter_maps::AnchoredCompletedMap> {
@@ -162,6 +277,25 @@ mod tests {
     }
 
     #[test]
+    fn durable_parameter_geometry_matches_every_recognized_parameter_id() {
+        for id in [ParamsId::Default, ParamsId::RangeTest] {
+            let logical = id.params();
+            let durable = filter_map_physical_params(id.into()).unwrap();
+            assert_eq!(durable.map_height, logical.map_height());
+            assert_eq!(durable.map_width, logical.map_width());
+            assert_eq!(durable.maps_per_epoch, logical.maps_per_epoch());
+            assert_eq!(durable.base_row_length, logical.base_row_length());
+            assert_eq!(
+                durable.max_row_length,
+                logical.max_row_length(logical.log_maps_per_epoch())
+            );
+            assert_eq!(durable.group_size, logical.base_row_group_size());
+        }
+        assert!(filter_map_physical_params(0).is_err());
+        assert!(filter_map_physical_params(3).is_err());
+    }
+
+    #[test]
     fn cleanup_epoch_ranges_are_bounded_and_non_overlapping() {
         let ranges = CleanupRanges::checked(ParamsId::Default, 0, 1, 0..=2_047, 0..=100).unwrap();
         let first = ranges.row_epoch_range(0).unwrap();
@@ -171,6 +305,15 @@ mod tests {
 
         let ranges = CleanupRanges::checked(ParamsId::RangeTest, 0, 1, 0..=1, 0..=1).unwrap();
         assert!(ranges.row_epoch_range(0).unwrap().end < ranges.row_epoch_range(1).unwrap().start);
+    }
+
+    #[test]
+    fn pristine_store_is_missing_identity() {
+        let db = create_test_rw_db();
+        assert!(matches!(
+            FilterMapReadSnapshot::new(db.tx().unwrap(), &identity()),
+            Err(FilterMapStorageError::MissingIdentity)
+        ));
     }
 
     #[test]
@@ -201,7 +344,11 @@ mod tests {
             initialize_identity(&tx, &identity()),
             Err(FilterMapStorageError::IncompleteStore)
         ));
-        tx.abort();
+        tx.commit().unwrap();
+        assert!(matches!(
+            FilterMapReadSnapshot::new(db.tx().unwrap(), &identity()),
+            Err(FilterMapStorageError::IncompleteStore)
+        ));
     }
 
     #[test]
@@ -227,63 +374,76 @@ mod tests {
     }
 
     #[test]
-    fn publish_reopen_and_matcher_reads_exact_rows() {
-        let db = create_test_rw_db();
-        let maps = maps();
-        let row = &maps[0].map().rows()[0];
-        let row_index = row.row_index();
-        let expected = row.columns().to_vec();
+    fn every_failed_publication_phase_keeps_new_coverage_invisible() {
+        use crate::store::{publish_with_fault, PublicationPhase};
 
-        let tx = db.tx_mut().unwrap();
-        initialize_identity(&tx, &identity()).unwrap();
-        publish_maps(
-            &tx,
-            &identity(),
-            PublicationStart::Open { origin: SegmentOrigin::Genesis },
-            &maps,
-        )
-        .unwrap();
-        tx.commit().unwrap();
-
-        let snapshot = FilterMapReadSnapshot::new(db.tx().unwrap(), &identity()).unwrap();
-        let activated = snapshot
-            .activate(|number| {
-                Ok::<_, std::convert::Infallible>(Some(if number == 0 {
-                    B256::ZERO
-                } else {
-                    B256::repeat_byte(number as u8)
-                }))
-            })
-            .unwrap();
-        let mut source = activated.into_segment_source(0).unwrap();
-        assert_eq!(source.read_row_prefixes(&[0], row_index, 10).unwrap(), vec![expected]);
-        assert_eq!(source.read_row_prefixes(&[0], row_index, 0).unwrap(), vec![Vec::<u32>::new()]);
-        assert_eq!(source.block_pointer(0).unwrap(), 0);
-        assert_eq!(source.block_pointer(1).unwrap(), 2);
-        assert!(source.block_pointer(2).is_err());
-    }
-
-    #[test]
-    fn committed_state_restores_after_database_reopen() {
-        let directory = tempfile::tempdir().unwrap();
-        {
-            let db = init_db(directory.path(), DatabaseArguments::test()).unwrap();
+        for phase in [
+            PublicationPhase::BaseRows,
+            PublicationPhase::Extensions,
+            PublicationPhase::Directories,
+            PublicationPhase::Pointers,
+            PublicationPhase::Anchors,
+            PublicationPhase::BeforeCoverage,
+        ] {
+            let db = create_test_rw_db();
             let tx = db.tx_mut().unwrap();
             initialize_identity(&tx, &identity()).unwrap();
-            publish_maps(
+            tx.commit().unwrap();
+
+            // Commit the deliberately partial physical writes. Coverage remains the visibility
+            // fence, so even this hostile caller behavior cannot make them queryable.
+            let tx = db.tx_mut().unwrap();
+            let maps = maps();
+            let result = publish_with_fault(
                 &tx,
                 &identity(),
                 PublicationStart::Open { origin: SegmentOrigin::Genesis },
-                &maps(),
-            )
-            .unwrap();
+                &maps[..1],
+                phase,
+            );
+            assert!(
+                matches!(result, Err(FilterMapStorageError::InjectedPublicationFailure)),
+                "phase {phase:?}: {result:?}"
+            );
             tx.commit().unwrap();
-        }
-        {
-            let db = init_db(directory.path(), DatabaseArguments::test()).unwrap();
+
             let snapshot = FilterMapReadSnapshot::new(db.tx().unwrap(), &identity()).unwrap();
-            assert_eq!(snapshot.restored().segments().len(), 1);
-            assert_eq!(snapshot.restored().segments()[0].terminal().completed_map_index, 1);
+            assert!(snapshot.restored().segments().is_empty(), "phase {phase:?}");
+            assert!(snapshot.activate(|_| Ok::<_, std::convert::Infallible>(None)).is_ok());
+        }
+    }
+
+    #[test]
+    fn failures_inside_multi_record_row_loops_keep_coverage_invisible() {
+        use crate::store::{publish_with_fault, PublicationPhase};
+
+        let (map, _, _) = replacement_transition_maps();
+        let identity =
+            IndexIdentity::new(STORAGE_FORMAT_V1, 1, B256::ZERO, GETH_V1, ParamsId::Default);
+        for phase in [PublicationPhase::BaseRowWrite, PublicationPhase::ExtensionWrite] {
+            let db = create_test_rw_db();
+            let tx = db.tx_mut().unwrap();
+            initialize_identity(&tx, &identity).unwrap();
+            tx.commit().unwrap();
+
+            // Commit the deliberately interrupted physical loop. Coverage remains unchanged, so
+            // neither the first written base group nor extension is queryable.
+            let tx = db.tx_mut().unwrap();
+            let result = publish_with_fault(
+                &tx,
+                &identity,
+                PublicationStart::Open { origin: SegmentOrigin::Genesis },
+                std::slice::from_ref(&map),
+                phase,
+            );
+            assert!(
+                matches!(result, Err(FilterMapStorageError::InjectedPublicationFailure)),
+                "phase {phase:?}: {result:?}"
+            );
+            tx.commit().unwrap();
+
+            let snapshot = FilterMapReadSnapshot::new(db.tx().unwrap(), &identity).unwrap();
+            assert!(snapshot.restored().segments().is_empty(), "phase {phase:?}");
         }
     }
 
@@ -437,24 +597,37 @@ mod tests {
         let db = create_test_rw_db();
         let tx = db.tx_mut().unwrap();
         initialize_identity(&tx, &identity()).unwrap();
-        publish(
+        publish_with_origin_verifier(
             &tx,
             &identity(),
             PublicationStart::Open { origin: SegmentOrigin::Genesis },
             &maps[..1],
+            &mut TestOriginVerifier,
         )
         .unwrap();
-        publish(
+        publish_with_origin_verifier(
             &tx,
             &identity(),
             PublicationStart::Open { origin: checkpoint.clone() },
             &maps[1..],
+            &mut TestOriginVerifier,
         )
         .unwrap();
-        publish(&tx, &identity(), PublicationStart::Open { origin: checkpoint }, &maps[1..])
-            .unwrap();
+        publish_with_origin_verifier(
+            &tx,
+            &identity(),
+            PublicationStart::Open { origin: checkpoint },
+            &maps[1..],
+            &mut TestOriginVerifier,
+        )
+        .unwrap();
         tx.commit().unwrap();
-        let snapshot = FilterMapReadSnapshot::new(db.tx().unwrap(), &identity()).unwrap();
+        let snapshot = FilterMapReadSnapshot::new_with_origin_verifier(
+            db.tx().unwrap(),
+            &identity(),
+            &mut TestOriginVerifier,
+        )
+        .unwrap();
         assert_eq!(snapshot.restored().segments().len(), 1);
 
         // Publishing the predecessor after the following checkpoint segment also merges. An
@@ -464,24 +637,37 @@ mod tests {
         let db = create_test_rw_db();
         let tx = db.tx_mut().unwrap();
         initialize_identity(&tx, &identity()).unwrap();
-        publish(&tx, &identity(), PublicationStart::Open { origin: checkpoint }, &maps[1..])
-            .unwrap();
-        publish(
+        publish_with_origin_verifier(
+            &tx,
+            &identity(),
+            PublicationStart::Open { origin: checkpoint },
+            &maps[1..],
+            &mut TestOriginVerifier,
+        )
+        .unwrap();
+        publish_with_origin_verifier(
             &tx,
             &identity(),
             PublicationStart::Open { origin: SegmentOrigin::Genesis },
             &maps[..1],
+            &mut TestOriginVerifier,
         )
         .unwrap();
-        publish(
+        publish_with_origin_verifier(
             &tx,
             &identity(),
             PublicationStart::Extend { from: maps[0].resume_anchor() },
             &maps[1..],
+            &mut TestOriginVerifier,
         )
         .unwrap();
         tx.commit().unwrap();
-        let snapshot = FilterMapReadSnapshot::new(db.tx().unwrap(), &identity()).unwrap();
+        let snapshot = FilterMapReadSnapshot::new_with_origin_verifier(
+            db.tx().unwrap(),
+            &identity(),
+            &mut TestOriginVerifier,
+        )
+        .unwrap();
         assert_eq!(snapshot.restored().segments().len(), 1);
     }
 
@@ -554,6 +740,7 @@ mod tests {
             vec![0; RANGE_TEST_PARAMS.map_height() as usize / 8],
             0,
             0,
+            vec![],
         )
         .unwrap();
         let mut malformed = empty.compress();
@@ -569,54 +756,20 @@ mod tests {
     }
 
     #[test]
-    fn lazy_row_access_rejects_inexact_directory_mark_count() {
-        let db = create_test_rw_db();
-        let (map, _) = production_map();
-        let row = map.map().rows().iter().find(|row| row.columns().len() > 1).unwrap().row_index();
-        let production_identity =
-            IndexIdentity::new(STORAGE_FORMAT_V1, 1, B256::ZERO, GETH_V1, ParamsId::Default);
-        let tx = db.tx_mut().unwrap();
-        initialize_identity(&tx, &production_identity).unwrap();
-        publish(
-            &tx,
-            &production_identity,
-            PublicationStart::Open { origin: SegmentOrigin::Genesis },
-            std::slice::from_ref(&map),
-        )
-        .unwrap();
-        let mut directory = tx.get::<FilterMapDirectories>(0).unwrap().unwrap();
-        directory.logical_mark_count = u64::from(directory.nonempty_row_count);
-        tx.put::<FilterMapDirectories>(0, directory).unwrap();
-        tx.commit().unwrap();
-
-        let snapshot = FilterMapReadSnapshot::new(db.tx().unwrap(), &production_identity).unwrap();
-        let activated = snapshot
-            .activate(|number| {
-                Ok::<_, std::convert::Infallible>(Some(if number == 0 {
-                    B256::ZERO
-                } else {
-                    B256::repeat_byte(number as u8)
-                }))
-            })
-            .unwrap();
-        let mut source = activated.into_segment_source(0).unwrap();
-        assert!(matches!(
-            source.read_row_prefixes(&[0], row, 1),
-            Err(FilterMapStorageError::PayloadCountMismatch(0))
-        ));
-    }
-
-    #[test]
-    fn lazy_access_requires_declared_extension_for_short_prefixes() {
+    fn lazy_row_access_rejects_plausibly_truncated_base_payload() {
         let db = create_test_rw_db();
         let (map, _) = production_map();
         let row = map
             .map()
             .rows()
             .iter()
-            .find(|row| row.columns().len() == DEFAULT_PARAMS.base_row_length() as usize)
-            .unwrap()
-            .row_index();
+            .find(|row| {
+                row.columns().len() > 1 &&
+                    row.columns().len() <= DEFAULT_PARAMS.base_row_length() as usize
+            })
+            .unwrap();
+        let row_index = row.row_index();
+        let original_length = row.columns().len();
         let production_identity =
             IndexIdentity::new(STORAGE_FORMAT_V1, 1, B256::ZERO, GETH_V1, ParamsId::Default);
         let tx = db.tx_mut().unwrap();
@@ -628,9 +781,14 @@ mod tests {
             std::slice::from_ref(&map),
         )
         .unwrap();
-        let mut directory = tx.get::<FilterMapDirectories>(0).unwrap().unwrap();
-        directory.extended[row as usize / 8] |= 1 << (row % 8);
-        tx.put::<FilterMapDirectories>(0, directory).unwrap();
+        tx.commit().unwrap();
+
+        let key = FilterMapBaseRowKey::new(ParamsId::Default.into(), 0, row_index).unwrap();
+        let slot = FilterMapBaseRowKey::slot(ParamsId::Default.into(), 0).unwrap();
+        let tx = db.tx_mut().unwrap();
+        let mut group = tx.get::<FilterMapBaseRows>(key).unwrap().unwrap();
+        group.slots[slot].pop().unwrap();
+        tx.put::<FilterMapBaseRows>(key, group).unwrap();
         tx.commit().unwrap();
 
         let snapshot = FilterMapReadSnapshot::new(db.tx().unwrap(), &production_identity).unwrap();
@@ -645,7 +803,51 @@ mod tests {
             .unwrap();
         let mut source = activated.into_segment_source(0).unwrap();
         assert!(matches!(
-            source.read_row_prefixes(&[0], row, 1),
+            source.read_row_prefixes(&[0], row_index, original_length as u32),
+            Err(FilterMapStorageError::PayloadCountMismatch(0))
+        ));
+    }
+
+    #[test]
+    fn lazy_access_does_not_read_irrelevant_missing_extension() {
+        let db = create_test_rw_db();
+        let (map, _, row) = replacement_transition_maps();
+        let production_identity =
+            IndexIdentity::new(STORAGE_FORMAT_V1, 1, B256::ZERO, GETH_V1, ParamsId::Default);
+        let tx = db.tx_mut().unwrap();
+        initialize_identity(&tx, &production_identity).unwrap();
+        publish(
+            &tx,
+            &production_identity,
+            PublicationStart::Open { origin: SegmentOrigin::Genesis },
+            std::slice::from_ref(&map),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let extension_key = FilterMapExtendedRowKey::new(ParamsId::Default.into(), 0, row).unwrap();
+        let tx = db.tx_mut().unwrap();
+        tx.delete::<FilterMapExtendedRows>(extension_key, None).unwrap();
+        tx.commit().unwrap();
+
+        let snapshot = FilterMapReadSnapshot::new(db.tx().unwrap(), &production_identity).unwrap();
+        let activated = snapshot
+            .activate(|number| {
+                Ok::<_, std::convert::Infallible>(Some(if number == 0 {
+                    B256::ZERO
+                } else {
+                    B256::repeat_byte(number as u8)
+                }))
+            })
+            .unwrap();
+        let mut source = activated.into_segment_source(0).unwrap();
+        let expected =
+            map.map().rows().iter().find(|candidate| candidate.row_index() == row).unwrap();
+        assert_eq!(
+            source.read_row_prefixes(&[0], row, 1).unwrap(),
+            vec![vec![expected.columns()[0]]]
+        );
+        assert!(matches!(
+            source.read_row_prefixes(&[0], row, DEFAULT_PARAMS.base_row_length() + 1),
             Err(FilterMapStorageError::MissingExtension { map_index: 0, row_index })
                 if row_index == row
         ));
@@ -757,6 +959,84 @@ mod tests {
     }
 
     #[test]
+    fn default_geometry_replacement_covers_row_transitions() {
+        let db = create_test_rw_db();
+        let (overflow, base, target_row) = replacement_transition_maps();
+        let production_identity =
+            IndexIdentity::new(STORAGE_FORMAT_V1, 1, B256::ZERO, GETH_V1, ParamsId::Default);
+        let key = FilterMapBaseRowKey::new(ParamsId::Default.into(), 0, target_row).unwrap();
+        let extension_key =
+            FilterMapExtendedRowKey::new(ParamsId::Default.into(), 0, target_row).unwrap();
+
+        let tx = db.tx_mut().unwrap();
+        initialize_identity(&tx, &production_identity).unwrap();
+        publish(
+            &tx,
+            &production_identity,
+            PublicationStart::Open { origin: SegmentOrigin::Genesis },
+            std::slice::from_ref(&overflow),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let tx = db.tx_mut().unwrap();
+        contract_for_reorg(&tx, &production_identity, 0, None).unwrap();
+        let mut group = tx.get::<FilterMapBaseRows>(key).unwrap().unwrap();
+        group.slots[1] = vec![7, 8, 9];
+        tx.put::<FilterMapBaseRows>(key, group).unwrap();
+        tx.commit().unwrap();
+
+        // Extended → base-only also removes obsolete extension data and preserves another map's
+        // byte-for-byte slot in the shared group.
+        let tx = db.tx_mut().unwrap();
+        publish(
+            &tx,
+            &production_identity,
+            PublicationStart::Open { origin: SegmentOrigin::Genesis },
+            std::slice::from_ref(&base),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let tx = db.tx().unwrap();
+        assert!(!tx.get::<FilterMapDirectories>(0).unwrap().unwrap().is_extended(target_row));
+        assert!(tx.get::<FilterMapExtendedRows>(extension_key).unwrap().is_none());
+        assert_eq!(tx.get::<FilterMapBaseRows>(key).unwrap().unwrap().slots[1], [7, 8, 9]);
+        drop(tx);
+
+        let tx = db.tx_mut().unwrap();
+        contract_for_reorg(&tx, &production_identity, 0, None).unwrap();
+        tx.commit().unwrap();
+        // Base-only → extended recreates the required extension.
+        let tx = db.tx_mut().unwrap();
+        publish(
+            &tx,
+            &production_identity,
+            PublicationStart::Open { origin: SegmentOrigin::Genesis },
+            std::slice::from_ref(&overflow),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let tx = db.tx().unwrap();
+        assert!(tx.get::<FilterMapDirectories>(0).unwrap().unwrap().is_extended(target_row));
+        assert!(tx.get::<FilterMapExtendedRows>(extension_key).unwrap().is_some());
+
+        // Rows present only in the base replacement are removed when overflow is restored.
+        let removed_row = base
+            .map()
+            .rows()
+            .iter()
+            .find(|row| {
+                !overflow
+                    .map()
+                    .rows()
+                    .iter()
+                    .any(|candidate| candidate.row_index() == row.row_index())
+            })
+            .unwrap()
+            .row_index();
+        assert!(!tx.get::<FilterMapDirectories>(0).unwrap().unwrap().is_nonempty(removed_row));
+    }
+
+    #[test]
     fn uncovered_stale_maps_can_be_replaced() {
         let db = create_test_rw_db();
         let original = maps_with_address(1, 2);
@@ -834,51 +1114,6 @@ mod tests {
             .restored()
             .segments()
             .is_empty());
-    }
-
-    #[test]
-    fn production_renderer_survives_publication_reopen_and_matcher_query() {
-        let directory = tempfile::tempdir().unwrap();
-        let (rendered, address) = production_map();
-        assert_eq!(rendered.map().map_index(), 0);
-        let production_identity =
-            IndexIdentity::new(STORAGE_FORMAT_V1, 1, B256::ZERO, GETH_V1, ParamsId::Default);
-
-        {
-            let db = init_db(directory.path(), DatabaseArguments::test()).unwrap();
-            let tx = db.tx_mut().unwrap();
-            initialize_identity(&tx, &production_identity).unwrap();
-            publish(
-                &tx,
-                &production_identity,
-                PublicationStart::Open { origin: SegmentOrigin::Genesis },
-                std::slice::from_ref(&rendered),
-            )
-            .unwrap();
-            tx.commit().unwrap();
-        }
-        {
-            let db = init_db(directory.path(), DatabaseArguments::test()).unwrap();
-            let source = FilterMapReadSnapshot::new(db.tx().unwrap(), &production_identity)
-                .unwrap()
-                .activate(|number| {
-                    Ok::<_, std::convert::Infallible>(Some(if number == 0 {
-                        B256::ZERO
-                    } else {
-                        B256::repeat_byte(number as u8)
-                    }))
-                })
-                .unwrap()
-                .into_segment_source(0)
-                .unwrap();
-            let candidates = FilterMapMatcher::new(source)
-                .match_subrange(
-                    &MatchPattern::new(vec![address], vec![]).unwrap(),
-                    IndexedMatchRange::new(0..=0, 0..=0, ParamsId::Default),
-                )
-                .unwrap();
-            assert_eq!(candidates.candidate_blocks(), &[0]);
-        }
     }
 
     #[test]

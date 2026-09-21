@@ -10,7 +10,9 @@ use reth_db_api::{
     tables::FilterMapCoverage,
     transaction::{DbTx, DbTxMut},
 };
-use reth_filter_maps::coverage::{IndexIdentity, MapResumeAnchor, ReorgContraction};
+use reth_filter_maps::coverage::{
+    IndexIdentity, MapResumeAnchor, RejectUntrustedOrigins, ReorgContraction, StoredOriginVerifier,
+};
 use std::ops::RangeInclusive;
 
 const SINGLETON_KEY: u8 = 0;
@@ -25,7 +27,27 @@ pub fn contract_for_reorg<TX>(
 where
     TX: DbTx + DbTxMut,
 {
-    let mut coverage = load_metadata(tx, identity)?.coverage;
+    contract_for_reorg_with_origin_verifier(
+        tx,
+        identity,
+        earliest_changed,
+        safe_anchor,
+        &mut RejectUntrustedOrigins,
+    )
+}
+
+/// Contracts query visibility after explicitly verifying persisted non-genesis origins.
+pub fn contract_for_reorg_with_origin_verifier<TX>(
+    tx: &TX,
+    identity: &IndexIdentity,
+    earliest_changed: u64,
+    safe_anchor: Option<MapResumeAnchor>,
+    verifier: &mut impl StoredOriginVerifier,
+) -> Result<ReorgContraction>
+where
+    TX: DbTx + DbTxMut,
+{
+    let mut coverage = load_metadata(tx, identity, verifier)?.coverage;
     let outcome = coverage.contract_for_reorg(earliest_changed, safe_anchor)?;
     tx.put::<FilterMapCoverage>(SINGLETON_KEY, catalog_to_db(coverage.stored_record()))?;
     Ok(outcome)
@@ -36,7 +58,20 @@ pub fn retain_after<TX>(tx: &TX, identity: &IndexIdentity, tail: MapResumeAnchor
 where
     TX: DbTx + DbTxMut,
 {
-    let mut coverage = load_metadata(tx, identity)?.coverage;
+    retain_after_with_origin_verifier(tx, identity, tail, &mut RejectUntrustedOrigins)
+}
+
+/// Drops visibility after explicitly verifying persisted non-genesis origins.
+pub fn retain_after_with_origin_verifier<TX>(
+    tx: &TX,
+    identity: &IndexIdentity,
+    tail: MapResumeAnchor,
+    verifier: &mut impl StoredOriginVerifier,
+) -> Result<()>
+where
+    TX: DbTx + DbTxMut,
+{
+    let mut coverage = load_metadata(tx, identity, verifier)?.coverage;
     coverage.retain_after(tail)?;
     tx.put::<FilterMapCoverage>(SINGLETON_KEY, catalog_to_db(coverage.stored_record()))?;
     Ok(())

@@ -9042,6 +9042,7 @@ version = "2.5.2"
 dependencies = [
  "alloy-eips",
  "alloy-primitives",
+ "reth-filter-maps-test-utils",
  "sha2 0.10.9",
  "thiserror 2.0.18",
 ]
@@ -9054,8 +9055,19 @@ dependencies = [
  "reth-db",
  "reth-db-api",
  "reth-filter-maps",
+ "reth-filter-maps-test-utils",
  "sha2 0.10.9",
  "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "reth-filter-maps-test-utils"
+version = "2.5.2"
+dependencies = [
+ "alloy-primitives",
+ "reth-fs-util",
+ "sha2 0.10.9",
  "thiserror 2.0.18",
 ]
 

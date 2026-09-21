@@ -13,7 +13,9 @@ use reth_db_api::{
     transaction::{DbTx, DbTxMut},
 };
 use reth_filter_maps::{
-    coverage::{IndexIdentity, MapResumeAnchor, SegmentOrigin},
+    coverage::{
+        IndexIdentity, MapResumeAnchor, RejectUntrustedOrigins, SegmentOrigin, StoredOriginVerifier,
+    },
     AnchoredCompletedMap,
 };
 
@@ -76,27 +78,93 @@ pub fn publish<TX>(
 where
     TX: DbTx + DbTxMut,
 {
-    let proposal = build_publication(tx, identity, &start, maps)?;
-    let PublicationProposal::Write(writes) = proposal else { return Ok(()) };
+    publish_with_origin_verifier(tx, identity, start, maps, &mut RejectUntrustedOrigins)
+}
 
+/// Publishes after explicitly re-establishing trust in any persisted non-genesis origins.
+pub fn publish_with_origin_verifier<TX>(
+    tx: &TX,
+    identity: &IndexIdentity,
+    start: PublicationStart,
+    maps: &[AnchoredCompletedMap],
+    verifier: &mut impl StoredOriginVerifier,
+) -> Result<()>
+where
+    TX: DbTx + DbTxMut,
+{
+    let proposal = build_publication(tx, identity, &start, maps, verifier)?;
+    let PublicationProposal::Write(writes) = proposal else { return Ok(()) };
+    apply_publication(tx, writes, |_| Ok(()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PublicationPhase {
+    BaseRowWrite,
+    BaseRows,
+    ExtensionWrite,
+    Extensions,
+    Directories,
+    Pointers,
+    Anchors,
+    BeforeCoverage,
+}
+
+fn apply_publication<TX>(
+    tx: &TX,
+    writes: crate::validation::PublicationWrites,
+    mut after_phase: impl FnMut(PublicationPhase) -> Result<()>,
+) -> Result<()>
+where
+    TX: DbTx + DbTxMut,
+{
     for (key, group) in writes.base_groups {
         tx.put::<FilterMapBaseRows>(key, group)?;
+        after_phase(PublicationPhase::BaseRowWrite)?;
     }
+    after_phase(PublicationPhase::BaseRows)?;
     for (key, extension) in writes.extensions {
         tx.delete::<FilterMapExtendedRows>(key, None)?;
         if let Some(extension) = extension {
             tx.put::<FilterMapExtendedRows>(key, extension)?;
         }
+        after_phase(PublicationPhase::ExtensionWrite)?;
     }
+    after_phase(PublicationPhase::Extensions)?;
     for (map_index, directory) in writes.directories {
         tx.put::<FilterMapDirectories>(map_index, directory)?;
     }
+    after_phase(PublicationPhase::Directories)?;
     for (block_number, pointer) in writes.pointers {
         tx.put::<FilterMapBlockPointers>(block_number, pointer)?;
     }
+    after_phase(PublicationPhase::Pointers)?;
     for (map_index, anchor) in writes.anchors {
         tx.put::<FilterMapAnchors>(map_index, anchor)?;
     }
+    after_phase(PublicationPhase::Anchors)?;
+    after_phase(PublicationPhase::BeforeCoverage)?;
     tx.put::<FilterMapCoverage>(SINGLETON_KEY, writes.coverage)?;
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn publish_with_fault<TX>(
+    tx: &TX,
+    identity: &IndexIdentity,
+    start: PublicationStart,
+    maps: &[AnchoredCompletedMap],
+    fault_after: PublicationPhase,
+) -> Result<()>
+where
+    TX: DbTx + DbTxMut,
+{
+    let proposal = build_publication(tx, identity, &start, maps, &mut RejectUntrustedOrigins)?;
+    let PublicationProposal::Write(writes) = proposal else { return Ok(()) };
+    apply_publication(tx, writes, |phase| {
+        if phase == fault_after {
+            Err(FilterMapStorageError::InjectedPublicationFailure)
+        } else {
+            Ok(())
+        }
+    })
 }

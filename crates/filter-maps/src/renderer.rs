@@ -3,7 +3,8 @@
 //! The renderer marks every typed searchable value and treats delimiters and padding only as
 //! absolute-index consumers. Completed maps remain private until the immediately following
 //! boundary is validated and paired with the matching numerical block pointer. Rows are sparse,
-//! deterministic logical output; physical encoding and publication belong to later layers.
+//! deterministic logical output; `reth-filter-maps-storage` owns physical encoding and atomic
+//! publication.
 
 mod error;
 mod map;

@@ -133,6 +133,10 @@ pub enum FilterMapStorageError {
     /// Checked cleanup or interval arithmetic overflowed.
     #[error("FilterMaps range arithmetic overflow")]
     Arithmetic,
+    /// Test-only failure injected between durable publication phases.
+    #[cfg(test)]
+    #[error("injected FilterMaps publication failure")]
+    InjectedPublicationFailure,
 }
 
 /// Result returned by durable `FilterMaps` operations.
