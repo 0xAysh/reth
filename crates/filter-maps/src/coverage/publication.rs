@@ -190,12 +190,9 @@ impl StructurallyRestoredCoverage {
 mod tests {
     use super::*;
     use crate::{
-        coverage::{
-            RejectUnrecognizedCheckpoints, StoredCoverageRecord, VerifiedCheckpoint,
-            STORAGE_FORMAT_V1,
-        },
-        BlockInput, BlockPointer, FilterMapRenderer, LogInput, LogValueStream,
-        LogValueStreamTermination, ParamsId, RendererOutput, GETH_V1, RANGE_TEST_PARAMS,
+        coverage::{RejectUnrecognizedCheckpoints, StoredCoverageRecord, STORAGE_FORMAT_V1},
+        test_utils::{recognized_checkpoint, render_from_genesis},
+        BlockInput, LogInput, ParamsId, GETH_V1, RANGE_TEST_PARAMS,
     };
     use alloy_primitives::{Address, B256};
     use std::{collections::BTreeMap, convert::Infallible};
@@ -224,23 +221,10 @@ mod tests {
             let logs = (0..logs).map(|_| LogInput::new(Address::repeat_byte(0x11), []));
             BlockInput::new(number, hash(number), logs)
         });
-        let stream = LogValueStream::new(
-            RANGE_TEST_PARAMS,
-            BlockPointer::new(0, hash(0), 0),
-            blocks.collect::<Vec<_>>(),
-            LogValueStreamTermination::ReachedHead,
-        );
-        let mut renderer = FilterMapRenderer::from_genesis(stream).unwrap();
-        (0..count)
-            .map(|_| match renderer.render_next().unwrap().unwrap() {
-                RendererOutput::Map(map) => map,
-                RendererOutput::Complete(_) => panic!("expected {count} maps"),
-            })
-            .collect()
-    }
-
-    fn checkpoint(anchor: MapResumeAnchor) -> SegmentOrigin {
-        SegmentOrigin::Checkpoint(VerifiedCheckpoint::recognized(identity(), anchor, 1))
+        let mut maps = render_from_genesis(RANGE_TEST_PARAMS, blocks.collect()).maps;
+        assert!(maps.len() >= count, "expected {count} maps");
+        maps.truncate(count);
+        maps
     }
 
     fn next(proposal: PublicationProposal) -> (StructurallyRestoredCoverage, PointerEvidence) {
@@ -309,7 +293,8 @@ mod tests {
     #[test]
     fn retry_is_recognized_inside_a_merged_segment() {
         let maps = render(4, 1);
-        let origin = checkpoint(maps[1].resume_anchor());
+        let origin =
+            recognized_checkpoint(identity(), maps[1].resume_anchor(), maps[2].resume_anchor());
         let checkpoint_start = PublicationStart::Open { origin };
         let (coverage, _) = next(empty().propose(&checkpoint_start, &maps[2..]).unwrap());
         let genesis = PublicationStart::Open { origin: SegmentOrigin::Genesis };

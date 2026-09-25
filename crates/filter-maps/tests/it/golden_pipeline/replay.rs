@@ -8,8 +8,8 @@
 use super::parser::{Block, BoundaryEnding, Fixture, LogIdentity, Query, SlotClass, Termination};
 use alloy_eips::BlockNumHash;
 use reth_filter_maps::{
-    BlockPointer, LogValueKind, LogValueSlot, LogValueStreamCompletion, LogValueStreamEvent,
-    LogValueStreamItem, MapBoundary,
+    test_utils::golden, BlockPointer, LogValueKind, LogValueSlot, LogValueStreamCompletion,
+    LogValueStreamEvent, LogValueStreamItem, MapBoundary,
 };
 use std::collections::BTreeMap;
 
@@ -141,11 +141,7 @@ fn log_identities(block: &Block) -> Vec<LogIdentity> {
 }
 
 fn drive(fixture: &Fixture) -> Result<Replay, String> {
-    let mut stream = super::input::stream(
-        fixture,
-        super::input::blocks(fixture),
-        super::input::termination(fixture),
-    );
+    let mut stream = golden::stream(fixture, golden::blocks(fixture), golden::termination(fixture));
 
     let mut tracker = Tracker {
         fixture,

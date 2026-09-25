@@ -1,8 +1,8 @@
+pub(super) use crate::test_utils::AcceptAllCheckpoints;
 use crate::{
     coverage::{
-        CheckpointProvenance, CheckpointVerifier, CoverageSet, IndexIdentity, QueryableCoverage,
-        SegmentOrigin, StructurallyRestoredCoverage, ValidatedSegment, VerifiedCheckpoint,
-        STORAGE_FORMAT_V1,
+        CoverageSet, IndexIdentity, QueryableCoverage, SegmentOrigin, StructurallyRestoredCoverage,
+        ValidatedSegment, VerifiedCheckpoint, STORAGE_FORMAT_V1,
     },
     BlockPointer, MapBoundary, MapResumeAnchor, ParamsId, DEFAULT_PARAMS, GETH_V1,
 };
@@ -82,20 +82,6 @@ pub(super) fn stored_pointers<'a>(
     pointers
 }
 
-/// Accepts every checkpoint recorded under the test identity.
-pub(super) struct TestCheckpointVerifier;
-
-impl CheckpointVerifier for TestCheckpointVerifier {
-    fn verify_checkpoint(
-        &mut self,
-        identity: &IndexIdentity,
-        anchor: MapResumeAnchor,
-        _provenance: CheckpointProvenance,
-    ) -> bool {
-        *identity == self::identity() && anchor.value_space_version == identity.value_space_version
-    }
-}
-
 /// Round-trips `set` through its stored catalog and anchors.
 pub(super) fn restored(set: &CoverageSet) -> StructurallyRestoredCoverage {
     let anchors = set.segments().iter().flat_map(|segment| segment.anchors().iter().copied());
@@ -103,7 +89,7 @@ pub(super) fn restored(set: &CoverageSet) -> StructurallyRestoredCoverage {
         set.identity(),
         set.stored_record(),
         anchors.collect::<Vec<_>>(),
-        &mut TestCheckpointVerifier,
+        &mut AcceptAllCheckpoints,
     )
     .unwrap()
 }

@@ -7,17 +7,17 @@
 //! log value stream and checks only recorded
 //! pointer, boundary, termination, and slot-classification evidence against emitted events. The
 //! local `render` module drives every fixture through the public renderer and compares its maps
-//! with Geth's rendered rows.
+//! with Geth's rendered rows, and the local `matcher` module matches every query over those maps.
 
-#[path = "golden_pipeline/input.rs"]
-mod input;
+#[path = "golden_pipeline/matcher.rs"]
+mod matcher;
 #[path = "golden_pipeline/render.rs"]
 mod render;
 #[path = "golden_pipeline/replay.rs"]
 mod replay;
 
 use parser::{BoundaryEnding, FixtureClass, Origin, ParamsName, Planner, TopicConstraint};
-pub(crate) use reth_filter_maps_test_utils::{manifest, parser};
+pub(crate) use reth_filter_maps::test_utils::golden::{manifest, parser};
 
 #[test]
 fn manifested_pipeline_corpus_is_valid() {

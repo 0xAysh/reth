@@ -9056,7 +9056,6 @@ dependencies = [
  "reth-db",
  "reth-db-api",
  "reth-filter-maps",
- "reth-filter-maps-test-utils",
  "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",

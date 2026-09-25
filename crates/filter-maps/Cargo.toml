@@ -22,9 +22,12 @@ sha2.workspace = true
 # misc
 thiserror.workspace = true
 
+# test-utils
+reth-filter-maps-test-utils = { workspace = true, optional = true }
+
 [dev-dependencies]
 reth-filter-maps = { workspace = true, features = ["test-utils"] }
 reth-filter-maps-test-utils.workspace = true
 
 [features]
-test-utils = ["reth-filter-maps/test-utils"]
+test-utils = ["dep:reth-filter-maps-test-utils", "reth-filter-maps/test-utils"]

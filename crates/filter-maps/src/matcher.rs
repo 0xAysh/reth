@@ -5,8 +5,6 @@
 //! subrange, and resolves them to blocks through explicit block-pointer lookups. Results are
 //! candidates only: receipt loading and exact log filtering remain authoritative.
 
-#[cfg(test)]
-use crate::AnchoredCompletedMap;
 use crate::{address_value, topic_value, Params, ParamsId};
 use alloy_primitives::{Address, B256};
 use std::{collections::BTreeMap, error::Error, ops::RangeInclusive};
@@ -680,125 +678,6 @@ fn combine(base: PotentialSet, next: Vec<u64>, offset: u64, values_per_map: u64)
             PotentialSet::Some(intersection)
         }
     }
-}
-
-#[cfg(test)]
-#[derive(Debug)]
-pub(crate) struct InMemoryMatchSource {
-    params_id: ParamsId,
-    maps: Vec<AnchoredCompletedMap>,
-    pointers: Vec<(u64, u64)>,
-}
-
-#[cfg(test)]
-impl InMemoryMatchSource {
-    pub(crate) fn new(
-        maps: Vec<AnchoredCompletedMap>,
-        pointers: Vec<(u64, u64)>,
-    ) -> Result<Self, InMemorySourceError> {
-        let params_id = maps.first().ok_or(InMemorySourceError::NoMaps)?.map().params_id();
-        let mut previous_map = None;
-        for anchored in &maps {
-            let map = anchored.map();
-            if map.params_id() != params_id {
-                return Err(InMemorySourceError::MixedParams {
-                    expected: params_id,
-                    actual: map.params_id(),
-                })
-            }
-            if previous_map.is_some_and(|previous| previous >= map.map_index()) {
-                return Err(InMemorySourceError::MapOrder {
-                    previous: previous_map.unwrap(),
-                    actual: map.map_index(),
-                })
-            }
-            previous_map = Some(map.map_index());
-        }
-        let mut previous: Option<(u64, u64)> = None;
-        for &(block, index) in &pointers {
-            if let Some((previous_block, previous_index)) = previous {
-                if previous_block.checked_add(1) != Some(block) {
-                    return Err(InMemorySourceError::PointerBlockOrder {
-                        previous: previous_block,
-                        actual: block,
-                    })
-                }
-                if previous_index >= index {
-                    return Err(InMemorySourceError::PointerIndexOrder {
-                        previous: previous_index,
-                        actual: index,
-                    })
-                }
-            }
-            previous = Some((block, index));
-        }
-        if pointers.is_empty() {
-            return Err(InMemorySourceError::NoPointers)
-        }
-        Ok(Self { params_id, maps, pointers })
-    }
-}
-
-#[cfg(test)]
-impl FilterMapMatchSource for InMemoryMatchSource {
-    type Error = InMemorySourceError;
-
-    fn params_id(&self) -> ParamsId {
-        self.params_id
-    }
-
-    fn read_row_prefixes(
-        &mut self,
-        map_indices: &[u32],
-        row_index: u32,
-        max_columns: u32,
-    ) -> Result<Vec<Vec<u32>>, Self::Error> {
-        map_indices
-            .iter()
-            .map(|&map_index| {
-                let map = self
-                    .maps
-                    .binary_search_by_key(&map_index, |map| map.map().map_index())
-                    .map_err(|_| InMemorySourceError::UnknownMap { map: map_index })?;
-                let rows = self.maps[map].map().rows();
-                let columns = rows
-                    .binary_search_by_key(&row_index, |row| row.row_index())
-                    .ok()
-                    .map(|row| rows[row].columns())
-                    .unwrap_or_default();
-                Ok(columns.iter().copied().take(max_columns as usize).collect())
-            })
-            .collect()
-    }
-
-    fn block_pointer(&mut self, block_number: u64) -> Result<u64, Self::Error> {
-        self.pointers
-            .binary_search_by_key(&block_number, |&(block, _)| block)
-            .map(|index| self.pointers[index].1)
-            .map_err(|_| InMemorySourceError::UnknownPointer { block: block_number })
-    }
-}
-
-#[cfg(test)]
-#[allow(missing_docs)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum InMemorySourceError {
-    #[error("at least one completed map is required")]
-    NoMaps,
-    #[error("at least one block pointer is required")]
-    NoPointers,
-    #[error("completed maps mix parameter identities {expected:?} and {actual:?}")]
-    MixedParams { expected: ParamsId, actual: ParamsId },
-    #[error("completed map {actual} does not strictly follow {previous}")]
-    MapOrder { previous: u32, actual: u32 },
-    #[error("pointer block {actual} does not immediately follow {previous}")]
-    PointerBlockOrder { previous: u64, actual: u64 },
-    #[error("pointer index {actual} does not strictly follow {previous}")]
-    PointerIndexOrder { previous: u64, actual: u64 },
-    #[error("completed map {map} is unavailable")]
-    UnknownMap { map: u32 },
-    #[error("block pointer {block} is unavailable")]
-    UnknownPointer { block: u64 },
 }
 
 #[cfg(test)]

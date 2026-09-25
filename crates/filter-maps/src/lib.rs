@@ -44,6 +44,8 @@ mod matcher;
 mod params;
 mod renderer;
 mod stream;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_utils;
 mod value;
 
 pub use anchor::{MapResumeAnchor, ResumeAnchorMismatch};
@@ -65,7 +67,3 @@ pub use stream::{
     UnknownValueSpaceVersion, ValueSpaceVersion, GETH_V1,
 };
 pub use value::{address_value, topic_value};
-
-// Shared fixture types are a dev-only dependency; private renderer state stays inside crate tests.
-#[cfg(test)]
-use reth_filter_maps_test_utils as golden_pipeline;

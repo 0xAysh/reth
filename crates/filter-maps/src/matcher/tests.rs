@@ -1,5 +1,5 @@
 use super::*;
-use crate::{RendererOutput, DEFAULT_PARAMS};
+use crate::DEFAULT_PARAMS;
 use alloy_primitives::{address, b256};
 use std::collections::BTreeMap;
 
@@ -181,84 +181,6 @@ fn malformed_columns_are_errors_not_empty_matches() {
         ),
         Err(MatcherError::MalformedColumn { .. })
     ));
-}
-
-#[test]
-fn fixture_match_all_classification_includes_declared_wildcards() {
-    use crate::golden_pipeline::{manifest, parser::TopicConstraint};
-
-    let mut query = manifest::load_and_validate_corpus()
-        .unwrap()
-        .into_iter()
-        .find_map(|(_, fixture)| fixture.queries.into_iter().next())
-        .unwrap();
-    query.addresses.clear();
-    for topics in [vec![], vec![TopicConstraint::Any], vec![TopicConstraint::Any; 2]] {
-        query.topics = topics;
-        assert!(query.is_match_all());
-    }
-}
-
-#[test]
-fn every_pipeline_query_matches_geth_from_production_renderer_output() {
-    use crate::golden_pipeline::{
-        manifest,
-        parser::{QueryResult, TopicConstraint},
-    };
-
-    for (entry, fixture) in manifest::load_and_validate_corpus().unwrap() {
-        let pointers = fixture.pointers.iter().map(|p| (p.block, p.index)).collect::<Vec<_>>();
-        let params_id = match fixture.params_name {
-            crate::golden_pipeline::parser::ParamsName::Default => ParamsId::Default,
-            crate::golden_pipeline::parser::ParamsName::Range => ParamsId::RangeTest,
-        };
-        for query in &fixture.queries {
-            let source =
-                InMemoryMatchSource::new(render_fixture(&fixture), pointers.clone()).unwrap();
-            let topics = query
-                .topics
-                .iter()
-                .map(|topic| match topic {
-                    TopicConstraint::Any => TopicSelection::Any,
-                    TopicConstraint::Values(values) => TopicSelection::OneOf(values.clone()),
-                })
-                .collect();
-            let pattern = MatchPattern::new(query.addresses.clone(), topics).unwrap();
-            let result = FilterMapMatcher::new(source).match_subrange(
-                &pattern,
-                IndexedMatchRange::new(
-                    query.first_block..=query.last_block,
-                    query.map_range.0..=query.map_range.1,
-                    params_id,
-                ),
-            );
-            if query.result == QueryResult::ErrMatchAll {
-                assert!(
-                    matches!(result, Err(MatcherError::NoSearchableValues)),
-                    "{}:{}",
-                    entry.path,
-                    query.id
-                );
-            } else {
-                let result =
-                    result.unwrap_or_else(|error| panic!("{}:{}: {error}", entry.path, query.id));
-                assert_eq!(
-                    result.potential_indices(),
-                    query.potential_indices,
-                    "{}:{}",
-                    entry.path,
-                    query.id
-                );
-                assert_eq!(
-                    result.candidate_blocks(),
-                    query.candidate_blocks,
-                    "{}:{}",
-                    entry.path,
-                    query.id
-                );
-            }
-        }
-    }
 }
 
 #[test]
@@ -489,63 +411,4 @@ fn pointer_order_and_range_boundaries_fail_closed() {
         )
         .unwrap_err();
     assert!(matches!(error, MatcherError::BlockSuccessorOverflow { .. }));
-}
-
-fn render_fixture(
-    fixture: &crate::golden_pipeline::parser::Fixture,
-) -> Vec<crate::AnchoredCompletedMap> {
-    use crate::{
-        golden_pipeline::parser::{Origin, ParamsName, Termination},
-        BatchContinuation, BlockInput, BlockPointer, FilterMapRenderer, LogInput, LogValueStream,
-        LogValueStreamTermination, RANGE_TEST_PARAMS,
-    };
-    use alloy_eips::BlockNumHash;
-
-    let params = match fixture.params_name {
-        ParamsName::Default => DEFAULT_PARAMS,
-        ParamsName::Range => RANGE_TEST_PARAMS,
-    };
-    let blocks = fixture.blocks.iter().map(|block| {
-        let logs = block
-            .receipts
-            .iter()
-            .flat_map(|receipt| &receipt.logs)
-            .map(|log| LogInput::new(log.address, log.topics.iter().copied()));
-        BlockInput::new(block.number, block.hash, logs)
-    });
-    let termination = match fixture.termination {
-        Termination::Head => LogValueStreamTermination::ReachedHead,
-        Termination::Batch { next_block, next_hash } => LogValueStreamTermination::BatchExhausted {
-            next_block: BlockNumHash::new(next_block, next_hash),
-        },
-    };
-    let (stream, previous) = match fixture.origin {
-        Origin::Genesis(origin) | Origin::Checkpoint(origin) => (
-            LogValueStream::new(
-                params,
-                BlockPointer::new(origin.block, origin.hash, origin.index),
-                blocks,
-                termination,
-            ),
-            None,
-        ),
-        Origin::Continuation { block, hash, cursor, previous } => (
-            LogValueStream::continue_from(
-                params,
-                BatchContinuation::new(BlockNumHash::new(block, hash), cursor),
-                blocks,
-                termination,
-            ),
-            Some(BlockPointer::new(previous.block, previous.hash, previous.index)),
-        ),
-    };
-    let mut renderer = FilterMapRenderer::from_geth_oracle_start(stream, previous).unwrap();
-    let mut maps = Vec::new();
-    while let Some(output) = renderer.render_next() {
-        match output.unwrap() {
-            RendererOutput::Map(map) => maps.push(map),
-            RendererOutput::Complete(_) => break,
-        }
-    }
-    maps
 }

@@ -9,14 +9,15 @@
 //! publishes must hold exactly Geth's partial rows.
 
 use super::{
-    input, manifest,
+    manifest,
     parser::{self, Fixture, Termination},
 };
 use alloy_eips::BlockNumHash;
 use alloy_primitives::B256;
 use reth_filter_maps::{
-    AnchoredCompletedMap, BlockInput, BlockPointer, CompletedMap, FilterMapRenderer, ParamsId,
-    RendererCompletion, RendererOutput,
+    test_utils::golden::{self, pointer},
+    AnchoredCompletedMap, BlockInput, CompletedMap, FilterMapRenderer, RendererCompletion,
+    RendererOutput,
 };
 
 #[test]
@@ -24,7 +25,7 @@ fn every_fixture_renders_geth_maps_through_render_next() {
     for (entry, fixture) in &manifest::load_and_validate_corpus().unwrap() {
         let path = entry.path.as_str();
         let mut renderer =
-            input::renderer(fixture, input::blocks(fixture), input::termination(fixture));
+            golden::oracle_renderer(fixture, golden::blocks(fixture), golden::termination(fixture));
         let mut maps = Vec::new();
         let completion = loop {
             match next_output(path, &mut renderer) {
@@ -54,7 +55,7 @@ fn check_completed_map(
     expected: &parser::CompletedMap,
 ) {
     let map = actual.map();
-    assert_eq!(map.params_id(), params_id(fixture), "{path}");
+    assert_eq!(map.params_id(), golden::params_id(fixture.params_name), "{path}");
     assert_eq!(map.map_index(), expected.index, "{path}");
     assert_eq!(map.epoch(), expected.epoch, "{path}");
     assert_eq!(map.mark_count(), expected.mark_count, "{path}");
@@ -80,7 +81,7 @@ fn check_completion(path: &str, fixture: &Fixture, completion: RendererCompletio
                     "{path}"
                 ),
                 _ => {
-                    let values_per_map = input::params(fixture.params_name).values_per_map();
+                    let values_per_map = golden::params(fixture.params_name).values_per_map();
                     assert!(pending_delimiter.index.is_multiple_of(values_per_map), "{path}");
                 }
             }
@@ -110,10 +111,10 @@ fn check_partial_map(path: &str, fixture: &Fixture, expected: &parser::PartialMa
         BlockInput::new(number, hash, [])
     });
     // The filler input never ends, so the termination is never reached.
-    let mut renderer = input::renderer(
+    let mut renderer = golden::oracle_renderer(
         fixture,
-        input::blocks(fixture).into_iter().chain(fillers),
-        input::termination(fixture),
+        golden::blocks(fixture).into_iter().chain(fillers),
+        golden::termination(fixture),
     );
     for _ in &fixture.completed_maps {
         next_map(path, &mut renderer);
@@ -146,14 +147,6 @@ fn next_map<I: Iterator<Item = BlockInput>>(
             panic!("{path}: expected a map, got {completion:?}")
         }
     }
-}
-
-fn params_id(fixture: &Fixture) -> ParamsId {
-    ParamsId::of(&input::params(fixture.params_name)).expect("fixture params are recognized")
-}
-
-const fn pointer(pointer: parser::Pointer) -> BlockPointer {
-    BlockPointer::new(pointer.block, pointer.hash, pointer.index)
 }
 
 fn filler_hash(number: u64) -> B256 {

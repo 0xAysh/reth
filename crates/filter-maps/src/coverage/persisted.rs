@@ -550,7 +550,7 @@ mod tests {
             &identity(),
             coverage.stored_record(),
             anchors,
-            &mut TestCheckpointVerifier,
+            &mut AcceptAllCheckpoints,
         )
         .unwrap();
         assert_eq!(restored.segments().len(), 1);
@@ -571,7 +571,7 @@ mod tests {
             &identity(),
             coverage.stored_record(),
             all_anchors,
-            &mut TestCheckpointVerifier,
+            &mut AcceptAllCheckpoints,
         )
         .unwrap();
 
@@ -601,7 +601,7 @@ mod tests {
             &identity(),
             record,
             anchors,
-            &mut TestCheckpointVerifier,
+            &mut AcceptAllCheckpoints,
         )
         .unwrap();
         let queryable = activate(&restored, |number| {
@@ -621,7 +621,7 @@ mod tests {
             &identity(),
             coverage.stored_record(),
             anchors,
-            &mut TestCheckpointVerifier,
+            &mut AcceptAllCheckpoints,
         )
         .unwrap();
         assert_eq!(restored.segments()[0].blocks(), Some(101..=129));
@@ -927,7 +927,7 @@ mod tests {
                 &identity(),
                 record,
                 [aligned(0, 10)],
-                &mut TestCheckpointVerifier,
+                &mut AcceptAllCheckpoints,
             ),
             Err(PersistedCoverageError::MissingAnchor { map_index: 1 })
         ));
@@ -937,7 +937,7 @@ mod tests {
                 &identity(),
                 empty.clone(),
                 [aligned(0, 10), aligned(0, 10)],
-                &mut TestCheckpointVerifier,
+                &mut AcceptAllCheckpoints,
             ),
             Err(PersistedCoverageError::DuplicateAnchor { map_index: 0 })
         ));
@@ -946,7 +946,7 @@ mod tests {
                 &identity(),
                 empty,
                 [aligned(0, 10)],
-                &mut TestCheckpointVerifier,
+                &mut AcceptAllCheckpoints,
             ),
             Err(PersistedCoverageError::UnexpectedAnchor { map_index: 0 })
         ));

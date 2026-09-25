@@ -19,6 +19,6 @@ thiserror.workspace = true
 
 [dev-dependencies]
 reth-db = { workspace = true, features = ["test-utils"] }
-reth-filter-maps-test-utils.workspace = true
+reth-filter-maps = { workspace = true, features = ["test-utils"] }
 sha2.workspace = true
 tempfile.workspace = true

@@ -62,14 +62,12 @@ mod tests {
     use reth_filter_maps::{
         address_value,
         coverage::{
-            CanonicalActivationError, CheckpointProvenance, CheckpointVerifier, IndexIdentity,
-            PublicationStart, RejectUnrecognizedCheckpoints, SegmentOrigin, StoredCoverageRecord,
-            StoredSegmentOrigin, StoredSegmentRecord, StructurallyRestoredCoverage,
-            STORAGE_FORMAT_V1,
+            CanonicalActivationError, IndexIdentity, PublicationStart,
+            RejectUnrecognizedCheckpoints, SegmentOrigin, STORAGE_FORMAT_V1,
         },
-        BlockInput, BlockPointer, FilterMapMatchSource, FilterMapRenderer, LogInput,
-        LogValueStream, LogValueStreamTermination, MapResumeAnchor, ParamsId, RendererOutput,
-        DEFAULT_PARAMS, GETH_V1, RANGE_TEST_PARAMS,
+        test_utils::{recognized_checkpoint, render_from_genesis, AcceptAllCheckpoints},
+        BlockInput, FilterMapMatchSource, LogInput, ParamsId, DEFAULT_PARAMS, GETH_V1,
+        RANGE_TEST_PARAMS,
     };
 
     #[derive(Debug)]
@@ -86,48 +84,8 @@ mod tests {
         IndexIdentity::new(STORAGE_FORMAT_V1, 1, B256::ZERO, GETH_V1, ParamsId::RangeTest)
     }
 
-    #[derive(Default)]
-    struct TestOriginVerifier;
-
-    impl CheckpointVerifier for TestOriginVerifier {
-        fn verify_checkpoint(
-            &mut self,
-            identity: &IndexIdentity,
-            anchor: MapResumeAnchor,
-            _provenance: CheckpointProvenance,
-        ) -> bool {
-            anchor.value_space_version == identity.value_space_version
-        }
-    }
-
     fn maps() -> Vec<reth_filter_maps::AnchoredCompletedMap> {
         maps_with_address(1, 2)
-    }
-
-    fn checkpoint_origin(
-        identity: IndexIdentity,
-        origin_anchor: MapResumeAnchor,
-        terminal: MapResumeAnchor,
-    ) -> SegmentOrigin {
-        let first_map = origin_anchor.completed_map_index + 1;
-        let restored = StructurallyRestoredCoverage::restore(
-            &identity,
-            StoredCoverageRecord {
-                identity,
-                segments: vec![StoredSegmentRecord {
-                    origin: StoredSegmentOrigin::Checkpoint {
-                        origin_anchor,
-                        provenance: CheckpointProvenance::Recognized { id: 1 },
-                    },
-                    first_map,
-                    terminal_map: terminal.completed_map_index,
-                }],
-            },
-            [terminal],
-            &mut TestOriginVerifier,
-        )
-        .unwrap();
-        restored.segments()[0].origin().clone()
     }
 
     fn publish_maps<TX>(
@@ -169,17 +127,11 @@ mod tests {
             ),
             BlockInput::new(1, B256::repeat_byte(1), []),
         ];
-        let stream = LogValueStream::new(
-            DEFAULT_PARAMS,
-            BlockPointer::new(0, B256::ZERO, 0),
-            blocks,
-            LogValueStreamTermination::ReachedHead,
-        );
-        let mut renderer = FilterMapRenderer::from_genesis(stream).unwrap();
-        match renderer.render_next().unwrap().unwrap() {
-            RendererOutput::Map(map) => map,
-            RendererOutput::Complete(_) => panic!("expected a completed production map"),
-        }
+        render_from_genesis(DEFAULT_PARAMS, blocks)
+            .maps
+            .into_iter()
+            .next()
+            .expect("a completed map")
     }
 
     fn replacement_transition_maps(
@@ -242,22 +194,8 @@ mod tests {
                 let logs = (0..logs).map(|_| LogInput::new(Address::repeat_byte(0x11), []));
                 BlockInput::new(number, hash, logs)
             })
-            .collect::<Vec<_>>();
-        let stream = LogValueStream::new(
-            RANGE_TEST_PARAMS,
-            BlockPointer::new(0, B256::ZERO, 0),
-            blocks,
-            LogValueStreamTermination::ReachedHead,
-        );
-        let mut renderer = FilterMapRenderer::from_genesis(stream).unwrap();
-        let mut maps = Vec::new();
-        while maps.len() < count {
-            match renderer.render_next().unwrap().unwrap() {
-                RendererOutput::Map(map) => maps.push(map),
-                RendererOutput::Complete(_) => panic!("expected {count} maps"),
-            }
-        }
-        maps
+            .collect();
+        first_maps(render_from_genesis(RANGE_TEST_PARAMS, blocks).maps, count)
     }
 
     /// Renders two default-geometry maps that repeat one address, so their few rows fill several
@@ -269,17 +207,7 @@ mod tests {
             BlockInput::new(1, B256::repeat_byte(1), logs(70_000)),
             BlockInput::new(2, B256::repeat_byte(2), []),
         ];
-        let stream = LogValueStream::new(
-            DEFAULT_PARAMS,
-            BlockPointer::new(0, B256::ZERO, 0),
-            blocks,
-            LogValueStreamTermination::ReachedHead,
-        );
-        let mut renderer = FilterMapRenderer::from_genesis(stream).unwrap();
-        let mut maps = Vec::new();
-        while let RendererOutput::Map(map) = renderer.render_next().unwrap().unwrap() {
-            maps.push(map);
-        }
+        let maps = render_from_genesis(DEFAULT_PARAMS, blocks).maps;
         assert_eq!(maps.len(), 2);
         maps
     }
@@ -293,20 +221,15 @@ mod tests {
             BlockInput::new(0, B256::ZERO, [LogInput::new(Address::repeat_byte(address), [])]),
             BlockInput::new(1, B256::repeat_byte(1), []),
         ];
-        let stream = LogValueStream::new(
-            RANGE_TEST_PARAMS,
-            BlockPointer::new(0, B256::ZERO, 0),
-            blocks,
-            LogValueStreamTermination::ReachedHead,
-        );
-        let mut renderer = FilterMapRenderer::from_genesis(stream).unwrap();
-        let mut maps = Vec::new();
-        while maps.len() < count {
-            match renderer.render_next().unwrap().unwrap() {
-                RendererOutput::Map(map) => maps.push(map),
-                RendererOutput::Complete(_) => panic!("expected two maps"),
-            }
-        }
+        first_maps(render_from_genesis(RANGE_TEST_PARAMS, blocks).maps, count)
+    }
+
+    fn first_maps(
+        mut maps: Vec<reth_filter_maps::AnchoredCompletedMap>,
+        count: usize,
+    ) -> Vec<reth_filter_maps::AnchoredCompletedMap> {
+        assert!(maps.len() >= count, "expected {count} maps, rendered {}", maps.len());
+        maps.truncate(count);
         maps
     }
 
@@ -542,8 +465,8 @@ mod tests {
         let db = create_test_rw_db();
         let tx = db.tx_mut().unwrap();
         FilterMapStore::initialize_identity(&tx, &identity()).unwrap();
-        let mut store = FilterMapStore::open(&tx, &identity(), &mut TestOriginVerifier).unwrap();
-        let checkpoint = checkpoint_origin(identity(), origin, logged[5].resume_anchor());
+        let mut store = FilterMapStore::open(&tx, &identity(), &mut AcceptAllCheckpoints).unwrap();
+        let checkpoint = recognized_checkpoint(identity(), origin, logged[5].resume_anchor());
         let mut start = PublicationStart::Open { origin: checkpoint };
         for map in &logged[5..=7] {
             store.publish(start, std::slice::from_ref(map)).unwrap();
@@ -564,7 +487,7 @@ mod tests {
         tx.commit().unwrap();
 
         let snapshot =
-            FilterMapReadSnapshot::open(db.tx().unwrap(), &identity(), &mut TestOriginVerifier)
+            FilterMapReadSnapshot::open(db.tx().unwrap(), &identity(), &mut AcceptAllCheckpoints)
                 .unwrap();
         // Both segments still activate: the genesis map before block 2 and the checkpoint segment.
         assert_eq!(snapshot.activate(chain_hash).unwrap().coverage().segments().len(), 2);
@@ -962,7 +885,7 @@ mod tests {
         let db = create_test_rw_db();
         let maps = maps();
         let checkpoint =
-            checkpoint_origin(identity(), maps[0].resume_anchor(), maps[1].resume_anchor());
+            recognized_checkpoint(identity(), maps[0].resume_anchor(), maps[1].resume_anchor());
         let tx = db.tx_mut().unwrap();
         FilterMapStore::initialize_identity(&tx, &identity()).unwrap();
         open_store(&tx, &identity())
@@ -977,7 +900,7 @@ mod tests {
             ))
         ));
         let snapshot =
-            FilterMapReadSnapshot::open(db.tx().unwrap(), &identity(), &mut TestOriginVerifier)
+            FilterMapReadSnapshot::open(db.tx().unwrap(), &identity(), &mut AcceptAllCheckpoints)
                 .unwrap();
         assert_eq!(snapshot.restored().segments()[0].maps(), 1..=1);
     }
