@@ -1,4 +1,4 @@
-use crate::{coverage::MapResumeAnchor, BlockPointer, MapBoundary, ParamsId};
+use crate::{BlockPointer, MapBoundary, MapResumeAnchor, ParamsId};
 use alloy_eips::BlockNumHash;
 
 /// One nonempty logical row in a completed filter map.

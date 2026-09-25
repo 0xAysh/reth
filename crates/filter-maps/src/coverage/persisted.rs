@@ -2,11 +2,11 @@
 
 use crate::{
     coverage::{
-        CheckpointProvenance, ContractionError, CoverageSet, IndexIdentity, MapResumeAnchor,
-        PublishError, ReorgContraction, RetainedAnchor, SegmentOrigin, ValidatedSegment,
-        ValueSpaceCheckpoint, VerifiedCheckpoint,
+        CheckpointProvenance, ContractionError, CoverageSet, IndexIdentity, PublishError,
+        ReorgContraction, RetainedAnchor, SegmentOrigin, ValidatedSegment, ValueSpaceCheckpoint,
+        VerifiedCheckpoint,
     },
-    BlockPointer,
+    BlockPointer, MapResumeAnchor,
 };
 use alloy_primitives::B256;
 use std::collections::BTreeMap;
@@ -280,7 +280,7 @@ impl QueryableCoverage {
     /// whose segments failed activation can produce one:
     ///
     /// ```compile_fail,E0599
-    /// use reth_filter_maps::coverage::{MapResumeAnchor, StructurallyRestoredCoverage};
+    /// use reth_filter_maps::{coverage::StructurallyRestoredCoverage, MapResumeAnchor};
     ///
     /// fn mint(restored: &StructurallyRestoredCoverage, anchor: MapResumeAnchor) {
     ///     let _ = restored.derived_checkpoint(anchor);

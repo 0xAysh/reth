@@ -1,10 +1,8 @@
 //! Validated segments: contiguous runs of covered blocks and the maps that support them.
 
 use crate::{
-    coverage::{
-        IdentityMismatch, IndexIdentity, MapResumeAnchor, PublicationStart, VerifiedCheckpoint,
-    },
-    BlockPointer, Params,
+    coverage::{IdentityMismatch, IndexIdentity, PublicationStart, VerifiedCheckpoint},
+    BlockPointer, MapResumeAnchor, Params,
 };
 use std::ops::RangeInclusive;
 

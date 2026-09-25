@@ -2,10 +2,10 @@
 
 use crate::{
     coverage::{
-        segment::check_map_sequence, IndexIdentity, MapResumeAnchor, PublishError, SegmentError,
-        SegmentOrigin, StructurallyRestoredCoverage,
+        segment::check_map_sequence, IndexIdentity, PublishError, SegmentError, SegmentOrigin,
+        StructurallyRestoredCoverage,
     },
-    AnchoredCompletedMap, BlockPointer,
+    AnchoredCompletedMap, BlockPointer, MapResumeAnchor,
 };
 use std::ops::RangeInclusive;
 

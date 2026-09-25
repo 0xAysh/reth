@@ -1,6 +1,6 @@
 use crate::{
-    coverage::ResumeAnchorMismatch, BatchContinuation, BlockPointer, LogValueStreamError,
-    MapBoundary, Params, PendingDelimiter,
+    BatchContinuation, BlockPointer, LogValueStreamError, MapBoundary, Params, PendingDelimiter,
+    ResumeAnchorMismatch,
 };
 use alloy_primitives::B256;
 

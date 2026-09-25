@@ -1,10 +1,10 @@
 use crate::{
     coverage::{
-        CheckpointProvenance, CheckpointVerifier, CoverageSet, IndexIdentity, MapResumeAnchor,
-        QueryableCoverage, SegmentOrigin, StructurallyRestoredCoverage, ValidatedSegment,
-        VerifiedCheckpoint, STORAGE_FORMAT_V1,
+        CheckpointProvenance, CheckpointVerifier, CoverageSet, IndexIdentity, QueryableCoverage,
+        SegmentOrigin, StructurallyRestoredCoverage, ValidatedSegment, VerifiedCheckpoint,
+        STORAGE_FORMAT_V1,
     },
-    BlockPointer, MapBoundary, ParamsId, DEFAULT_PARAMS, GETH_V1,
+    BlockPointer, MapBoundary, MapResumeAnchor, ParamsId, DEFAULT_PARAMS, GETH_V1,
 };
 use alloy_primitives::B256;
 use std::{collections::BTreeMap, convert::Infallible};

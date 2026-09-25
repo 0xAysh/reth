@@ -38,6 +38,7 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+mod anchor;
 pub mod coverage;
 mod matcher;
 mod params;
@@ -45,6 +46,7 @@ mod renderer;
 mod stream;
 mod value;
 
+pub use anchor::{MapResumeAnchor, ResumeAnchorMismatch};
 pub use matcher::{
     CandidateSet, FilterMapMatchSource, FilterMapMatcher, IndexedMatchRange, MatchPattern,
     MatcherError, PatternError, TopicSelection,

@@ -62,13 +62,13 @@ mod tests {
         address_value,
         coverage::{
             CanonicalActivationError, CheckpointProvenance, CheckpointVerifier, IndexIdentity,
-            MapResumeAnchor, PublicationStart, RejectUnrecognizedCheckpoints, SegmentOrigin,
-            StoredCoverageRecord, StoredSegmentOrigin, StoredSegmentRecord,
-            StructurallyRestoredCoverage, STORAGE_FORMAT_V1,
+            PublicationStart, RejectUnrecognizedCheckpoints, SegmentOrigin, StoredCoverageRecord,
+            StoredSegmentOrigin, StoredSegmentRecord, StructurallyRestoredCoverage,
+            STORAGE_FORMAT_V1,
         },
         BlockInput, BlockPointer, FilterMapMatchSource, FilterMapRenderer, LogInput,
-        LogValueStream, LogValueStreamTermination, ParamsId, RendererOutput, DEFAULT_PARAMS,
-        GETH_V1, RANGE_TEST_PARAMS,
+        LogValueStream, LogValueStreamTermination, MapResumeAnchor, ParamsId, RendererOutput,
+        DEFAULT_PARAMS, GETH_V1, RANGE_TEST_PARAMS,
     };
 
     #[derive(Debug)]
@@ -105,8 +105,8 @@ mod tests {
 
     fn checkpoint_origin(
         identity: IndexIdentity,
-        origin_anchor: reth_filter_maps::coverage::MapResumeAnchor,
-        terminal: reth_filter_maps::coverage::MapResumeAnchor,
+        origin_anchor: MapResumeAnchor,
+        terminal: MapResumeAnchor,
     ) -> SegmentOrigin {
         let first_map = origin_anchor.completed_map_index + 1;
         let restored = StructurallyRestoredCoverage::restore(

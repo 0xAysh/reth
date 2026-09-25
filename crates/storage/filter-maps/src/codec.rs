@@ -11,10 +11,10 @@ use reth_db_api::models::{
 };
 use reth_filter_maps::{
     coverage::{
-        CheckpointProvenance, IndexIdentity, MapResumeAnchor, StorageFormatVersion,
-        StoredCoverageRecord, StoredSegmentOrigin, StoredSegmentRecord,
+        CheckpointProvenance, IndexIdentity, StorageFormatVersion, StoredCoverageRecord,
+        StoredSegmentOrigin, StoredSegmentRecord,
     },
-    BlockPointer, MapBoundary, ParamsId, ValueSpaceVersion,
+    BlockPointer, MapBoundary, MapResumeAnchor, ParamsId, ValueSpaceVersion,
 };
 
 pub(crate) fn identity_to_db(identity: &IndexIdentity) -> DbIdentity {

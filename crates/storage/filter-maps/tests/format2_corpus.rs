@@ -5,13 +5,13 @@ use reth_db::{init_db, mdbx::DatabaseArguments};
 use reth_db_api::{database::Database, transaction::DbTx};
 use reth_filter_maps::{
     coverage::{
-        CheckpointProvenance, CheckpointVerifier, IndexIdentity, MapResumeAnchor, PublicationStart,
-        SegmentOrigin, StoredCoverageRecord, StoredSegmentOrigin, StoredSegmentRecord,
+        CheckpointProvenance, CheckpointVerifier, IndexIdentity, PublicationStart, SegmentOrigin,
+        StoredCoverageRecord, StoredSegmentOrigin, StoredSegmentRecord,
         StructurallyRestoredCoverage, STORAGE_FORMAT_V1,
     },
     AnchoredCompletedMap, BlockInput, BlockPointer, FilterMapMatchSource, FilterMapMatcher,
     FilterMapRenderer, IndexedMatchRange, LogInput, LogValueStream, LogValueStreamTermination,
-    MapBoundary, MatchPattern, ParamsId, RendererOutput, TopicSelection, GETH_V1,
+    MapBoundary, MapResumeAnchor, MatchPattern, ParamsId, RendererOutput, TopicSelection, GETH_V1,
 };
 use reth_filter_maps_storage::{FilterMapReadSnapshot, FilterMapStore};
 use reth_filter_maps_test_utils::{

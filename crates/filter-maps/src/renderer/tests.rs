@@ -1,7 +1,6 @@
 use super::*;
 use crate::{
-    coverage::MapResumeAnchor, BlockPointer, LogInput, LogValueKind, RendererError, DEFAULT_PARAMS,
-    RANGE_TEST_PARAMS,
+    BlockPointer, LogInput, LogValueKind, RendererError, DEFAULT_PARAMS, RANGE_TEST_PARAMS,
 };
 use alloy_eips::BlockNumHash;
 use alloy_primitives::{Address, B256};

@@ -16,10 +16,10 @@ use reth_db_api::{
 };
 use reth_filter_maps::{
     coverage::{
-        CheckpointVerifier, IndexIdentity, MapResumeAnchor, PersistedCoverageError,
-        PublicationStart, ReorgContraction, StructurallyRestoredCoverage,
+        CheckpointVerifier, IndexIdentity, PersistedCoverageError, PublicationStart,
+        ReorgContraction, StructurallyRestoredCoverage,
     },
-    AnchoredCompletedMap,
+    AnchoredCompletedMap, MapResumeAnchor,
 };
 use std::collections::BTreeMap;
 

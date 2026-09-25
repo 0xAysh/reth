@@ -10,13 +10,13 @@
 use alloy_primitives::{Address, B256};
 use reth_filter_maps::{
     coverage::{
-        CandidateSource, IndexIdentity, LogQueryTarget, MapResumeAnchor, PlannedSubrange,
-        QueryPlan, QueryableCoverage, RejectUnrecognizedCheckpoints, SegmentOrigin,
-        StoredCoverageRecord, StructurallyRestoredCoverage, STORAGE_FORMAT_V1,
+        CandidateSource, IndexIdentity, LogQueryTarget, PlannedSubrange, QueryPlan,
+        QueryableCoverage, RejectUnrecognizedCheckpoints, SegmentOrigin, StoredCoverageRecord,
+        StructurallyRestoredCoverage, STORAGE_FORMAT_V1,
     },
     BlockInput, BlockPointer, IndexedMatchRange, LogInput, LogValueSlot, LogValueStream,
     LogValueStreamCompletion, LogValueStreamEvent, LogValueStreamItem, LogValueStreamTermination,
-    MapBoundary, ParamsId, GETH_V1, RANGE_TEST_PARAMS,
+    MapBoundary, MapResumeAnchor, ParamsId, GETH_V1, RANGE_TEST_PARAMS,
 };
 use std::{
     collections::{BTreeMap, HashMap},

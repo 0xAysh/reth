@@ -8,7 +8,7 @@
 //! identity references, and integrity metadata; contraction commits the visibility change before
 //! later physical cleanup.
 
-mod anchor;
+mod checkpoint;
 mod eligibility;
 mod identity;
 mod persisted;
@@ -19,10 +19,7 @@ mod set;
 #[cfg(test)]
 mod test_utils;
 
-pub use anchor::{
-    CheckpointProvenance, MapResumeAnchor, ResumeAnchorMismatch, ValueSpaceCheckpoint,
-    VerifiedCheckpoint,
-};
+pub use checkpoint::{CheckpointProvenance, ValueSpaceCheckpoint, VerifiedCheckpoint};
 pub use eligibility::{BlockReceiptEvidence, IneligibilityReason, IneligibleBlock};
 pub use identity::{
     IdentityMismatch, IndexIdentity, StorageFormatVersion, UnknownStorageFormatVersion,

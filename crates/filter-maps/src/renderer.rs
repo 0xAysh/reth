@@ -11,10 +11,9 @@ mod map;
 mod rows;
 
 use crate::{
-    coverage::MapResumeAnchor, stream::StreamStart, BatchContinuation, BlockInput, BlockPointer,
-    LogValueSlot, LogValueStream, LogValueStreamCompletion, LogValueStreamEvent,
-    LogValueStreamItem, LogValueStreamTermination, MapBoundary, Params, ParamsId, PendingDelimiter,
-    GETH_V1,
+    stream::StreamStart, BatchContinuation, BlockInput, BlockPointer, LogValueSlot, LogValueStream,
+    LogValueStreamCompletion, LogValueStreamEvent, LogValueStreamItem, LogValueStreamTermination,
+    MapBoundary, MapResumeAnchor, Params, ParamsId, PendingDelimiter, GETH_V1,
 };
 use alloy_eips::BlockNumHash;
 use rows::ActiveRows;

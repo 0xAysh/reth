@@ -2,10 +2,10 @@
 
 use crate::{
     coverage::{
-        IdentityMismatch, IndexIdentity, MapResumeAnchor, SegmentError, SegmentOrigin,
-        ValidatedSegment, VerifiedCheckpoint,
+        IdentityMismatch, IndexIdentity, SegmentError, SegmentOrigin, ValidatedSegment,
+        VerifiedCheckpoint,
     },
-    Params, ParamsId,
+    MapResumeAnchor, Params, ParamsId,
 };
 
 /// Ordered, disjoint validated segments under one index identity.
