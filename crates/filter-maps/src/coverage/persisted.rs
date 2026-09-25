@@ -1,11 +1,15 @@
 //! Storage-neutral records and the restoration boundary for durable coverage.
 
-use crate::coverage::{
-    CheckpointProvenance, CoverageSet, IndexIdentity, MapResumeAnchor, PublishError, RestoreError,
-    RetainedAnchor, SegmentOrigin, ValidatedSegment, ValueSpaceCheckpoint, VerifiedCheckpoint,
+use crate::{
+    coverage::{
+        CheckpointProvenance, CoverageSet, IndexIdentity, MapResumeAnchor, PublishError,
+        RestoreError, RetainedAnchor, SegmentOrigin, ValidatedSegment, ValueSpaceCheckpoint,
+        VerifiedCheckpoint,
+    },
+    BlockPointer,
 };
 use alloy_primitives::B256;
-use std::{collections::BTreeMap, convert::Infallible};
+use std::collections::BTreeMap;
 
 /// Compact durable representation of all coverage under one index identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,44 +171,32 @@ impl StructurallyRestoredCoverage {
         self.0.segments()
     }
 
-    /// Verifies segment canonical evidence and retains only currently canonical segments.
+    /// Verifies every segment's canonical identities and keeps only currently canonical segments.
     ///
-    /// A missing or mismatched canonical hash disables that segment. Lookup failures abort
-    /// activation because they do not prove either canonicality or non-canonicality.
-    pub fn activate<E>(
+    /// A segment stays queryable only if its origin, any derivation predecessor, and every map
+    /// anchor name current canonical blocks; a missing or mismatched canonical hash disables that
+    /// segment. The stored block pointers of each surviving segment's
+    /// [pointer span](ValidatedSegment::pointer_span) must then all exist, carry canonical hashes,
+    /// strictly increase, and agree with the segment's start and anchors. Unlike a non-canonical
+    /// anchor, which a reorg explains, a surviving segment with contradictory pointers is corrupt,
+    /// so that fails activation. Lookup failures also fail activation because they prove neither
+    /// canonicality nor non-canonicality.
+    pub fn activate<E, P>(
         &self,
         mut canonical_hash: impl FnMut(u64) -> Result<Option<B256>, E>,
-    ) -> Result<QueryableCoverage, CanonicalActivationError<E>> {
-        let mut queryable = CoverageSet::new(*self.identity());
+        mut stored_pointer: impl FnMut(u64) -> Result<Option<BlockPointer>, P>,
+    ) -> Result<QueryableCoverage, CanonicalActivationError<E, P>> {
+        let mut canonical_segments = Vec::with_capacity(self.segments().len());
         for segment in self.segments() {
-            let mut canonical = true;
-            if let Some(origin) = segment.origin().anchor() {
-                canonical &= canonical_hash(origin.pointer.block_number)
-                    .map_err(CanonicalActivationError::Lookup)? ==
-                    Some(origin.pointer.block_hash);
-                if let SegmentOrigin::Checkpoint(checkpoint) = segment.origin() &&
-                    let CheckpointProvenance::DerivedFrom { predecessor } =
-                        checkpoint.checkpoint().provenance()
-                {
-                    canonical &= canonical_hash(predecessor.pointer.block_number)
-                        .map_err(CanonicalActivationError::Lookup)? ==
-                        Some(predecessor.pointer.block_hash);
-                }
-            } else {
-                canonical &= canonical_hash(0).map_err(CanonicalActivationError::Lookup)? ==
-                    Some(self.identity().genesis_hash);
-            }
-            for anchor in segment.anchors() {
-                canonical &= canonical_hash(anchor.pointer.block_number)
-                    .map_err(CanonicalActivationError::Lookup)? ==
-                    Some(anchor.pointer.block_hash);
-            }
+            let canonical = identities_canonical(self.identity(), segment, &mut canonical_hash)?;
             if canonical {
-                queryable
-                    .insert_restored(segment.clone())
-                    .map_err(CanonicalActivationError::Corrupt)?;
+                verify_pointer_span(segment, &mut canonical_hash, &mut stored_pointer)?;
             }
+            canonical_segments.push(canonical);
         }
+        let mut queryable = self.0.clone();
+        let mut canonical = canonical_segments.into_iter();
+        queryable.retain_segments(|_| canonical.next().expect("one flag per segment"));
         Ok(QueryableCoverage(queryable))
     }
 
@@ -413,33 +405,27 @@ pub enum PersistedCoverageError {
     MapIndexOverflow,
 }
 
-/// Failure while checking restored canonical identity evidence.
+/// Failure while checking restored coverage against the current canonical chain.
 #[derive(Debug, thiserror::Error)]
-pub enum CanonicalActivationError<E> {
+pub enum CanonicalActivationError<E, P> {
     /// Canonical hash lookup failed.
     #[error("canonical hash lookup failed")]
-    Lookup(#[source] E),
-    /// Structurally valid segments became inconsistent while being selected.
-    #[error("restored coverage became inconsistent: {0}")]
-    Corrupt(PublishError),
-}
-
-impl StructurallyRestoredCoverage {
-    /// Convenience activation for infallible canonical-hash lookup callbacks.
-    pub fn activate_infallible(
-        &self,
-        mut canonical_hash: impl FnMut(u64) -> Option<B256>,
-    ) -> QueryableCoverage {
-        match self.activate(|number| Ok::<_, Infallible>(canonical_hash(number))) {
-            Ok(coverage) => coverage,
-            Err(error) => match error {
-                CanonicalActivationError::Lookup(never) => match never {},
-                CanonicalActivationError::Corrupt(corrupt) => {
-                    unreachable!("restored coverage selection is valid: {corrupt}")
-                }
-            },
-        }
-    }
+    CanonicalLookup(#[source] E),
+    /// Stored block pointer lookup failed.
+    #[error("stored block pointer lookup failed")]
+    PointerLookup(#[source] P),
+    /// A canonical segment's pointer span has no stored pointer for this block.
+    #[error("canonical coverage has no stored pointer for block {block_number}")]
+    MissingPointer {
+        /// Block without a stored pointer.
+        block_number: u64,
+    },
+    /// A stored pointer contradicts the canonical chain, its neighbours, or the segment anchors.
+    #[error("stored pointer for block {block_number} contradicts canonical coverage")]
+    PointerMismatch {
+        /// Block whose stored pointer is inconsistent.
+        block_number: u64,
+    },
 }
 
 impl From<RestoreError> for PersistedCoverageError {
@@ -451,10 +437,98 @@ impl From<RestoreError> for PersistedCoverageError {
     }
 }
 
+/// Returns whether the segment's origin, derivation predecessor, and anchors are all canonical.
+fn identities_canonical<E, P>(
+    identity: &IndexIdentity,
+    segment: &ValidatedSegment,
+    canonical_hash: &mut impl FnMut(u64) -> Result<Option<B256>, E>,
+) -> Result<bool, CanonicalActivationError<E, P>> {
+    let mut is_canonical = |number: u64, hash: B256| {
+        canonical_hash(number)
+            .map(|canonical| canonical == Some(hash))
+            .map_err(CanonicalActivationError::CanonicalLookup)
+    };
+    let mut canonical = match segment.origin() {
+        SegmentOrigin::Genesis => is_canonical(0, identity.genesis_hash)?,
+        origin => {
+            let anchor = origin.anchor().expect("non-genesis origins have anchors");
+            is_canonical(anchor.pointer.block_number, anchor.pointer.block_hash)?
+        }
+    };
+    if let SegmentOrigin::Checkpoint(checkpoint) = segment.origin() &&
+        let CheckpointProvenance::DerivedFrom { predecessor } =
+            checkpoint.checkpoint().provenance()
+    {
+        canonical &=
+            is_canonical(predecessor.pointer.block_number, predecessor.pointer.block_hash)?;
+    }
+    for anchor in segment.anchors() {
+        canonical &= is_canonical(anchor.pointer.block_number, anchor.pointer.block_hash)?;
+    }
+    Ok(canonical)
+}
+
+/// Checks every stored pointer a canonical segment's publications wrote.
+fn verify_pointer_span<E, P>(
+    segment: &ValidatedSegment,
+    canonical_hash: &mut impl FnMut(u64) -> Result<Option<B256>, E>,
+    stored_pointer: &mut impl FnMut(u64) -> Result<Option<BlockPointer>, P>,
+) -> Result<(), CanonicalActivationError<E, P>> {
+    let start = segment.start();
+    let start =
+        BlockPointer::new(start.block_number, start.block_hash, start.first_log_value_index);
+    // Anchor pointers never precede the start and are ordered by block, so one forward pass pairs
+    // each anchor with the stored pointer of its resume block.
+    let mut anchors = segment.anchors().iter().peekable();
+    let mut previous_index = None;
+    for block_number in segment.pointer_span() {
+        let mismatch = CanonicalActivationError::PointerMismatch { block_number };
+        let pointer = stored_pointer(block_number)
+            .map_err(CanonicalActivationError::PointerLookup)?
+            .ok_or(CanonicalActivationError::MissingPointer { block_number })?;
+        if pointer.block_number != block_number ||
+            previous_index.is_some_and(|previous| previous >= pointer.first_log_value_index) ||
+            (block_number == start.block_number && pointer != start)
+        {
+            return Err(mismatch)
+        }
+        while let Some(anchor) =
+            anchors.next_if(|anchor| anchor.pointer.block_number == block_number)
+        {
+            if anchor.pointer != pointer {
+                return Err(mismatch)
+            }
+        }
+        if canonical_hash(block_number).map_err(CanonicalActivationError::CanonicalLookup)? !=
+            Some(pointer.block_hash)
+        {
+            return Err(mismatch)
+        }
+        previous_index = Some(pointer.first_log_value_index);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::coverage::test_utils::*;
+    use std::convert::Infallible;
+
+    /// Activates against a chain where every block `number` has hash `hash(number)` unless
+    /// `canonical` says otherwise, with the pointers a real publication would have stored.
+    fn activate(
+        restored: &StructurallyRestoredCoverage,
+        canonical: impl Fn(u64) -> Option<B256>,
+    ) -> QueryableCoverage {
+        let pointers = stored_pointers(restored.segments());
+        restored
+            .activate(
+                |number| Ok::<_, Infallible>(canonical(number)),
+                |number| Ok::<_, Infallible>(pointers.get(&number).copied()),
+            )
+            .unwrap()
+    }
 
     #[derive(Default)]
     struct TestOriginVerifier;
@@ -485,9 +559,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(restored.segments().len(), 1);
-        let queryable = restored.activate_infallible(|number| {
-            Some(if number == 0 { identity().genesis_hash } else { hash(number) })
-        });
+        let queryable = activate(&restored, |number| Some(hash(number)));
         assert!(queryable.coverage().covers(29));
     }
 
@@ -508,9 +580,7 @@ mod tests {
         )
         .unwrap();
 
-        let queryable = restored.activate_infallible(|number| {
-            (number < 100).then(|| if number == 0 { identity().genesis_hash } else { hash(number) })
-        });
+        let queryable = activate(&restored, |number| (number < 100).then(|| hash(number)));
         assert_eq!(queryable.coverage().segments().len(), 1);
         assert!(queryable.coverage().covers(19));
         assert!(!queryable.coverage().covers(100));
@@ -539,10 +609,70 @@ mod tests {
             &mut TestOriginVerifier,
         )
         .unwrap();
-        let queryable = restored.activate_infallible(|number| {
+        let queryable = activate(&restored, |number| {
             Some(if number == 60 { B256::ZERO } else { hash(number) })
         });
         assert!(queryable.coverage().segments().is_empty());
+    }
+
+    #[test]
+    fn activation_verifies_every_stored_pointer_of_a_canonical_segment() {
+        // Block 100 began inside map 9, so it lies in the pointer span but is not covered.
+        let origin = anchor(9, 100, 10 * VPM - 3);
+        let anchors = anchors_through(10, aligned(12, 130));
+        let mut coverage = CoverageSet::new(identity());
+        coverage.open_segment_batch(checkpoint(origin), anchors.clone()).unwrap();
+        let restored = StructurallyRestoredCoverage::restore(
+            &identity(),
+            coverage.stored_record(),
+            anchors,
+            &mut TestOriginVerifier,
+        )
+        .unwrap();
+        assert_eq!(restored.segments()[0].blocks(), Some(101..=129));
+        assert_eq!(restored.segments()[0].pointer_span(), 100..=130);
+
+        let activate_with = |pointers: BTreeMap<u64, BlockPointer>| {
+            restored.activate(
+                |number| Ok::<_, Infallible>(Some(hash(number))),
+                |number| Ok::<_, Infallible>(pointers.get(&number).copied()),
+            )
+        };
+        let stored = stored_pointers(restored.segments());
+        assert_eq!(activate_with(stored.clone()).unwrap().coverage().segments().len(), 1);
+
+        let corrupt = |block: u64, edit: &dyn Fn(&mut BlockPointer)| {
+            let mut pointers = stored.clone();
+            edit(pointers.get_mut(&block).unwrap());
+            pointers
+        };
+        let previous_index = stored[&115].first_log_value_index;
+        for (pointers, block_number) in [
+            (corrupt(100, &|pointer| pointer.first_log_value_index -= 1), 100),
+            (corrupt(115, &|pointer| pointer.block_hash = hash(0xff)), 115),
+            (corrupt(116, &|pointer| pointer.first_log_value_index = previous_index), 116),
+            (corrupt(120, &|pointer| pointer.first_log_value_index -= 1), 120),
+        ] {
+            assert!(
+                matches!(
+                    activate_with(pointers),
+                    Err(CanonicalActivationError::PointerMismatch { block_number: actual })
+                        if actual == block_number
+                ),
+                "block {block_number}"
+            );
+        }
+
+        let mut missing_start = stored.clone();
+        missing_start.remove(&100);
+        assert!(matches!(
+            activate_with(missing_start),
+            Err(CanonicalActivationError::MissingPointer { block_number: 100 })
+        ));
+        assert!(matches!(
+            restored.activate(|number| Ok::<_, ()>(Some(hash(number))), |_| Err("unreadable")),
+            Err(CanonicalActivationError::PointerLookup("unreadable"))
+        ));
     }
 
     struct ExactCheckpointVerifier {

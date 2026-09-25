@@ -115,6 +115,15 @@ impl ValidatedSegment {
         self.first_map
     }
 
+    /// Returns every block whose stored pointer this segment's publications wrote.
+    ///
+    /// The span runs from the start's block through the terminal's resume block. It contains the
+    /// covered blocks and their successor, which bounds the last covered block, plus the start
+    /// block when that block began in an earlier map and is therefore not covered itself.
+    pub fn pointer_span(&self) -> RangeInclusive<u64> {
+        self.start.block_number..=self.terminal().pointer.block_number
+    }
+
     /// Returns wholly covered blocks, or `None` if no block is complete yet.
     pub fn blocks(&self) -> Option<RangeInclusive<u64>> {
         let last = self.terminal().covered_through()?;

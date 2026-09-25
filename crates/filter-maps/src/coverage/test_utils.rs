@@ -1,10 +1,12 @@
 use crate::{
     coverage::{
-        IndexIdentity, MapResumeAnchor, SegmentOrigin, VerifiedCheckpoint, STORAGE_FORMAT_V1,
+        IndexIdentity, MapResumeAnchor, SegmentOrigin, ValidatedSegment, VerifiedCheckpoint,
+        STORAGE_FORMAT_V1,
     },
     BlockPointer, MapBoundary, ParamsId, DEFAULT_PARAMS, GETH_V1,
 };
 use alloy_primitives::B256;
+use std::collections::BTreeMap;
 
 pub(super) const VPM: u64 = DEFAULT_PARAMS.values_per_map();
 
@@ -53,4 +55,28 @@ pub(super) fn anchors_through(first_map: u32, terminal: MapResumeAnchor) -> Vec<
             }
         })
         .collect()
+}
+
+/// Stored pointers a publication of `segments` would have written: the start and anchor pointers,
+/// with every block between them one slot after its predecessor.
+pub(super) fn stored_pointers<'a>(
+    segments: impl IntoIterator<Item = &'a ValidatedSegment>,
+) -> BTreeMap<u64, BlockPointer> {
+    let mut pointers = BTreeMap::new();
+    for segment in segments {
+        let start = segment.start();
+        let mut previous =
+            BlockPointer::new(start.block_number, start.block_hash, start.first_log_value_index);
+        pointers.insert(previous.block_number, previous);
+        for anchor in segment.anchors() {
+            for number in previous.block_number + 1..anchor.pointer.block_number {
+                previous =
+                    BlockPointer::new(number, hash(number), previous.first_log_value_index + 1);
+                pointers.insert(number, previous);
+            }
+            previous = anchor.pointer;
+            pointers.insert(previous.block_number, previous);
+        }
+    }
+    pointers
 }

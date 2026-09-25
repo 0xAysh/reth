@@ -37,7 +37,7 @@ mod validation;
 pub use contraction::CleanupRanges;
 pub use error::{FilterMapStorageError, Result};
 pub use matcher::FilterMapSegmentSource;
-pub use snapshot::{ActivatedFilterMapSnapshot, FilterMapActivationError, FilterMapReadSnapshot};
+pub use snapshot::{ActivatedFilterMapSnapshot, FilterMapReadSnapshot};
 pub use store::{FilterMapStore, PublicationStart};
 
 #[cfg(test)]
@@ -61,9 +61,10 @@ mod tests {
     use reth_filter_maps::{
         address_value,
         coverage::{
-            CheckpointProvenance, IndexIdentity, MapResumeAnchor, RejectUntrustedOrigins,
-            SegmentOrigin, StoredCoverageRecord, StoredOriginVerifier, StoredSegmentOrigin,
-            StoredSegmentRecord, StructurallyRestoredCoverage, STORAGE_FORMAT_V1,
+            CanonicalActivationError, CheckpointProvenance, IndexIdentity, MapResumeAnchor,
+            RejectUntrustedOrigins, SegmentOrigin, StoredCoverageRecord, StoredOriginVerifier,
+            StoredSegmentOrigin, StoredSegmentRecord, StructurallyRestoredCoverage,
+            STORAGE_FORMAT_V1,
         },
         BlockInput, FilterMapMatchSource, FilterMapRenderer, LogInput, LogValueStream,
         LogValueStreamTermination, ParamsId, RendererOutput, ValueSpaceAnchor, DEFAULT_PARAMS,
@@ -770,43 +771,30 @@ mod tests {
     }
 
     #[test]
-    fn activation_rejects_pointer_hash_and_index_corruption() {
-        for corrupt_hash in [true, false] {
-            let db = create_test_rw_db();
-            let maps = maps();
-            let tx = db.tx_mut().unwrap();
-            FilterMapStore::initialize_identity(&tx, &identity()).unwrap();
-            publish_maps(
-                &tx,
-                &identity(),
-                PublicationStart::Open { origin: SegmentOrigin::Genesis },
-                &maps,
-            )
-            .unwrap();
-            tx.commit().unwrap();
+    fn activation_checks_stored_pointers_from_the_snapshot_transaction() {
+        let db = create_test_rw_db();
+        let maps = maps();
+        let tx = db.tx_mut().unwrap();
+        FilterMapStore::initialize_identity(&tx, &identity()).unwrap();
+        publish_maps(
+            &tx,
+            &identity(),
+            PublicationStart::Open { origin: SegmentOrigin::Genesis },
+            &maps,
+        )
+        .unwrap();
+        tx.commit().unwrap();
 
-            let tx = db.tx_mut().unwrap();
-            let mut pointer = tx.get::<FilterMapBlockPointers>(0).unwrap().unwrap();
-            if corrupt_hash {
-                pointer.block_hash = B256::repeat_byte(0xff);
-            } else {
-                pointer.first_log_value_index = 1;
-            }
-            tx.put::<FilterMapBlockPointers>(0, pointer).unwrap();
-            tx.commit().unwrap();
+        let tx = db.tx_mut().unwrap();
+        let mut pointer = tx.get::<FilterMapBlockPointers>(0).unwrap().unwrap();
+        pointer.block_hash = B256::repeat_byte(0xff);
+        tx.put::<FilterMapBlockPointers>(0, pointer).unwrap();
+        tx.commit().unwrap();
 
-            let result = read_snapshot(db.tx().unwrap(), &identity()).unwrap().activate(|number| {
-                Ok::<_, std::convert::Infallible>(Some(if number == 0 {
-                    B256::ZERO
-                } else {
-                    B256::repeat_byte(number as u8)
-                }))
-            });
-            assert!(matches!(
-                result,
-                Err(FilterMapActivationError::Storage(FilterMapStorageError::PointerMismatch(0)))
-            ));
-        }
+        assert!(matches!(
+            read_snapshot(db.tx().unwrap(), &identity()).unwrap().activate(chain_hash),
+            Err(CanonicalActivationError::PointerMismatch { block_number: 0 })
+        ));
     }
 
     #[test]

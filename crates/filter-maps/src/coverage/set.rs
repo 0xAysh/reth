@@ -205,6 +205,14 @@ impl CoverageSet {
         Ok(())
     }
 
+    /// Keeps only the segments `keep` selects, visiting them in ascending order.
+    ///
+    /// Any subset of ordered, disjoint, already merged segments is itself ordered and disjoint,
+    /// and removing segments cannot create a new exact continuation, so no revalidation is needed.
+    pub(super) fn retain_segments(&mut self, keep: impl FnMut(&ValidatedSegment) -> bool) {
+        self.segments.retain(keep);
+    }
+
     pub(super) fn insert(&mut self, segment: ValidatedSegment) -> Result<(), PublishError> {
         self.identity.check_compatible(segment.identity()).map_err(PublishError::Identity)?;
         let index =

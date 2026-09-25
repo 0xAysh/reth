@@ -113,9 +113,6 @@ pub enum FilterMapStorageError {
     /// A required block pointer is absent.
     #[error("required FilterMaps block pointer {0} is missing")]
     MissingPointer(u64),
-    /// A pointer hash or numerical index disagrees with canonical or anchor evidence.
-    #[error("FilterMaps block pointer {0} is semantically inconsistent")]
-    PointerMismatch(u64),
     /// Row payload cardinality disagrees with its authoritative map directory.
     #[error("FilterMaps payload count disagrees with directory for map {0}")]
     PayloadCountMismatch(u32),

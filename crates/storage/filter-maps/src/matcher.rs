@@ -5,7 +5,7 @@ use crate::{
     rows::{RowRead, RowReader},
     snapshot::ActivatedFilterMapSnapshot,
 };
-use reth_db_api::transaction::DbTx;
+use reth_db_api::{tables::FilterMapBlockPointers, transaction::DbTx};
 use reth_filter_maps::{FilterMapMatchSource, ParamsId};
 use std::ops::RangeInclusive;
 
@@ -46,7 +46,7 @@ impl<TX: DbTx + 'static> FilterMapMatchSource for FilterMapSegmentSource<TX> {
     type Error = FilterMapStorageError;
 
     fn params_id(&self) -> ParamsId {
-        self.snapshot.identity.params
+        self.snapshot.queryable.coverage().identity().params
     }
 
     fn read_row_prefixes(
@@ -95,9 +95,10 @@ impl<TX: DbTx + 'static> FilterMapMatchSource for FilterMapSegmentSource<TX> {
                 key: block_number,
             })
         }
+        // Activation verified every pointer of this segment in the same read transaction.
         self.snapshot
-            .pointers
-            .get(&block_number)
+            .tx
+            .get::<FilterMapBlockPointers>(block_number)?
             .map(|pointer| pointer.first_log_value_index)
             .ok_or(FilterMapStorageError::MissingPointer(block_number))
     }
