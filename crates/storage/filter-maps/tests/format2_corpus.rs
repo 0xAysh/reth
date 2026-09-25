@@ -5,8 +5,8 @@ use reth_db::{init_db, mdbx::DatabaseArguments};
 use reth_db_api::{database::Database, transaction::DbTx};
 use reth_filter_maps::{
     coverage::{
-        CheckpointProvenance, IndexIdentity, MapResumeAnchor, SegmentOrigin, StoredCoverageRecord,
-        StoredOriginVerifier, StoredSegmentOrigin, StoredSegmentRecord,
+        CheckpointProvenance, CheckpointVerifier, IndexIdentity, MapResumeAnchor, SegmentOrigin,
+        StoredCoverageRecord, StoredSegmentOrigin, StoredSegmentRecord,
         StructurallyRestoredCoverage, STORAGE_FORMAT_V1,
     },
     AnchoredCompletedMap, BlockInput, BlockPointer, FilterMapMatchSource, FilterMapMatcher,
@@ -23,7 +23,7 @@ use std::{collections::BTreeMap, convert::Infallible, path::Path};
 #[derive(Default)]
 struct TestOriginVerifier;
 
-impl StoredOriginVerifier for TestOriginVerifier {
+impl CheckpointVerifier for TestOriginVerifier {
     fn verify_checkpoint(
         &mut self,
         identity: &IndexIdentity,

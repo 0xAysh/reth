@@ -10,7 +10,7 @@ use reth_db_api::{
 };
 use reth_filter_maps::{
     coverage::{
-        CanonicalActivationError, IndexIdentity, QueryableCoverage, StoredOriginVerifier,
+        CanonicalActivationError, CheckpointVerifier, IndexIdentity, QueryableCoverage,
         StructurallyRestoredCoverage,
     },
     BlockPointer,
@@ -35,7 +35,7 @@ impl<TX: DbTx> FilterMapReadSnapshot<TX> {
     pub fn open(
         tx: TX,
         running: &IndexIdentity,
-        checkpoints: &mut impl StoredOriginVerifier,
+        checkpoints: &mut impl CheckpointVerifier,
     ) -> Result<Self> {
         let store = FilterMapStore::open(&tx, running, checkpoints)?;
         let directories = store.load_directories()?;

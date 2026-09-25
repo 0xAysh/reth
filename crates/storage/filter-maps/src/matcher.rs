@@ -10,6 +10,28 @@ use reth_filter_maps::{FilterMapMatchSource, ParamsId};
 use std::ops::RangeInclusive;
 
 /// MDBX-backed matcher source pinned to one activated segment and one read transaction.
+///
+/// Only a canonically activated snapshot yields a source:
+///
+/// ```
+/// use reth_db_api::transaction::DbTx;
+/// use reth_filter_maps_storage::ActivatedFilterMapSnapshot;
+///
+/// fn source<TX: DbTx>(snapshot: ActivatedFilterMapSnapshot<TX>) {
+///     let _ = snapshot.into_segment_source(0);
+/// }
+/// ```
+///
+/// A structurally restored snapshot has not been checked against the current chain:
+///
+/// ```compile_fail,E0599
+/// use reth_db_api::transaction::DbTx;
+/// use reth_filter_maps_storage::FilterMapReadSnapshot;
+///
+/// fn source<TX: DbTx>(snapshot: FilterMapReadSnapshot<TX>) {
+///     let _ = snapshot.into_segment_source(0);
+/// }
+/// ```
 #[derive(Debug)]
 pub struct FilterMapSegmentSource<TX> {
     snapshot: ActivatedFilterMapSnapshot<TX>,
@@ -23,7 +45,7 @@ impl<TX: DbTx> FilterMapSegmentSource<TX> {
         snapshot: ActivatedFilterMapSnapshot<TX>,
         segment_index: usize,
     ) -> Result<Self, FilterMapStorageError> {
-        let segment = snapshot.queryable.coverage().segments().get(segment_index).ok_or(
+        let segment = snapshot.queryable.segments().get(segment_index).ok_or(
             FilterMapStorageError::OutsideSource { kind: "segment", key: segment_index as u64 },
         )?;
         let maps = segment.maps();
@@ -46,7 +68,7 @@ impl<TX: DbTx + 'static> FilterMapMatchSource for FilterMapSegmentSource<TX> {
     type Error = FilterMapStorageError;
 
     fn params_id(&self) -> ParamsId {
-        self.snapshot.queryable.coverage().identity().params
+        self.snapshot.queryable.identity().params
     }
 
     fn read_row_prefixes(

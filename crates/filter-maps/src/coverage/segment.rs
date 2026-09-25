@@ -7,6 +7,10 @@ use crate::{
 use std::ops::RangeInclusive;
 
 /// One contiguous run of covered blocks and its supporting completed maps.
+///
+/// Segments are built and transformed only inside the crate, so an origin minted by a
+/// transformation, such as a [`SegmentOrigin::Retained`] anchor, always comes from coverage that
+/// passed restoration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedSegment {
     identity: IndexIdentity,
@@ -18,17 +22,8 @@ pub struct ValidatedSegment {
 }
 
 impl ValidatedSegment {
-    /// Creates a segment from one completed-map anchor.
-    pub fn new(
-        identity: &IndexIdentity,
-        origin: SegmentOrigin,
-        anchor: MapResumeAnchor,
-    ) -> Result<Self, SegmentError> {
-        Self::new_batch(identity, origin, [anchor])
-    }
-
     /// Creates a segment from all completed-map anchors in one publication.
-    pub fn new_batch(
+    pub(crate) fn new_batch(
         identity: &IndexIdentity,
         origin: SegmentOrigin,
         anchors: impl IntoIterator<Item = MapResumeAnchor>,
@@ -140,13 +135,8 @@ impl ValidatedSegment {
         self.identity == next.identity && next.origin.anchor() == Some(self.terminal())
     }
 
-    /// Returns a segment extended through one completed-map anchor.
-    pub fn extend(&self, anchor: MapResumeAnchor) -> Result<Self, SegmentError> {
-        self.extend_batch([anchor])
-    }
-
     /// Returns a segment extended through every supplied completed-map anchor.
-    pub fn extend_batch(
+    pub(crate) fn extend_batch(
         &self,
         anchors: impl IntoIterator<Item = MapResumeAnchor>,
     ) -> Result<Self, SegmentError> {
@@ -177,7 +167,7 @@ impl ValidatedSegment {
     }
 
     /// Merges a segment that exactly continues this one.
-    pub fn merge(mut self, next: Self) -> Result<Self, SegmentError> {
+    pub(crate) fn merge(mut self, next: Self) -> Result<Self, SegmentError> {
         if !self.continues_into(&next) {
             return Err(SegmentError::NotContinuous {
                 terminal: self.terminal(),
@@ -189,7 +179,10 @@ impl ValidatedSegment {
     }
 
     /// Contracts this segment to one of its published anchors.
-    pub fn contract_to(&self, anchor: MapResumeAnchor) -> Result<Option<Self>, SegmentError> {
+    pub(crate) fn contract_to(
+        &self,
+        anchor: MapResumeAnchor,
+    ) -> Result<Option<Self>, SegmentError> {
         if !self.contains_anchor(anchor) || anchor == self.terminal() {
             return Err(SegmentError::AnchorOutsideSegment { anchor })
         }
@@ -204,7 +197,7 @@ impl ValidatedSegment {
     }
 
     /// Retains maps after one of this segment's published anchors.
-    pub fn retain_after(&self, tail: MapResumeAnchor) -> Result<Option<Self>, SegmentError> {
+    pub(crate) fn retain_after(&self, tail: MapResumeAnchor) -> Result<Option<Self>, SegmentError> {
         if !self.contains_anchor(tail) {
             return Err(SegmentError::AnchorOutsideSegment { anchor: tail })
         }
@@ -502,14 +495,15 @@ mod tests {
     #[test]
     fn every_completed_map_requires_a_resume_anchor() {
         assert_eq!(
-            ValidatedSegment::new(&identity(), SegmentOrigin::Genesis, aligned(1, 20)),
+            ValidatedSegment::new_batch(&identity(), SegmentOrigin::Genesis, [aligned(1, 20)]),
             Err(SegmentError::MissingMapAnchor { expected: 0, actual: 1 })
         );
 
         let segment =
-            ValidatedSegment::new(&identity(), SegmentOrigin::Genesis, aligned(0, 10)).unwrap();
+            ValidatedSegment::new_batch(&identity(), SegmentOrigin::Genesis, [aligned(0, 10)])
+                .unwrap();
         assert_eq!(
-            segment.extend(aligned(2, 30)),
+            segment.extend_batch([aligned(2, 30)]),
             Err(SegmentError::MissingMapAnchor { expected: 1, actual: 2 })
         );
     }
@@ -522,7 +516,7 @@ mod tests {
         assert_eq!(extended.maps(), 0..=3);
         assert_eq!(extended.blocks(), Some(0..=29));
         assert!(matches!(
-            extended.extend(anchor(3, 30, 4 * VPM)),
+            extended.extend_batch([anchor(3, 30, 4 * VPM)]),
             Err(SegmentError::TerminalNotLater { .. })
         ));
     }
@@ -604,10 +598,10 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            segment.extend(anchor(4, 900, 5)),
+            segment.extend_batch([anchor(4, 900, 5)]),
             Err(SegmentError::ImplausibleResume { .. })
         ));
-        assert!(segment.extend(anchor(4, 4, 5)).is_ok());
+        assert!(segment.extend_batch([anchor(4, 4, 5)]).is_ok());
     }
 
     #[test]

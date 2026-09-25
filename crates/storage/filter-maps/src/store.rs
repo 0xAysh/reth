@@ -16,8 +16,8 @@ use reth_db_api::{
 };
 use reth_filter_maps::{
     coverage::{
-        IndexIdentity, MapResumeAnchor, PersistedCoverageError, ReorgContraction, SegmentOrigin,
-        StoredOriginVerifier, StructurallyRestoredCoverage,
+        CheckpointVerifier, IndexIdentity, MapResumeAnchor, PersistedCoverageError,
+        ReorgContraction, SegmentOrigin, StructurallyRestoredCoverage,
     },
     AnchoredCompletedMap,
 };
@@ -45,12 +45,12 @@ impl<'tx, TX: DbTx> FilterMapStore<'tx, TX> {
     ///
     /// Origins the store minted itself restore directly. `checkpoints` is consulted only for
     /// externally recognized or derived checkpoints; pass
-    /// [`RejectUntrustedOrigins`](reth_filter_maps::coverage::RejectUntrustedOrigins) when no
-    /// checkpoint registry is available.
+    /// [`RejectUnrecognizedCheckpoints`](reth_filter_maps::coverage::RejectUnrecognizedCheckpoints)
+    /// when no checkpoint registry is available.
     pub fn open(
         tx: &'tx TX,
         running: &IndexIdentity,
-        checkpoints: &mut impl StoredOriginVerifier,
+        checkpoints: &mut impl CheckpointVerifier,
     ) -> Result<Self> {
         let identity_entries = tx.entries::<FilterMapIdentity>()?;
         let identity = tx.get::<FilterMapIdentity>(SINGLETON_KEY)?;
@@ -173,8 +173,8 @@ impl<'tx, TX: DbTx + DbTxMut> FilterMapStore<'tx, TX> {
         earliest_changed: u64,
         safe_anchor: Option<MapResumeAnchor>,
     ) -> Result<ReorgContraction> {
-        let mut contracted = self.coverage.clone();
-        let outcome = contracted.contract_for_reorg(earliest_changed, safe_anchor)?;
+        let (contracted, outcome) =
+            self.coverage.contract_for_reorg(earliest_changed, safe_anchor)?;
         self.write_coverage(contracted)?;
         Ok(outcome)
     }
@@ -184,8 +184,7 @@ impl<'tx, TX: DbTx + DbTxMut> FilterMapStore<'tx, TX> {
     /// A tail inside a segment leaves the remainder under a retained origin, which later openings
     /// trust because only this operation mints it.
     pub fn retain_after(&mut self, tail: MapResumeAnchor) -> Result<()> {
-        let mut retained = self.coverage.clone();
-        retained.retain_after(tail)?;
+        let retained = self.coverage.retain_after(tail)?;
         self.write_coverage(retained)
     }
 

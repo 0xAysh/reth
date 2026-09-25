@@ -82,14 +82,11 @@ pub(crate) fn build_publication<TX: DbTx>(
         return Err(FilterMapStorageError::IncompletePriorState)
     }
 
-    let mut proposed = current.clone();
     let map_anchors = maps.iter().map(AnchoredCompletedMap::resume_anchor);
-    match start {
-        PublicationStart::Open { origin } => {
-            proposed.open_segment_batch(origin.clone(), map_anchors)?;
-        }
-        PublicationStart::Extend { from } => proposed.extend_batch(*from, map_anchors)?,
-    }
+    let proposed = match start {
+        PublicationStart::Open { origin } => current.open_segment(origin.clone(), map_anchors)?,
+        PublicationStart::Extend { from } => current.extend(*from, map_anchors)?,
+    };
 
     let mut rows = RowWrites::default();
     for map_rows in &encoded {

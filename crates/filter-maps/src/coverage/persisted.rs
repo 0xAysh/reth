@@ -2,9 +2,9 @@
 
 use crate::{
     coverage::{
-        CheckpointProvenance, CoverageSet, IndexIdentity, MapResumeAnchor, PublishError,
-        RestoreError, RetainedAnchor, SegmentOrigin, ValidatedSegment, ValueSpaceCheckpoint,
-        VerifiedCheckpoint,
+        CheckpointProvenance, ContractionError, CoverageSet, IndexIdentity, MapResumeAnchor,
+        PublishError, ReorgContraction, RetainedAnchor, SegmentOrigin, ValidatedSegment,
+        ValueSpaceCheckpoint, VerifiedCheckpoint,
     },
     BlockPointer,
 };
@@ -58,13 +58,15 @@ pub enum StoredSegmentOrigin {
 /// identity and anchor and prove derived checkpoints against a trusted predecessor. Returning
 /// `false` fails closed.
 ///
-/// Self-minted origins restore without it: a [`SegmentOrigin::Retained`] origin or a
-/// [`CheckpointProvenance::PublishedCoverage`] checkpoint can only be constructed from anchors of
-/// coverage that was already validated, and it is persisted in the same transaction as the
-/// coverage it replaces. Whoever can forge such a record can equally forge the anchors and rows it
-/// describes, so a verifier could add no evidence the store does not already hold. Canonical
-/// activation still checks every origin hash against the current chain.
-pub trait StoredOriginVerifier {
+/// Self-minted origins restore without it. A [`SegmentOrigin::Retained`] origin is minted only by
+/// [`StructurallyRestoredCoverage::retain_after`], and a
+/// [`CheckpointProvenance::PublishedCoverage`] checkpoint only by
+/// [`QueryableCoverage::derived_checkpoint`], so both name anchors of coverage that passed
+/// restoration, and the checkpoint also canonical activation. Whoever can forge such a record can
+/// equally forge the anchors and rows it describes, so a verifier could add no evidence the store
+/// does not already hold. Canonical activation still checks every origin hash against the current
+/// chain.
+pub trait CheckpointVerifier {
     /// Verifies the exact checkpoint record, including its numerical pointer.
     fn verify_checkpoint(
         &mut self,
@@ -76,9 +78,9 @@ pub trait StoredOriginVerifier {
 
 /// Verifier used when no checkpoint registry is present: every external checkpoint is rejected.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct RejectUntrustedOrigins;
+pub struct RejectUnrecognizedCheckpoints;
 
-impl StoredOriginVerifier for RejectUntrustedOrigins {
+impl CheckpointVerifier for RejectUnrecognizedCheckpoints {
     fn verify_checkpoint(
         &mut self,
         _identity: &IndexIdentity,
@@ -99,7 +101,7 @@ impl StructurallyRestoredCoverage {
         running: &IndexIdentity,
         record: StoredCoverageRecord,
         anchors: impl IntoIterator<Item = MapResumeAnchor>,
-        verifier: &mut impl StoredOriginVerifier,
+        verifier: &mut impl CheckpointVerifier,
     ) -> Result<Self, PersistedCoverageError> {
         running.check_compatible(&record.identity)?;
         let mut anchors_by_map = BTreeMap::new();
@@ -151,7 +153,7 @@ impl StructurallyRestoredCoverage {
                 );
             }
             let segment = ValidatedSegment::new_batch(&record.identity, origin, segment_anchors)?;
-            coverage.insert_restored(segment)?;
+            coverage.insert(segment)?;
             previous_terminal = Some(descriptor.terminal_map);
         }
 
@@ -200,39 +202,48 @@ impl StructurallyRestoredCoverage {
         Ok(QueryableCoverage(queryable))
     }
 
-    /// Applies an open-segment proposal while retaining the structurally-restored type state.
-    pub fn open_segment_batch(
-        &mut self,
+    /// Returns this coverage with a new segment opened from a trusted origin.
+    ///
+    /// Like every transition here, the result stays structurally restored: publishing or
+    /// contracting coverage never grants queryability without a new canonical activation.
+    pub fn open_segment(
+        &self,
         origin: SegmentOrigin,
         anchors: impl IntoIterator<Item = MapResumeAnchor>,
-    ) -> Result<(), PublishError> {
-        self.0.open_segment_batch(origin, anchors)
+    ) -> Result<Self, PublishError> {
+        let mut next = self.0.clone();
+        next.open_segment_batch(origin, anchors)?;
+        Ok(Self(next))
     }
 
-    /// Applies an extension proposal while retaining the structurally-restored type state.
-    pub fn extend_batch(
-        &mut self,
+    /// Returns this coverage with the segment ending at `from` extended through `anchors`.
+    pub fn extend(
+        &self,
         from: MapResumeAnchor,
         anchors: impl IntoIterator<Item = MapResumeAnchor>,
-    ) -> Result<(), PublishError> {
-        self.0.extend_batch(from, anchors)
+    ) -> Result<Self, PublishError> {
+        let mut next = self.0.clone();
+        next.extend_batch(from, anchors)?;
+        Ok(Self(next))
     }
 
-    /// Contracts structurally-restored coverage for a reorg without granting queryability.
+    /// Returns this coverage contracted before `earliest_changed`, and what the contraction
+    /// removed.
     pub fn contract_for_reorg(
-        &mut self,
+        &self,
         earliest_changed: u64,
         safe_anchor: Option<MapResumeAnchor>,
-    ) -> Result<crate::coverage::ReorgContraction, crate::coverage::ContractionError> {
-        self.0.contract_for_reorg(earliest_changed, safe_anchor)
+    ) -> Result<(Self, ReorgContraction), ContractionError> {
+        let mut next = self.0.clone();
+        let outcome = next.contract_for_reorg(earliest_changed, safe_anchor)?;
+        Ok((Self(next), outcome))
     }
 
-    /// Applies retention contraction without granting queryability.
-    pub fn retain_after(
-        &mut self,
-        tail: MapResumeAnchor,
-    ) -> Result<(), crate::coverage::ContractionError> {
-        self.0.retain_after(tail)
+    /// Returns this coverage without anything through the published `tail` anchor.
+    pub fn retain_after(&self, tail: MapResumeAnchor) -> Result<Self, ContractionError> {
+        let mut next = self.0.clone();
+        next.retain_after(tail)?;
+        Ok(Self(next))
     }
 
     /// Produces the compact catalog after a validated structural transition.
@@ -261,20 +272,39 @@ impl QueryableCoverage {
         self.0.covers(block_number)
     }
 
-    /// Returns current queryable coverage.
-    pub const fn coverage(&self) -> &CoverageSet {
-        &self.0
-    }
-
-    /// Consumes the wrapper after canonical verification.
-    pub fn into_coverage(self) -> CoverageSet {
-        self.0
+    /// Returns a checkpoint for an anchor this canonical coverage published.
+    ///
+    /// This is the only way to mint a [`CheckpointProvenance::PublishedCoverage`] checkpoint,
+    /// which later openings of the store trust without a [`CheckpointVerifier`]. Minting requires
+    /// canonical activation, so neither fabricated coverage nor structurally restored coverage
+    /// whose segments failed activation can produce one:
+    ///
+    /// ```compile_fail,E0599
+    /// use reth_filter_maps::coverage::{MapResumeAnchor, StructurallyRestoredCoverage};
+    ///
+    /// fn mint(restored: &StructurallyRestoredCoverage, anchor: MapResumeAnchor) {
+    ///     let _ = restored.derived_checkpoint(anchor);
+    /// }
+    /// ```
+    ///
+    /// ```compile_fail,E0603
+    /// use reth_filter_maps::coverage::{CoverageSet, IndexIdentity};
+    ///
+    /// fn fabricate(identity: IndexIdentity) {
+    ///     let _ = CoverageSet::new(identity);
+    /// }
+    /// ```
+    pub fn derived_checkpoint(
+        &self,
+        anchor: MapResumeAnchor,
+    ) -> Result<VerifiedCheckpoint, PublishError> {
+        self.0.derived_checkpoint(anchor)
     }
 }
 
 impl CoverageSet {
     /// Produces the compact storage-neutral catalog. Per-map anchors remain separate records.
-    pub fn stored_record(&self) -> StoredCoverageRecord {
+    pub(crate) fn stored_record(&self) -> StoredCoverageRecord {
         let segments = self
             .segments()
             .iter()
@@ -285,13 +315,6 @@ impl CoverageSet {
             })
             .collect();
         StoredCoverageRecord { identity: *self.identity(), segments }
-    }
-
-    pub(super) fn insert_restored(
-        &mut self,
-        segment: ValidatedSegment,
-    ) -> Result<(), PublishError> {
-        self.insert(segment)
     }
 }
 
@@ -310,7 +333,7 @@ impl StoredSegmentOrigin {
     fn restore(
         self,
         identity: IndexIdentity,
-        verifier: &mut impl StoredOriginVerifier,
+        verifier: &mut impl CheckpointVerifier,
     ) -> Result<SegmentOrigin, PersistedCoverageError> {
         let anchor = match &self {
             Self::Genesis => return Ok(SegmentOrigin::Genesis),
@@ -443,15 +466,6 @@ pub enum CanonicalActivationError<E, P> {
     },
 }
 
-impl From<RestoreError> for PersistedCoverageError {
-    fn from(error: RestoreError) -> Self {
-        match error {
-            RestoreError::Identity(error) => Self::Identity(error),
-            RestoreError::Corrupt(error) => Self::Coverage(error),
-        }
-    }
-}
-
 /// Returns whether the segment's origin, derivation predecessor, and anchors are all canonical.
 fn identities_canonical<E, P>(
     identity: &IndexIdentity,
@@ -545,7 +559,7 @@ mod tests {
         .unwrap();
         assert_eq!(restored.segments().len(), 1);
         let queryable = activate(&restored, |number| Some(hash(number)));
-        assert!(queryable.coverage().covers(29));
+        assert!(queryable.covers(29));
     }
 
     #[test]
@@ -566,9 +580,9 @@ mod tests {
         .unwrap();
 
         let queryable = activate(&restored, |number| (number < 100).then(|| hash(number)));
-        assert_eq!(queryable.coverage().segments().len(), 1);
-        assert!(queryable.coverage().covers(19));
-        assert!(!queryable.coverage().covers(100));
+        assert_eq!(queryable.segments().len(), 1);
+        assert!(queryable.covers(19));
+        assert!(!queryable.covers(100));
     }
 
     #[test]
@@ -597,7 +611,7 @@ mod tests {
         let queryable = activate(&restored, |number| {
             Some(if number == 60 { B256::ZERO } else { hash(number) })
         });
-        assert!(queryable.coverage().segments().is_empty());
+        assert!(queryable.segments().is_empty());
     }
 
     #[test]
@@ -624,7 +638,7 @@ mod tests {
             )
         };
         let stored = stored_pointers(restored.segments());
-        assert_eq!(activate_with(stored.clone()).unwrap().coverage().segments().len(), 1);
+        assert_eq!(activate_with(stored.clone()).unwrap().segments().len(), 1);
 
         let corrupt = |block: u64, edit: &dyn Fn(&mut BlockPointer)| {
             let mut pointers = stored.clone();
@@ -665,7 +679,7 @@ mod tests {
         anchor: MapResumeAnchor,
     }
 
-    impl StoredOriginVerifier for ExactCheckpointVerifier {
+    impl CheckpointVerifier for ExactCheckpointVerifier {
         fn verify_checkpoint(
             &mut self,
             identity: &IndexIdentity,
@@ -698,7 +712,7 @@ mod tests {
                 &identity(),
                 record.clone(),
                 [terminal],
-                &mut RejectUntrustedOrigins,
+                &mut RejectUnrecognizedCheckpoints,
             ),
             Err(PersistedCoverageError::UnverifiedOrigin)
         ));
@@ -725,7 +739,7 @@ mod tests {
         let mut coverage = CoverageSet::new(identity());
         let anchors = anchors_through(0, aligned(4, 50));
         coverage.open_segment_batch(SegmentOrigin::Genesis, anchors.clone()).unwrap();
-        let checkpoint = coverage.derived_checkpoint(anchors[1]).unwrap();
+        let checkpoint = queryable(&coverage).derived_checkpoint(anchors[1]).unwrap();
         coverage.retain_after(anchors[1]).unwrap();
         let retained = coverage.clone();
         assert!(matches!(retained.segments()[0].origin(), SegmentOrigin::Retained(_)));
@@ -733,7 +747,7 @@ mod tests {
             &identity(),
             retained.stored_record(),
             anchors[2..].iter().copied(),
-            &mut RejectUntrustedOrigins,
+            &mut RejectUnrecognizedCheckpoints,
         )
         .unwrap();
         assert_eq!(restored.segments(), retained.segments());
@@ -746,10 +760,136 @@ mod tests {
             &identity(),
             published.stored_record(),
             anchors[2..].iter().copied(),
-            &mut RejectUntrustedOrigins,
+            &mut RejectUnrecognizedCheckpoints,
         )
         .unwrap();
         assert_eq!(restored.segments(), published.segments());
+    }
+
+    #[test]
+    fn only_canonically_activated_coverage_mints_published_coverage_checkpoints() {
+        let mut coverage = CoverageSet::new(identity());
+        let canonical = anchors_through(0, aligned(1, 20));
+        let reorged = anchors_through(10, aligned(11, 120));
+        coverage.open_segment_batch(SegmentOrigin::Genesis, canonical.clone()).unwrap();
+        coverage.open_segment_batch(checkpoint(aligned(9, 100)), reorged.clone()).unwrap();
+        let restored = restored(&coverage);
+        let queryable = activate(&restored, |number| (number < 100).then(|| hash(number)));
+
+        let minted = queryable.derived_checkpoint(canonical[0]).unwrap();
+        assert_eq!(minted.anchor(), canonical[0]);
+        assert_eq!(minted.checkpoint().provenance(), CheckpointProvenance::PublishedCoverage);
+        // The segment restored from storage but disabled by activation cannot vouch for anchors.
+        assert_eq!(
+            queryable.derived_checkpoint(reorged[0]),
+            Err(PublishError::UnknownAnchor { anchor: reorged[0] })
+        );
+        // Plausible values that no segment published cannot be minted either.
+        let invented = anchor(0, 10, VPM - 1);
+        assert_eq!(
+            queryable.derived_checkpoint(invented),
+            Err(PublishError::UnknownAnchor { anchor: invented })
+        );
+    }
+
+    #[test]
+    fn restored_transitions_return_new_states_and_leave_the_source_unchanged() {
+        let mut coverage = CoverageSet::new(identity());
+        let anchors = anchors_through(0, aligned(4, 50));
+        coverage.open_segment_batch(SegmentOrigin::Genesis, anchors[..2].to_vec()).unwrap();
+        let restored = restored(&coverage);
+
+        let extended = restored.extend(anchors[1], anchors[2..].to_vec()).unwrap();
+        assert_eq!(restored.segments()[0].maps(), 0..=1);
+        assert_eq!(extended.segments()[0].maps(), 0..=4);
+
+        let retained = extended.retain_after(anchors[1]).unwrap();
+        assert!(matches!(retained.segments()[0].origin(), SegmentOrigin::Retained(_)));
+        let (contracted, outcome) = extended.contract_for_reorg(45, Some(anchors[3])).unwrap();
+        assert_eq!(outcome.rebuild_from, Some(anchors[3]));
+        assert_eq!(contracted.segments()[0].maps(), 0..=3);
+        assert_eq!(extended.segments()[0].maps(), 0..=4);
+
+        let opened = contracted.open_segment(checkpoint(aligned(9, 100)), [aligned(10, 110)]);
+        assert_eq!(opened.unwrap().segments().len(), 2);
+        assert_eq!(contracted.stored_record().segments.len(), 1);
+    }
+
+    #[test]
+    fn restoration_fails_closed_on_identity_mismatch() {
+        let mut stored = identity();
+        stored.params = crate::ParamsId::RangeTest;
+        let record = StoredCoverageRecord { identity: stored, segments: Vec::new() };
+        assert!(matches!(
+            StructurallyRestoredCoverage::restore(
+                &identity(),
+                record,
+                [],
+                &mut RejectUnrecognizedCheckpoints,
+            ),
+            Err(PersistedCoverageError::Identity(crate::coverage::IdentityMismatch::Params { .. }))
+        ));
+    }
+
+    #[test]
+    fn restoration_rejects_block_overlap_even_when_maps_are_disjoint() {
+        let first = anchors_through(0, aligned(1, 100));
+        let second = anchors_through(10, aligned(12, 130));
+        let record = StoredCoverageRecord {
+            identity: identity(),
+            segments: vec![
+                StoredSegmentRecord {
+                    origin: StoredSegmentOrigin::Genesis,
+                    first_map: 0,
+                    terminal_map: 1,
+                },
+                StoredSegmentRecord {
+                    origin: StoredSegmentOrigin::Retained { origin_anchor: aligned(9, 50) },
+                    first_map: 10,
+                    terminal_map: 12,
+                },
+            ],
+        };
+        assert!(matches!(
+            StructurallyRestoredCoverage::restore(
+                &identity(),
+                record,
+                first.into_iter().chain(second),
+                &mut RejectUnrecognizedCheckpoints,
+            ),
+            Err(PersistedCoverageError::Coverage(PublishError::BlockOverlap { .. }))
+        ));
+    }
+
+    #[test]
+    fn restoration_merges_exactly_continuing_segments() {
+        let join = aligned(5, 60);
+        let record = StoredCoverageRecord {
+            identity: identity(),
+            segments: vec![
+                StoredSegmentRecord {
+                    origin: StoredSegmentOrigin::Genesis,
+                    first_map: 0,
+                    terminal_map: 5,
+                },
+                StoredSegmentRecord {
+                    origin: StoredSegmentOrigin::Retained { origin_anchor: join },
+                    first_map: 6,
+                    terminal_map: 8,
+                },
+            ],
+        };
+        let anchors =
+            anchors_through(0, join).into_iter().chain(anchors_through(6, aligned(8, 90)));
+        let restored = StructurallyRestoredCoverage::restore(
+            &identity(),
+            record,
+            anchors,
+            &mut RejectUnrecognizedCheckpoints,
+        )
+        .unwrap();
+        assert_eq!(restored.segments().len(), 1);
+        assert_eq!(restored.segments()[0].blocks(), Some(0..=89));
     }
 
     #[test]
@@ -770,7 +910,7 @@ mod tests {
                 &identity(),
                 record,
                 [aligned(10, 110)],
-                &mut RejectUntrustedOrigins,
+                &mut RejectUnrecognizedCheckpoints,
             ),
             Err(PersistedCoverageError::UnverifiedOrigin)
         ));

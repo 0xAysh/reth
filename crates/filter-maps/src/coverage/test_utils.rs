@@ -1,7 +1,7 @@
 use crate::{
     coverage::{
-        CheckpointProvenance, CoverageSet, IndexIdentity, MapResumeAnchor, QueryableCoverage,
-        SegmentOrigin, StoredOriginVerifier, StructurallyRestoredCoverage, ValidatedSegment,
+        CheckpointProvenance, CheckpointVerifier, CoverageSet, IndexIdentity, MapResumeAnchor,
+        QueryableCoverage, SegmentOrigin, StructurallyRestoredCoverage, ValidatedSegment,
         VerifiedCheckpoint, STORAGE_FORMAT_V1,
     },
     BlockPointer, MapBoundary, ParamsId, DEFAULT_PARAMS, GETH_V1,
@@ -85,7 +85,7 @@ pub(super) fn stored_pointers<'a>(
 /// Accepts every checkpoint recorded under the test identity.
 pub(super) struct TestCheckpointVerifier;
 
-impl StoredOriginVerifier for TestCheckpointVerifier {
+impl CheckpointVerifier for TestCheckpointVerifier {
     fn verify_checkpoint(
         &mut self,
         identity: &IndexIdentity,

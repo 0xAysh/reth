@@ -61,8 +61,8 @@ mod tests {
     use reth_filter_maps::{
         address_value,
         coverage::{
-            CanonicalActivationError, CheckpointProvenance, IndexIdentity, MapResumeAnchor,
-            RejectUntrustedOrigins, SegmentOrigin, StoredCoverageRecord, StoredOriginVerifier,
+            CanonicalActivationError, CheckpointProvenance, CheckpointVerifier, IndexIdentity,
+            MapResumeAnchor, RejectUnrecognizedCheckpoints, SegmentOrigin, StoredCoverageRecord,
             StoredSegmentOrigin, StoredSegmentRecord, StructurallyRestoredCoverage,
             STORAGE_FORMAT_V1,
         },
@@ -88,7 +88,7 @@ mod tests {
     #[derive(Default)]
     struct TestOriginVerifier;
 
-    impl StoredOriginVerifier for TestOriginVerifier {
+    impl CheckpointVerifier for TestOriginVerifier {
         fn verify_checkpoint(
             &mut self,
             identity: &IndexIdentity,
@@ -147,14 +147,14 @@ mod tests {
     }
 
     fn open_store<'tx, TX: DbTx>(tx: &'tx TX, identity: &IndexIdentity) -> FilterMapStore<'tx, TX> {
-        FilterMapStore::open(tx, identity, &mut RejectUntrustedOrigins).unwrap()
+        FilterMapStore::open(tx, identity, &mut RejectUnrecognizedCheckpoints).unwrap()
     }
 
     fn read_snapshot<TX: DbTx>(
         tx: TX,
         identity: &IndexIdentity,
     ) -> Result<FilterMapReadSnapshot<TX>> {
-        FilterMapReadSnapshot::open(tx, identity, &mut RejectUntrustedOrigins)
+        FilterMapReadSnapshot::open(tx, identity, &mut RejectUnrecognizedCheckpoints)
     }
 
     fn render_address_map(
@@ -1048,7 +1048,7 @@ mod tests {
 
         let activated =
             read_snapshot(db.tx().unwrap(), &identity()).unwrap().activate(chain_hash).unwrap();
-        assert_eq!(activated.coverage().coverage().segments()[0].maps(), 2..=4);
+        assert_eq!(activated.coverage().segments()[0].maps(), 2..=4);
     }
 
     #[test]
@@ -1073,7 +1073,6 @@ mod tests {
             .activate(chain_hash)
             .unwrap()
             .coverage()
-            .coverage()
             .derived_checkpoint(maps[1].resume_anchor())
             .unwrap();
         let tx = db.tx_mut().unwrap();
@@ -1089,7 +1088,7 @@ mod tests {
 
         let activated =
             read_snapshot(db.tx().unwrap(), &identity()).unwrap().activate(chain_hash).unwrap();
-        let segment = &activated.coverage().coverage().segments()[0];
+        let segment = &activated.coverage().segments()[0];
         assert_eq!(segment.origin(), &SegmentOrigin::Checkpoint(checkpoint));
         assert_eq!(segment.maps(), 2..=3);
     }

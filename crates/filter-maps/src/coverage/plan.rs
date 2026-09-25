@@ -19,7 +19,7 @@ use std::ops::RangeInclusive;
 /// Structurally restored coverage has not been checked against the current chain, so it cannot
 /// route a query to the matcher:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0308
 /// use reth_filter_maps::coverage::{LogQueryTarget, QueryPlan, StructurallyRestoredCoverage};
 ///
 /// fn plan(coverage: &StructurallyRestoredCoverage) {

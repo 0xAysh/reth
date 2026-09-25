@@ -28,12 +28,13 @@ pub use identity::{
     STORAGE_FORMAT_V1,
 };
 pub use persisted::{
-    CanonicalActivationError, PersistedCoverageError, QueryableCoverage, RejectUntrustedOrigins,
-    StoredCoverageRecord, StoredOriginVerifier, StoredSegmentOrigin, StoredSegmentRecord,
+    CanonicalActivationError, CheckpointVerifier, PersistedCoverageError, QueryableCoverage,
+    RejectUnrecognizedCheckpoints, StoredCoverageRecord, StoredSegmentOrigin, StoredSegmentRecord,
     StructurallyRestoredCoverage,
 };
 pub use plan::{
     CandidateSource, CanonicalityChanged, LogQueryTarget, PlanError, PlannedSubrange, QueryPlan,
 };
 pub use segment::{RetainedAnchor, SegmentError, SegmentOrigin, ValidatedSegment};
-pub use set::{ContractionError, CoverageSet, PublishError, ReorgContraction, RestoreError};
+pub(crate) use set::CoverageSet;
+pub use set::{ContractionError, PublishError, ReorgContraction};
