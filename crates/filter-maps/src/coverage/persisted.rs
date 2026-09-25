@@ -205,8 +205,10 @@ impl StructurallyRestoredCoverage {
     /// Returns this coverage with a new segment opened from a trusted origin.
     ///
     /// Like every transition here, the result stays structurally restored: publishing or
-    /// contracting coverage never grants queryability without a new canonical activation.
-    pub fn open_segment(
+    /// contracting coverage never grants queryability without a new canonical activation. Callers
+    /// outside the crate publish through [`propose`](Self::propose), which also checks the batch's
+    /// pointers and exact retries.
+    pub(crate) fn open_segment(
         &self,
         origin: SegmentOrigin,
         anchors: impl IntoIterator<Item = MapResumeAnchor>,
@@ -217,7 +219,7 @@ impl StructurallyRestoredCoverage {
     }
 
     /// Returns this coverage with the segment ending at `from` extended through `anchors`.
-    pub fn extend(
+    pub(crate) fn extend(
         &self,
         from: MapResumeAnchor,
         anchors: impl IntoIterator<Item = MapResumeAnchor>,
