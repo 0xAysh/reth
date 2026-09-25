@@ -29,10 +29,10 @@ mod codec;
 mod contraction;
 mod error;
 mod matcher;
+mod publication;
 mod rows;
 mod snapshot;
 mod store;
-mod validation;
 
 pub use contraction::CleanupRanges;
 pub use error::{FilterMapStorageError, Result};
@@ -43,7 +43,7 @@ pub use store::FilterMapStore;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::validation::{build_publication, PublicationPlan, PublicationWrite};
+    use crate::publication::{build_publication, PublicationPlan, PublicationWrite};
     use alloy_primitives::{Address, B256};
     use reth_db::test_utils::create_test_rw_db;
     use reth_db_api::{

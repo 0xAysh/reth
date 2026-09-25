@@ -1,13 +1,14 @@
-//! Physical publication checks and write-set derivation.
+//! The physical plan of one publication.
 //!
 //! Publication rules belong to
 //! [`StructurallyRestoredCoverage::propose`](reth_filter_maps::coverage::StructurallyRestoredCoverage::propose).
-//! This module adds only what depends on stored bytes and physical layout, and then constructs
-//! either a no-op retry or the complete ordered [`PublicationWrites`] before the store mutates any
-//! table. The caller-owned MDBX transaction remains the atomicity boundary.
+//! This module turns its decision into a [`PublicationPlan`]: it adds only the checks that depend
+//! on stored bytes and physical layout, and then constructs either a no-op retry or the complete
+//! ordered [`PublicationWrites`] before the store mutates any table. The caller-owned MDBX
+//! transaction remains the atomicity boundary.
 
 use crate::{
-    codec::anchor_to_db,
+    codec::{anchor_to_db, pointer_to_db},
     error::{FilterMapStorageError, Result},
     rows::{EncodedMap, RowWrites},
     store::FilterMapStore,
@@ -22,13 +23,14 @@ use reth_db_api::{
 };
 use reth_filter_maps::{
     coverage::{
-        IndexIdentity, PointerEvidence, PublicationProposal, PublicationStart,
+        IndexIdentity, PointerEvidence, PublicationProposal, PublicationStart, PublishError,
         StructurallyRestoredCoverage,
     },
     AnchoredCompletedMap,
 };
 
-const MAX_BATCH: usize = 32;
+/// Most maps one publication may stage.
+pub(crate) const MAX_BATCH: usize = 32;
 
 #[derive(Debug)]
 pub(crate) enum PublicationPlan {
@@ -127,10 +129,9 @@ pub(crate) fn build_publication<TX: DbTx>(
     let directories = encoded.iter().map(|map_rows| {
         PublicationWrite::Directory(map_rows.map_index(), map_rows.directory().clone())
     });
-    let pointers = pointers
-        .pointers()
-        .iter()
-        .map(|pointer| PublicationWrite::BlockPointer(pointer.block_number, stored(pointer)));
+    let pointers = pointers.pointers().iter().map(|pointer| {
+        PublicationWrite::BlockPointer(pointer.block_number, pointer_to_db(pointer))
+    });
     let anchors = maps.iter().map(|anchored| {
         let anchor = anchored.resume_anchor();
         PublicationWrite::Anchor(anchor.completed_map_index, anchor_to_db(anchor))
@@ -140,15 +141,15 @@ pub(crate) fn build_publication<TX: DbTx>(
 }
 
 /// Rejects batches the physical row layout cannot stage as one base-row group.
-///
-/// Runs after the pure proposal, which already established a nonempty, consecutive batch.
 fn check_batch_layout(identity: &IndexIdentity, maps: &[AnchoredCompletedMap]) -> Result<()> {
     if maps.len() > MAX_BATCH {
         return Err(FilterMapStorageError::OversizedPublication(maps.len()))
     }
+    let ([first, ..], [.., last]) = (maps, maps) else {
+        return Err(PublishError::EmptyPublication.into())
+    };
     let params = u8::from(identity.params);
-    let first = maps.first().expect("proposal rejects empty batches").map().map_index();
-    let last = maps.last().expect("proposal rejects empty batches").map().map_index();
+    let (first, last) = (first.map().map_index(), last.map().map_index());
     if FilterMapBaseRowKey::new(params, first, 0)? != FilterMapBaseRowKey::new(params, last, 0)? {
         return Err(FilterMapStorageError::MultipleBaseRowGroups {
             first_map: first,
@@ -171,7 +172,7 @@ fn validate_protected_pointers<TX: DbTx>(
             continue
         }
         match tx.get::<FilterMapBlockPointers>(number)? {
-            Some(existing) if existing == stored(pointer) => {}
+            Some(existing) if existing == pointer_to_db(pointer) => {}
             Some(_) => {
                 return Err(FilterMapStorageError::ProtectedConflict {
                     kind: "block pointer",
@@ -182,11 +183,4 @@ fn validate_protected_pointers<TX: DbTx>(
         }
     }
     Ok(())
-}
-
-const fn stored(pointer: &reth_filter_maps::BlockPointer) -> StoredBlockPointer {
-    StoredBlockPointer {
-        block_hash: pointer.block_hash,
-        first_log_value_index: pointer.first_log_value_index,
-    }
 }

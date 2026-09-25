@@ -1,5 +1,6 @@
 //! Typed `FilterMaps` storage failures.
 
+use crate::publication::MAX_BATCH;
 use reth_db_api::{models::FilterMapModelError, DatabaseError};
 use reth_filter_maps::coverage::{
     ContractionError, IdentityMismatch, PersistedCoverageError, PublishError,
@@ -36,7 +37,7 @@ pub enum FilterMapStorageError {
     #[error(transparent)]
     Model(#[from] FilterMapModelError),
     /// Publication holds more maps than one batch may stage.
-    #[error("FilterMaps publication contains {0} maps; maximum is 32")]
+    #[error("FilterMaps publication contains {0} maps; maximum is {max}", max = MAX_BATCH)]
     OversizedPublication(usize),
     /// Publication maps do not share one base-row group.
     #[error("FilterMaps publication maps {first_map}..={last_map} span several base-row groups")]

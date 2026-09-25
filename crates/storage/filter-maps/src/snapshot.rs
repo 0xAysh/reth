@@ -1,6 +1,7 @@
 //! Coherent structural snapshots and canonically activated matcher sources.
 
 use crate::{
+    codec::pointer_from_db,
     error::{FilterMapStorageError, Result},
     store::FilterMapStore,
 };
@@ -8,12 +9,9 @@ use alloy_primitives::B256;
 use reth_db_api::{
     models::StoredMapRowDirectory, tables::FilterMapBlockPointers, transaction::DbTx,
 };
-use reth_filter_maps::{
-    coverage::{
-        CanonicalActivationError, CheckpointVerifier, IndexIdentity, QueryableCoverage,
-        StructurallyRestoredCoverage,
-    },
-    BlockPointer,
+use reth_filter_maps::coverage::{
+    CanonicalActivationError, CheckpointVerifier, IndexIdentity, QueryableCoverage,
+    StructurallyRestoredCoverage,
 };
 use std::collections::BTreeMap;
 
@@ -65,9 +63,10 @@ impl<TX: DbTx> FilterMapReadSnapshot<TX> {
         CanonicalActivationError<E, FilterMapStorageError>,
     > {
         let queryable = self.restored.activate(canonical_hash, |block_number| {
-            Ok(self.tx.get::<FilterMapBlockPointers>(block_number)?.map(|stored| {
-                BlockPointer::new(block_number, stored.block_hash, stored.first_log_value_index)
-            }))
+            Ok(self
+                .tx
+                .get::<FilterMapBlockPointers>(block_number)?
+                .map(|stored| pointer_from_db(block_number, stored)))
         })?;
         Ok(ActivatedFilterMapSnapshot { tx: self.tx, queryable, directories: self.directories })
     }

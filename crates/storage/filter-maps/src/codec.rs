@@ -5,8 +5,8 @@
 
 use crate::error::{FilterMapStorageError, Result};
 use reth_db_api::models::{
-    StoredCheckpointProvenance as DbProvenance, StoredCoverageCatalog,
-    StoredIndexIdentity as DbIdentity, StoredMapResumeAnchor as DbAnchor,
+    StoredBlockPointer as DbPointer, StoredCheckpointProvenance as DbProvenance,
+    StoredCoverageCatalog, StoredIndexIdentity as DbIdentity, StoredMapResumeAnchor as DbAnchor,
     StoredSegmentDescriptor as DbSegment, StoredSegmentOrigin as DbOrigin,
 };
 use reth_filter_maps::{
@@ -38,6 +38,19 @@ pub(crate) fn identity_from_db(identity: DbIdentity) -> Result<IndexIdentity> {
         ParamsId::try_from(identity.params_id)
             .map_err(|_| FilterMapStorageError::UnknownIdentity("parameter set"))?,
     ))
+}
+
+/// Converts a pointer to its record, which omits the block number because it is the table key.
+pub(crate) const fn pointer_to_db(pointer: &BlockPointer) -> DbPointer {
+    DbPointer {
+        block_hash: pointer.block_hash,
+        first_log_value_index: pointer.first_log_value_index,
+    }
+}
+
+/// Converts the pointer record stored under `block_number`.
+pub(crate) const fn pointer_from_db(block_number: u64, pointer: DbPointer) -> BlockPointer {
+    BlockPointer::new(block_number, pointer.block_hash, pointer.first_log_value_index)
 }
 
 pub(crate) fn anchor_to_db(anchor: MapResumeAnchor) -> DbAnchor {
