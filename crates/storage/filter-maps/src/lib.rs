@@ -30,6 +30,7 @@ mod contraction;
 mod error;
 mod matcher;
 mod restore;
+mod rows;
 mod snapshot;
 mod store;
 mod validation;
@@ -155,36 +156,6 @@ mod tests {
             start = PublicationStart::Extend { from: map.resume_anchor() };
         }
         Ok(())
-    }
-
-    fn production_map() -> (reth_filter_maps::AnchoredCompletedMap, Address) {
-        production_map_with_seed(0)
-    }
-
-    fn production_map_with_seed(seed: u64) -> (reth_filter_maps::AnchoredCompletedMap, Address) {
-        let mut searched = [0u8; 20];
-        searched[12..].copy_from_slice(&seed.wrapping_add(42).to_be_bytes());
-        let address = Address::from(searched);
-        let logs = (seed..seed + 65_535).map(|index| {
-            let mut bytes = [0u8; 20];
-            bytes[12..].copy_from_slice(&index.to_be_bytes());
-            LogInput::new(Address::from(bytes), [])
-        });
-        let stream = LogValueStream::new(
-            DEFAULT_PARAMS,
-            ValueSpaceAnchor::new(0, B256::ZERO, 0),
-            vec![
-                BlockInput::new(0, B256::ZERO, logs),
-                BlockInput::new(1, B256::repeat_byte(1), []),
-            ],
-            LogValueStreamTermination::ReachedHead,
-        );
-        let mut renderer = FilterMapRenderer::from_genesis(stream).unwrap();
-        let rendered = match renderer.render_next().unwrap().unwrap() {
-            RendererOutput::Map(map) => map,
-            RendererOutput::Complete(_) => panic!("expected a completed production map"),
-        };
-        (rendered, address)
     }
 
     fn render_address_map(
@@ -752,104 +723,6 @@ mod tests {
         assert!(matches!(
             FilterMapReadSnapshot::new(db.tx().unwrap(), &identity()),
             Err(FilterMapStorageError::Database(reth_db_api::DatabaseError::Decode))
-        ));
-    }
-
-    #[test]
-    fn lazy_row_access_rejects_plausibly_truncated_base_payload() {
-        let db = create_test_rw_db();
-        let (map, _) = production_map();
-        let row = map
-            .map()
-            .rows()
-            .iter()
-            .find(|row| {
-                row.columns().len() > 1 &&
-                    row.columns().len() <= DEFAULT_PARAMS.base_row_length() as usize
-            })
-            .unwrap();
-        let row_index = row.row_index();
-        let original_length = row.columns().len();
-        let production_identity =
-            IndexIdentity::new(STORAGE_FORMAT_V1, 1, B256::ZERO, GETH_V1, ParamsId::Default);
-        let tx = db.tx_mut().unwrap();
-        initialize_identity(&tx, &production_identity).unwrap();
-        publish(
-            &tx,
-            &production_identity,
-            PublicationStart::Open { origin: SegmentOrigin::Genesis },
-            std::slice::from_ref(&map),
-        )
-        .unwrap();
-        tx.commit().unwrap();
-
-        let key = FilterMapBaseRowKey::new(ParamsId::Default.into(), 0, row_index).unwrap();
-        let slot = FilterMapBaseRowKey::slot(ParamsId::Default.into(), 0).unwrap();
-        let tx = db.tx_mut().unwrap();
-        let mut group = tx.get::<FilterMapBaseRows>(key).unwrap().unwrap();
-        group.slots[slot].pop().unwrap();
-        tx.put::<FilterMapBaseRows>(key, group).unwrap();
-        tx.commit().unwrap();
-
-        let snapshot = FilterMapReadSnapshot::new(db.tx().unwrap(), &production_identity).unwrap();
-        let activated = snapshot
-            .activate(|number| {
-                Ok::<_, std::convert::Infallible>(Some(if number == 0 {
-                    B256::ZERO
-                } else {
-                    B256::repeat_byte(number as u8)
-                }))
-            })
-            .unwrap();
-        let mut source = activated.into_segment_source(0).unwrap();
-        assert!(matches!(
-            source.read_row_prefixes(&[0], row_index, original_length as u32),
-            Err(FilterMapStorageError::PayloadCountMismatch(0))
-        ));
-    }
-
-    #[test]
-    fn lazy_access_does_not_read_irrelevant_missing_extension() {
-        let db = create_test_rw_db();
-        let (map, _, row) = replacement_transition_maps();
-        let production_identity =
-            IndexIdentity::new(STORAGE_FORMAT_V1, 1, B256::ZERO, GETH_V1, ParamsId::Default);
-        let tx = db.tx_mut().unwrap();
-        initialize_identity(&tx, &production_identity).unwrap();
-        publish(
-            &tx,
-            &production_identity,
-            PublicationStart::Open { origin: SegmentOrigin::Genesis },
-            std::slice::from_ref(&map),
-        )
-        .unwrap();
-        tx.commit().unwrap();
-        let extension_key = FilterMapExtendedRowKey::new(ParamsId::Default.into(), 0, row).unwrap();
-        let tx = db.tx_mut().unwrap();
-        tx.delete::<FilterMapExtendedRows>(extension_key, None).unwrap();
-        tx.commit().unwrap();
-
-        let snapshot = FilterMapReadSnapshot::new(db.tx().unwrap(), &production_identity).unwrap();
-        let activated = snapshot
-            .activate(|number| {
-                Ok::<_, std::convert::Infallible>(Some(if number == 0 {
-                    B256::ZERO
-                } else {
-                    B256::repeat_byte(number as u8)
-                }))
-            })
-            .unwrap();
-        let mut source = activated.into_segment_source(0).unwrap();
-        let expected =
-            map.map().rows().iter().find(|candidate| candidate.row_index() == row).unwrap();
-        assert_eq!(
-            source.read_row_prefixes(&[0], row, 1).unwrap(),
-            vec![vec![expected.columns()[0]]]
-        );
-        assert!(matches!(
-            source.read_row_prefixes(&[0], row, DEFAULT_PARAMS.base_row_length() + 1),
-            Err(FilterMapStorageError::MissingExtension { map_index: 0, row_index })
-                if row_index == row
         ));
     }
 

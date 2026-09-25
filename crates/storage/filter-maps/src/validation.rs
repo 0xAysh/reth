@@ -6,7 +6,8 @@
 use crate::{
     codec::{anchor_to_db, catalog_to_db},
     error::{FilterMapStorageError, Result},
-    restore::{load_directories, load_metadata, read_map_rows},
+    restore::{load_directories, load_metadata},
+    rows::{EncodedMap, RowWrites},
     store::PublicationStart,
 };
 use reth_db_api::{
@@ -14,14 +15,14 @@ use reth_db_api::{
         FilterMapBaseRowKey, FilterMapExtendedRowKey, StoredBaseRowGroup, StoredBlockPointer,
         StoredExtendedRow, StoredMapResumeAnchor, StoredMapRowDirectory,
     },
-    tables::{FilterMapAnchors, FilterMapBaseRows, FilterMapBlockPointers, FilterMapDirectories},
+    tables::{FilterMapAnchors, FilterMapBlockPointers},
     transaction::DbTx,
 };
 use reth_filter_maps::{
     coverage::{IndexIdentity, StoredOriginVerifier, StructurallyRestoredCoverage},
     AnchoredCompletedMap, BlockPointer,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 const MAX_BATCH: usize = 32;
 
@@ -53,57 +54,17 @@ pub(crate) fn build_publication<TX: DbTx>(
     load_directories(tx, &metadata)?;
     let identity = metadata.identity;
     let current = metadata.coverage;
-    let params = identity.params.params();
-    let params_id = u8::from(identity.params);
 
+    let mut encoded = Vec::with_capacity(maps.len());
     let mut directories = BTreeMap::new();
     let mut anchors = BTreeMap::new();
-    let mut logical_rows = BTreeMap::<u32, BTreeMap<u32, Vec<u32>>>::new();
     for anchored in maps {
         let map = anchored.map();
-        let anchor = anchored.resume_anchor();
-        let mut nonempty = vec![0u8; params.map_height() as usize / 8];
-        let mut extended = vec![0u8; nonempty.len()];
-        let mut rows = BTreeMap::new();
-        let mut previous = None;
-        let mut marks = 0u64;
-        let mut row_lengths = Vec::new();
-        for row in map.rows() {
-            let row_index = row.row_index();
-            if row_index >= params.map_height() ||
-                previous.is_some_and(|previous| row_index <= previous) ||
-                row.columns().is_empty() ||
-                row.columns().iter().any(|&column| column >= params.map_width())
-            {
-                return Err(FilterMapStorageError::MalformedRow {
-                    map_index: map.map_index(),
-                    row_index,
-                })
-            }
-            previous = Some(row_index);
-            let row_length = u32::try_from(row.columns().len())
-                .map_err(|_| FilterMapStorageError::Arithmetic)?;
-            marks = marks
-                .checked_add(u64::from(row_length))
-                .ok_or(FilterMapStorageError::Arithmetic)?;
-            row_lengths.push(row_length);
-            set_bit(&mut nonempty, row_index);
-            if row.columns().len() > params.base_row_length() as usize {
-                set_bit(&mut extended, row_index);
-            }
-            rows.insert(row_index, row.columns().to_vec());
-        }
-        let directory = StoredMapRowDirectory::new(
-            params_id,
-            nonempty,
-            extended,
-            u32::try_from(rows.len()).map_err(|_| FilterMapStorageError::Arithmetic)?,
-            marks,
-            row_lengths,
-        )?;
-        directories.insert(map.map_index(), directory);
-        anchors.insert(map.map_index(), anchor_to_db(anchor));
-        logical_rows.insert(map.map_index(), rows);
+        let rows = map.rows().iter().map(|row| (row.row_index(), row.columns()));
+        let map_rows = EncodedMap::new(identity.params, map.map_index(), rows)?;
+        directories.insert(map.map_index(), map_rows.directory().clone());
+        anchors.insert(map.map_index(), anchor_to_db(anchored.resume_anchor()));
+        encoded.push(map_rows);
     }
 
     let pointers = normalize_pointers(&identity, start, maps)?;
@@ -117,7 +78,7 @@ pub(crate) fn build_publication<TX: DbTx>(
     if target_covered.iter().any(|covered| *covered) {
         if target_covered.iter().all(|covered| *covered) &&
             retry_coverage_matches(&current, start, maps) &&
-            publication_matches(tx, &identity, &logical_rows, &directories, &anchors, &pointers)?
+            publication_matches(tx, &encoded, &anchors, &pointers)?
         {
             return Ok(PublicationProposal::Noop)
         }
@@ -133,59 +94,11 @@ pub(crate) fn build_publication<TX: DbTx>(
         PublicationStart::Extend { from } => proposed.extend_batch(*from, map_anchors)?,
     }
 
-    let mut base_groups = BTreeMap::new();
-    let mut extensions = BTreeMap::new();
-    for anchored in maps {
-        let map_index = anchored.map().map_index();
-        let old_directory = tx.get::<FilterMapDirectories>(map_index)?;
-        if old_directory.as_ref().is_some_and(|directory| directory.params_id != params_id) {
-            return Err(FilterMapStorageError::KeyValueMismatch {
-                kind: "stale directory parameter identity",
-                key: u64::from(map_index),
-            })
-        }
-        let new_rows = &logical_rows[&map_index];
-        let mut affected = BTreeSet::new();
-        if let Some(directory) = &old_directory {
-            for row in 0..params.map_height() {
-                if directory.is_nonempty(row) {
-                    affected.insert(row);
-                }
-            }
-        }
-        affected.extend(new_rows.keys().copied());
-
-        for row_index in affected {
-            let base_key = FilterMapBaseRowKey::new(params_id, map_index, row_index)?;
-            if let std::collections::btree_map::Entry::Vacant(entry) = base_groups.entry(base_key) {
-                let group = tx
-                    .get::<FilterMapBaseRows>(base_key)?
-                    .unwrap_or(StoredBaseRowGroup::empty(params_id)?);
-                if group.params_id != params_id {
-                    return Err(FilterMapStorageError::KeyValueMismatch {
-                        kind: "base group parameter identity",
-                        key: base_key.get(),
-                    })
-                }
-                entry.insert(group);
-            }
-            let group = base_groups.get_mut(&base_key).expect("inserted above");
-            let slot = FilterMapBaseRowKey::slot(params_id, map_index)?;
-            group.slots[slot].clear();
-            let extension_key = FilterMapExtendedRowKey::new(params_id, map_index, row_index)?;
-            extensions.insert(extension_key, None);
-            if let Some(columns) = new_rows.get(&row_index) {
-                let split = columns.len().min(params.base_row_length() as usize);
-                group.slots[slot].extend_from_slice(&columns[..split]);
-                if split < columns.len() {
-                    extensions.insert(
-                        extension_key,
-                        Some(StoredExtendedRow::new(params_id, columns[split..].to_vec())?),
-                    );
-                }
-            }
-        }
+    let mut rows = RowWrites::default();
+    for map_rows in &encoded {
+        map_rows.stage(tx, &mut rows)?;
     }
+    let RowWrites { base_groups, extensions } = rows;
 
     Ok(PublicationProposal::Write(PublicationWrites {
         base_groups,
@@ -356,24 +269,15 @@ fn retry_coverage_matches(
 
 fn publication_matches<TX: DbTx>(
     tx: &TX,
-    identity: &IndexIdentity,
-    rows: &BTreeMap<u32, BTreeMap<u32, Vec<u32>>>,
-    directories: &BTreeMap<u32, StoredMapRowDirectory>,
+    encoded: &[EncodedMap],
     anchors: &BTreeMap<u32, StoredMapResumeAnchor>,
     pointers: &BTreeMap<u64, StoredBlockPointer>,
 ) -> Result<bool> {
-    for (&map_index, expected) in directories {
-        if tx.get::<FilterMapDirectories>(map_index)?.as_ref() != Some(expected) ||
-            tx.get::<FilterMapAnchors>(map_index)?.as_ref() != anchors.get(&map_index)
+    for map_rows in encoded {
+        let map_index = map_rows.map_index();
+        if tx.get::<FilterMapAnchors>(map_index)?.as_ref() != anchors.get(&map_index) ||
+            !map_rows.is_stored(tx)?
         {
-            return Ok(false)
-        }
-        let actual = match read_map_rows(tx, identity, map_index, expected, true) {
-            Ok(actual) => actual,
-            Err(FilterMapStorageError::ContradictedPayload { .. }) => return Ok(false),
-            Err(error) => return Err(error),
-        };
-        if &actual != rows.get(&map_index).expect("publication rows are complete") {
             return Ok(false)
         }
     }
@@ -383,8 +287,4 @@ fn publication_matches<TX: DbTx>(
         }
     }
     Ok(true)
-}
-
-fn set_bit(bitmap: &mut [u8], row: u32) {
-    bitmap[row as usize / 8] |= 1 << (row % 8);
 }

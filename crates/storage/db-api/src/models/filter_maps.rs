@@ -1005,23 +1005,41 @@ mod tests {
         assert!(row0_map0 < row0_map1);
         assert!(row0_map1 < row1_map0);
         assert_eq!(FilterMapBaseRowKey(1).validate(1), Err(FilterMapModelError::GroupMisalignment));
-        let aligned = FilterMapBaseRowKey::new(1, 32, 7).unwrap().validate(1).unwrap();
-        assert_eq!(aligned.group_start, 32);
-        assert_eq!(aligned.row_index, 7);
 
         for params_id in [1, 2] {
             let epoch0 = FilterMapRowKeyRange::complete_epoch(params_id, 0).unwrap();
             let epoch1 = FilterMapRowKeyRange::complete_epoch(params_id, 1).unwrap();
             assert!(epoch0.end < epoch1.start);
         }
+    }
 
-        let range_map0 = FilterMapBaseRowKey::new(2, 0, 7).unwrap();
-        let range_map1 = FilterMapBaseRowKey::new(2, 1, 7).unwrap();
-        assert_ne!(range_map0, range_map1);
-        assert_eq!(FilterMapBaseRowKey::slot(2, 0).unwrap(), 0);
-        assert_eq!(FilterMapBaseRowKey::slot(2, 1).unwrap(), 0);
-        assert_eq!(range_map1.validate(2).unwrap().group_start, 1);
-        assert_eq!(range_map1.validate(2).unwrap().row_index, 7);
+    /// Every reader and writer locates a map's base row as `(key, slot)`; decoding the key must
+    /// give back the group that `slot` indexes into, and that group must never span an epoch.
+    #[test]
+    fn base_row_key_and_slot_recompose_the_map_index() {
+        for params_id in [1, 2] {
+            let limits = params(params_id).unwrap();
+            let epoch = limits.maps_per_epoch;
+            let group = limits.group_size;
+            let maps = [0, 1, group - 1, group, group + 1, epoch - 1, epoch, epoch + 1]
+                .into_iter()
+                .chain([2 * epoch + group + 3, u32::MAX - epoch, u32::MAX]);
+            for map_index in maps {
+                let slot = FilterMapBaseRowKey::slot(params_id, map_index).unwrap();
+                assert!(slot < GROUP_SIZE, "params {params_id}, map {map_index}");
+                for row_index in [0, 1, limits.map_height - 1] {
+                    let key = FilterMapBaseRowKey::new(params_id, map_index, row_index).unwrap();
+                    let coordinates = key.validate(params_id).unwrap();
+                    assert_eq!(coordinates.row_index, row_index);
+                    assert_eq!(
+                        u64::from(coordinates.group_start) + slot as u64,
+                        u64::from(map_index),
+                        "params {params_id}, map {map_index}, row {row_index}"
+                    );
+                    assert_eq!(coordinates.group_start / epoch, map_index / epoch);
+                }
+            }
+        }
     }
 
     #[test]
