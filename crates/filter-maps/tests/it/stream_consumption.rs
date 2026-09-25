@@ -3,9 +3,9 @@
 use alloy_eips::BlockNumHash;
 use alloy_primitives::B256;
 use reth_filter_maps::{
-    BatchContinuation, BlockInput, LogInput, LogValueSlot, LogValueStream,
+    BatchContinuation, BlockInput, BlockPointer, LogInput, LogValueSlot, LogValueStream,
     LogValueStreamCompletion, LogValueStreamError, LogValueStreamEvent, LogValueStreamItem,
-    LogValueStreamTermination, ValueSpaceAnchor, DEFAULT_PARAMS, RANGE_TEST_PARAMS,
+    LogValueStreamTermination, DEFAULT_PARAMS, RANGE_TEST_PARAMS,
 };
 use std::cell::Cell;
 
@@ -44,7 +44,7 @@ fn composition_block(number: u64, topics: usize) -> BlockInput {
     )
 }
 
-fn three_batch_output(anchor: ValueSpaceAnchor, blocks: &[BlockInput]) -> Vec<LogValueStreamItem> {
+fn three_batch_output(anchor: BlockPointer, blocks: &[BlockInput]) -> Vec<LogValueStreamItem> {
     assert_eq!(blocks.len(), 3);
     let mut output = Vec::new();
     let mut continuation = None;
@@ -98,7 +98,7 @@ fn three_bounded_batches_equal_uninterrupted_traversal_across_boundary_kinds() {
             .enumerate()
             .map(|(offset, topics)| composition_block(10 + offset as u64, topics))
             .collect::<Vec<_>>();
-        let anchor = ValueSpaceAnchor::new(blocks[0].number, blocks[0].hash, start);
+        let anchor = BlockPointer::new(blocks[0].number, blocks[0].hash, start);
         let uninterrupted = LogValueStream::new(
             DEFAULT_PARAMS,
             anchor,
@@ -133,7 +133,7 @@ fn construction_and_map_limited_consumer_do_not_exhaust_input() {
     let input = NonCloneBlocks { fetched: &fetched, next_number: 0 };
     let mut stream = LogValueStream::new(
         DEFAULT_PARAMS,
-        ValueSpaceAnchor::new(0, B256::ZERO, DEFAULT_PARAMS.values_per_map() - 1),
+        BlockPointer::new(0, B256::ZERO, DEFAULT_PARAMS.values_per_map() - 1),
         input,
         LogValueStreamTermination::ReachedHead,
     );
@@ -175,7 +175,7 @@ fn continuation_construction_is_lazy() {
 #[test]
 fn a_paused_consumer_and_its_clone_preserve_the_exact_suffix() {
     let blocks = [block(10, 0), block(11, 2)];
-    let anchor = ValueSpaceAnchor::new(10, B256::ZERO, DEFAULT_PARAMS.values_per_map() - 2);
+    let anchor = BlockPointer::new(10, B256::ZERO, DEFAULT_PARAMS.values_per_map() - 2);
     let expected = LogValueStream::new(
         DEFAULT_PARAMS,
         anchor,
@@ -200,7 +200,7 @@ fn anchored_first_log_cannot_require_padding() {
     let index = DEFAULT_PARAMS.values_per_map() - 1;
     let mut stream = LogValueStream::new(
         DEFAULT_PARAMS,
-        ValueSpaceAnchor::new(0, B256::ZERO, index),
+        BlockPointer::new(0, B256::ZERO, index),
         [block(0, 1)],
         LogValueStreamTermination::ReachedHead,
     );
@@ -216,7 +216,7 @@ fn anchored_first_log_cannot_require_padding() {
 fn searchable_value_overflow_is_block_atomic() {
     let mut stream = LogValueStream::new(
         DEFAULT_PARAMS,
-        ValueSpaceAnchor::new(0, B256::ZERO, u64::MAX),
+        BlockPointer::new(0, B256::ZERO, u64::MAX),
         [block(0, 0)],
         LogValueStreamTermination::ReachedHead,
     );
@@ -247,7 +247,7 @@ fn late_arithmetic_failure_prevents_the_blocks_pointer_escaping() {
     input.logs.push(LogInput::new(Default::default(), []));
     let mut stream = LogValueStream::new(
         RANGE_TEST_PARAMS,
-        ValueSpaceAnchor::new(10, B256::ZERO, u64::from(u32::MAX)),
+        BlockPointer::new(10, B256::ZERO, u64::from(u32::MAX)),
         [input],
         LogValueStreamTermination::ReachedHead,
     );
@@ -262,7 +262,7 @@ fn late_arithmetic_failure_prevents_the_blocks_pointer_escaping() {
 fn lookahead_is_not_validated_as_an_active_block() {
     let mut stream = LogValueStream::new(
         RANGE_TEST_PARAMS,
-        ValueSpaceAnchor::new(10, B256::ZERO, 0),
+        BlockPointer::new(10, B256::ZERO, 0),
         [block(10, 0), block(11, 5)],
         LogValueStreamTermination::ReachedHead,
     );
@@ -282,7 +282,7 @@ fn successor_number_error_timing_is_preserved() {
     for (index, events_before_error) in [(0, 3), (DEFAULT_PARAMS.values_per_map() - 2, 0)] {
         let mut stream = LogValueStream::new(
             DEFAULT_PARAMS,
-            ValueSpaceAnchor::new(10, B256::ZERO, index),
+            BlockPointer::new(10, B256::ZERO, index),
             [block(10, 0), block(12, 0)],
             LogValueStreamTermination::ReachedHead,
         );

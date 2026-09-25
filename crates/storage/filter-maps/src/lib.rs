@@ -66,8 +66,8 @@ mod tests {
             StoredCoverageRecord, StoredSegmentOrigin, StoredSegmentRecord,
             StructurallyRestoredCoverage, STORAGE_FORMAT_V1,
         },
-        BlockInput, FilterMapMatchSource, FilterMapRenderer, LogInput, LogValueStream,
-        LogValueStreamTermination, ParamsId, RendererOutput, ValueSpaceAnchor, DEFAULT_PARAMS,
+        BlockInput, BlockPointer, FilterMapMatchSource, FilterMapRenderer, LogInput,
+        LogValueStream, LogValueStreamTermination, ParamsId, RendererOutput, DEFAULT_PARAMS,
         GETH_V1, RANGE_TEST_PARAMS,
     };
 
@@ -170,7 +170,7 @@ mod tests {
         ];
         let stream = LogValueStream::new(
             DEFAULT_PARAMS,
-            ValueSpaceAnchor::new(0, B256::ZERO, 0),
+            BlockPointer::new(0, B256::ZERO, 0),
             blocks,
             LogValueStreamTermination::ReachedHead,
         );
@@ -244,7 +244,7 @@ mod tests {
             .collect::<Vec<_>>();
         let stream = LogValueStream::new(
             RANGE_TEST_PARAMS,
-            ValueSpaceAnchor::new(0, B256::ZERO, 0),
+            BlockPointer::new(0, B256::ZERO, 0),
             blocks,
             LogValueStreamTermination::ReachedHead,
         );
@@ -270,7 +270,7 @@ mod tests {
         ];
         let stream = LogValueStream::new(
             RANGE_TEST_PARAMS,
-            ValueSpaceAnchor::new(0, B256::ZERO, 0),
+            BlockPointer::new(0, B256::ZERO, 0),
             blocks,
             LogValueStreamTermination::ReachedHead,
         );

@@ -16,7 +16,7 @@ use reth_filter_maps::{
     },
     BlockInput, BlockPointer, IndexedMatchRange, LogInput, LogValueSlot, LogValueStream,
     LogValueStreamCompletion, LogValueStreamEvent, LogValueStreamItem, LogValueStreamTermination,
-    MapBoundary, ParamsId, ValueSpaceAnchor, GETH_V1, RANGE_TEST_PARAMS,
+    MapBoundary, ParamsId, GETH_V1, RANGE_TEST_PARAMS,
 };
 use std::{
     collections::{BTreeMap, HashMap},
@@ -59,14 +59,14 @@ struct Observed {
 }
 
 /// Drives a stream from `anchor` and pairs every boundary with its resume block's pointer.
-fn observe(anchor: ValueSpaceAnchor, blocks: Vec<BlockInput>, next_block: u64) -> Vec<Observed> {
+fn observe(anchor: BlockPointer, blocks: Vec<BlockInput>, next_block: u64) -> Vec<Observed> {
     observe_with_pointers(anchor, blocks, next_block).0
 }
 
 /// Like [`observe`], also returning every block pointer the stream established, which is what a
 /// publication of these maps would store.
 fn observe_with_pointers(
-    anchor: ValueSpaceAnchor,
+    anchor: BlockPointer,
     blocks: Vec<BlockInput>,
     next_block: u64,
 ) -> (Vec<Observed>, BTreeMap<u64, BlockPointer>) {
@@ -131,7 +131,7 @@ fn observe_with_pointers(
 }
 
 fn genesis() -> (Vec<Observed>, BTreeMap<u64, BlockPointer>) {
-    observe_with_pointers(ValueSpaceAnchor::new(0, hash(0), 0), chain(), 6)
+    observe_with_pointers(BlockPointer::new(0, hash(0), 0), chain(), 6)
 }
 
 fn genesis_anchors() -> Vec<Observed> {
@@ -253,7 +253,7 @@ fn a_checkpoint_segment_joins_genesis_construction_only_at_the_same_anchor() {
 
     // Construction from the checkpoint reproduces the same anchors as genesis construction, the
     // join anchor included: the resumed block re-renders its slot in map 4.
-    let from_checkpoint = observe(join.resume_anchor(), chain()[3..].to_vec(), 6);
+    let from_checkpoint = observe(join.pointer, chain()[3..].to_vec(), 6);
     let expected: Vec<_> = observed[join_at..].iter().map(|o| o.anchor).collect();
     let reproduced: Vec<_> = from_checkpoint.iter().map(|o| o.anchor).collect();
     assert_eq!(reproduced, expected, "a checkpoint enters the same value space");

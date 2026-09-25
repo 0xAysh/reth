@@ -81,7 +81,7 @@ where
                 return Err(RendererError::ResumeFromContinuation { actual })
             }
         };
-        let expected = anchor.resume_anchor();
+        let expected = anchor.pointer;
         if actual != expected {
             return Err(RendererError::StartAnchorMismatch { expected, actual })
         }

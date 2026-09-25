@@ -8,7 +8,7 @@ use alloy_primitives::{Address, B256};
 use reth_filter_maps::{
     BatchContinuation, BlockInput, BlockPointer, LogInput, LogValueSlot, LogValueStream,
     LogValueStreamCompletion, LogValueStreamEvent, LogValueStreamItem, LogValueStreamTermination,
-    MapBoundary, Params, ValueSpaceAnchor, DEFAULT_PARAMS, RANGE_TEST_PARAMS,
+    MapBoundary, Params, DEFAULT_PARAMS, RANGE_TEST_PARAMS,
 };
 
 fn block(number: u64, logs: impl IntoIterator<Item = LogInput>) -> BlockInput {
@@ -121,11 +121,7 @@ enum PointerTiming {
     OneAdditionalPointer,
 }
 
-fn all_slots(
-    params: Params,
-    anchor: ValueSpaceAnchor,
-    blocks: Vec<BlockInput>,
-) -> Vec<LogValueSlot> {
+fn all_slots(params: Params, anchor: BlockPointer, blocks: Vec<BlockInput>) -> Vec<LogValueSlot> {
     LogValueStream::new(params, anchor, blocks, LogValueStreamTermination::ReachedHead)
         .map(|item| item.unwrap())
         .filter_map(|item| match item {
@@ -137,7 +133,7 @@ fn all_slots(
 
 fn assert_durable_restart(
     params: Params,
-    anchor: ValueSpaceAnchor,
+    anchor: BlockPointer,
     blocks: Vec<BlockInput>,
     batch_end: Option<usize>,
     expected_timing: PointerTiming,
@@ -230,7 +226,7 @@ fn assert_durable_restart(
                 block.hash == persisted.resume_block.hash
         })
         .expect("persisted canonical identity selects the restart input");
-    let restart_anchor = ValueSpaceAnchor::new(
+    let restart_anchor = BlockPointer::new(
         persisted.resume_block.number,
         persisted.resume_block.hash,
         persisted.resume_pointer,
@@ -251,7 +247,7 @@ fn searchable_value_completion_publishes_with_the_pointer_already_available() {
     let blocks = vec![block(10, [log(0)]), block(11, [log(0)])];
     assert_durable_restart(
         DEFAULT_PARAMS,
-        ValueSpaceAnchor::new(10, blocks[0].hash, map_size - 1),
+        BlockPointer::new(10, blocks[0].hash, map_size - 1),
         blocks,
         None,
         PointerTiming::AvailableAtBoundary,
@@ -264,7 +260,7 @@ fn delimiter_completion_waits_one_pointer_for_a_non_empty_successor() {
     let blocks = vec![block(10, [log(0)]), block(11, [log(0)])];
     assert_durable_restart(
         DEFAULT_PARAMS,
-        ValueSpaceAnchor::new(10, blocks[0].hash, map_size - 2),
+        BlockPointer::new(10, blocks[0].hash, map_size - 2),
         blocks,
         None,
         PointerTiming::OneAdditionalPointer,
@@ -277,7 +273,7 @@ fn delimiter_completion_waits_one_pointer_for_an_empty_successor() {
     let blocks = vec![block(10, [log(0)]), block(11, []), block(12, [log(0)])];
     assert_durable_restart(
         DEFAULT_PARAMS,
-        ValueSpaceAnchor::new(10, blocks[0].hash, map_size - 2),
+        BlockPointer::new(10, blocks[0].hash, map_size - 2),
         blocks,
         None,
         PointerTiming::OneAdditionalPointer,
@@ -290,7 +286,7 @@ fn padding_completion_waits_one_pointer_for_the_upcoming_block() {
     let blocks = vec![block(10, []), block(11, [log(1)])];
     assert_durable_restart(
         DEFAULT_PARAMS,
-        ValueSpaceAnchor::new(10, blocks[0].hash, map_size - 2),
+        BlockPointer::new(10, blocks[0].hash, map_size - 2),
         blocks,
         None,
         PointerTiming::OneAdditionalPointer,
@@ -302,7 +298,7 @@ fn a_block_spanning_multiple_maps_reuses_its_available_pointer() {
     let blocks = vec![block(10, [log(0), log(0), log(0)])];
     assert_durable_restart(
         RANGE_TEST_PARAMS,
-        ValueSpaceAnchor::new(10, blocks[0].hash, 0),
+        BlockPointer::new(10, blocks[0].hash, 0),
         blocks,
         None,
         PointerTiming::AvailableAtBoundary,
@@ -315,7 +311,7 @@ fn bounded_batch_ending_at_a_boundary_waits_for_the_next_batches_pointer() {
     let blocks = vec![block(10, []), block(11, [log(0)])];
     assert_durable_restart(
         DEFAULT_PARAMS,
-        ValueSpaceAnchor::new(10, blocks[0].hash, map_size - 1),
+        BlockPointer::new(10, blocks[0].hash, map_size - 1),
         blocks,
         Some(1),
         PointerTiming::OneAdditionalPointer,
@@ -330,7 +326,7 @@ fn a_pending_head_delimiter_at_a_map_boundary_is_not_a_completed_map() {
     let mut renderer = StatefulRenderer::new(&mut storage);
     let stream = LogValueStream::new(
         DEFAULT_PARAMS,
-        ValueSpaceAnchor::new(10, head.hash, map_size),
+        BlockPointer::new(10, head.hash, map_size),
         [head],
         LogValueStreamTermination::ReachedHead,
     );
@@ -353,7 +349,7 @@ fn batch_continuation_retains_identity_and_the_pre_padding_cursor() {
     let next_block = BlockNumHash::new(second.number, second.hash);
     let items = LogValueStream::new(
         DEFAULT_PARAMS,
-        ValueSpaceAnchor::new(first.number, first.hash, map_size - 2),
+        BlockPointer::new(first.number, first.hash, map_size - 2),
         [first],
         LogValueStreamTermination::BatchExhausted { next_block },
     )

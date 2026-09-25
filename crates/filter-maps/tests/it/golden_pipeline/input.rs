@@ -4,7 +4,7 @@ use super::parser::{Block, Fixture, Origin, ParamsName, Termination};
 use alloy_eips::BlockNumHash;
 use reth_filter_maps::{
     BatchContinuation, BlockInput, BlockPointer, FilterMapRenderer, LogInput, LogValueStream,
-    LogValueStreamTermination, Params, ValueSpaceAnchor, DEFAULT_PARAMS, RANGE_TEST_PARAMS,
+    LogValueStreamTermination, Params, DEFAULT_PARAMS, RANGE_TEST_PARAMS,
 };
 
 pub(super) const fn params(name: ParamsName) -> Params {
@@ -46,7 +46,7 @@ pub(super) fn stream<I: Iterator<Item = BlockInput>>(
     match fixture.origin {
         Origin::Genesis(anchor) | Origin::Checkpoint(anchor) => LogValueStream::new(
             params,
-            ValueSpaceAnchor::new(anchor.block, anchor.hash, anchor.index),
+            BlockPointer::new(anchor.block, anchor.hash, anchor.index),
             blocks,
             termination,
         ),

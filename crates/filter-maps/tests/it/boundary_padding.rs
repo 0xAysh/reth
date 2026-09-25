@@ -6,7 +6,7 @@ use reth_filter_maps::{
     address_value, topic_value, BatchContinuation, BlockInput, BlockPointer, LogInput,
     LogValueKind, LogValueSlot, LogValueStream, LogValueStreamCompletion, LogValueStreamError,
     LogValueStreamEvent, LogValueStreamItem, LogValueStreamTermination, MapBoundary,
-    PendingDelimiter, ValueSpaceAnchor, DEFAULT_PARAMS, RANGE_TEST_PARAMS,
+    PendingDelimiter, DEFAULT_PARAMS, RANGE_TEST_PARAMS,
 };
 
 const fn value(index: u64, hash: B256, kind: LogValueKind) -> LogValueStreamItem {
@@ -31,7 +31,7 @@ fn a_log_that_exactly_fits_the_map_remainder_is_not_padded() {
     let address = Address::repeat_byte(0xaa);
     let topic = B256::repeat_byte(0x01);
     let block = BlockInput::new(0, block_hash, [LogInput::new(address, [topic])]);
-    let anchor = ValueSpaceAnchor::new(0, block_hash, 65_534);
+    let anchor = BlockPointer::new(0, block_hash, 65_534);
 
     let actual = LogValueStream::new(
         DEFAULT_PARAMS,
@@ -80,7 +80,7 @@ fn a_log_one_slot_wider_than_the_remainder_moves_intact_to_the_next_map() {
         block_hash,
         [LogInput::new(first_address, []), LogInput::new(second_address, topics)],
     );
-    let anchor = ValueSpaceAnchor::new(0, block_hash, 65_532);
+    let anchor = BlockPointer::new(0, block_hash, 65_532);
 
     let actual = LogValueStream::new(
         DEFAULT_PARAMS,
@@ -131,7 +131,7 @@ fn padding_before_a_blocks_first_log_places_its_pointer_after_the_padding() {
         BlockInput::new(0, first_hash, [LogInput::new(first_address, [])]),
         BlockInput::new(1, second_hash, [LogInput::new(second_address, [topic])]),
     ];
-    let anchor = ValueSpaceAnchor::new(0, first_hash, 65_533);
+    let anchor = BlockPointer::new(0, first_hash, 65_533);
 
     let actual =
         LogValueStream::new(DEFAULT_PARAMS, anchor, blocks, LogValueStreamTermination::ReachedHead)
@@ -178,7 +178,7 @@ fn a_delimiter_occupies_the_last_map_slot_without_padding() {
         BlockInput::new(0, first_hash, [LogInput::new(address, [])]),
         BlockInput::new(1, second_hash, []),
     ];
-    let anchor = ValueSpaceAnchor::new(0, first_hash, 65_534);
+    let anchor = BlockPointer::new(0, first_hash, 65_534);
 
     let actual =
         LogValueStream::new(DEFAULT_PARAMS, anchor, blocks, LogValueStreamTermination::ReachedHead)
@@ -222,7 +222,7 @@ fn an_oversized_later_log_emits_no_events_from_its_block() {
             LogInput::new(Address::repeat_byte(0xbb), [B256::repeat_byte(0x01)]),
         ],
     );
-    let anchor = ValueSpaceAnchor::new(0, block_hash, 0);
+    let anchor = BlockPointer::new(0, block_hash, 0);
     let mut stream = LogValueStream::new(
         RANGE_TEST_PARAMS,
         anchor,
@@ -255,7 +255,7 @@ fn an_oversized_later_block_emits_no_events_from_the_failing_block() {
             [LogInput::new(Address::repeat_byte(0xbb), [B256::repeat_byte(0x01)])],
         ),
     ];
-    let anchor = ValueSpaceAnchor::new(0, first_hash, 0);
+    let anchor = BlockPointer::new(0, first_hash, 0);
     let mut stream = LogValueStream::new(
         RANGE_TEST_PARAMS,
         anchor,
@@ -291,7 +291,7 @@ fn invalid_topic_count_takes_precedence_over_impossible_map_geometry() {
     let block_hash = B256::repeat_byte(0x11);
     let topics = (0..5).map(B256::repeat_byte);
     let block = BlockInput::new(0, block_hash, [LogInput::new(Address::repeat_byte(0xaa), topics)]);
-    let anchor = ValueSpaceAnchor::new(0, block_hash, 0);
+    let anchor = BlockPointer::new(0, block_hash, 0);
     let mut stream = LogValueStream::new(
         RANGE_TEST_PARAMS,
         anchor,
@@ -318,7 +318,7 @@ fn a_log_wider_than_a_map_returns_a_typed_error_before_its_block() {
         block_hash,
         [LogInput::new(Address::repeat_byte(0xaa), [B256::repeat_byte(0x01)])],
     );
-    let anchor = ValueSpaceAnchor::new(0, block_hash, 0);
+    let anchor = BlockPointer::new(0, block_hash, 0);
     let mut stream = LogValueStream::new(
         RANGE_TEST_PARAMS,
         anchor,

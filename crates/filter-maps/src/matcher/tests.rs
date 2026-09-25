@@ -497,7 +497,7 @@ fn render_fixture(
     use crate::{
         golden_pipeline::parser::{Origin, ParamsName, Termination},
         BatchContinuation, BlockInput, BlockPointer, FilterMapRenderer, LogInput, LogValueStream,
-        LogValueStreamTermination, ValueSpaceAnchor, RANGE_TEST_PARAMS,
+        LogValueStreamTermination, RANGE_TEST_PARAMS,
     };
     use alloy_eips::BlockNumHash;
 
@@ -523,7 +523,7 @@ fn render_fixture(
         Origin::Genesis(origin) | Origin::Checkpoint(origin) => (
             LogValueStream::new(
                 params,
-                ValueSpaceAnchor::new(origin.block, origin.hash, origin.index),
+                BlockPointer::new(origin.block, origin.hash, origin.index),
                 blocks,
                 termination,
             ),

@@ -1,6 +1,6 @@
 use crate::{
     coverage::ResumeAnchorMismatch, BatchContinuation, BlockPointer, LogValueStreamError,
-    MapBoundary, Params, PendingDelimiter, ValueSpaceAnchor,
+    MapBoundary, Params, PendingDelimiter,
 };
 use alloy_primitives::B256;
 
@@ -17,7 +17,7 @@ pub enum RendererError {
     #[error("renderer requires a genesis anchor at block 0, index 0")]
     InvalidGenesisStart {
         /// Configured stream anchor.
-        actual: ValueSpaceAnchor,
+        actual: BlockPointer,
     },
     /// A genesis renderer was given a raw batch continuation.
     #[error("renderer cannot start genesis from a batch continuation")]
@@ -29,9 +29,9 @@ pub enum RendererError {
     #[error("renderer resume stream anchor does not match its map resume anchor")]
     StartAnchorMismatch {
         /// Required stream anchor.
-        expected: ValueSpaceAnchor,
+        expected: BlockPointer,
         /// Configured stream anchor.
-        actual: ValueSpaceAnchor,
+        actual: BlockPointer,
     },
     /// A durable renderer resume was attempted from a raw continuation stream.
     #[error("renderer cannot durably resume from a batch-continuation stream")]

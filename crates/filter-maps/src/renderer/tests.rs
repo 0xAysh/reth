@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
-    coverage::MapResumeAnchor, LogInput, LogValueKind, RendererError, ValueSpaceAnchor,
-    DEFAULT_PARAMS, RANGE_TEST_PARAMS,
+    coverage::MapResumeAnchor, BlockPointer, LogInput, LogValueKind, RendererError, DEFAULT_PARAMS,
+    RANGE_TEST_PARAMS,
 };
 use alloy_eips::BlockNumHash;
 use alloy_primitives::{Address, B256};
@@ -25,7 +25,7 @@ fn genesis_stream(
     let genesis_hash = blocks[0].hash;
     LogValueStream::new(
         RANGE_TEST_PARAMS,
-        ValueSpaceAnchor::new(0, genesis_hash, 0),
+        BlockPointer::new(0, genesis_hash, 0),
         blocks,
         termination,
     )
@@ -67,7 +67,7 @@ fn completed_maps_are_anchored_and_returned_one_per_pull() {
         second.map().block_pointers().iter().map(|p| p.block_number).collect::<Vec<_>>(),
         [1]
     );
-    assert_eq!(second.resume_anchor().resume_anchor(), ValueSpaceAnchor::new(1, hash(1), 2));
+    assert_eq!(second.resume_anchor().pointer, BlockPointer::new(1, hash(1), 2));
 
     assert!(matches!(
         renderer.render_next(),
@@ -81,7 +81,7 @@ fn every_typed_value_is_marked_regardless_of_kind_or_zero_bytes() {
     let input = block(0, []);
     let stream = LogValueStream::new(
         DEFAULT_PARAMS,
-        ValueSpaceAnchor::new(0, input.hash, 0),
+        BlockPointer::new(0, input.hash, 0),
         vec![input],
         LogValueStreamTermination::ReachedHead,
     );
@@ -116,7 +116,7 @@ fn durable_resume_suppresses_the_published_prefix() {
     .unwrap();
     let stream = LogValueStream::new(
         RANGE_TEST_PARAMS,
-        anchor.resume_anchor(),
+        anchor.pointer,
         vec![genesis, child],
         LogValueStreamTermination::ReachedHead,
     );
@@ -133,7 +133,7 @@ fn durable_resume_rejects_mismatched_starts_and_replay_jumps() {
     let anchor = MapResumeAnchor::new(MapBoundary::new(0, 0, hash(0)), pointer).unwrap();
     let stream = LogValueStream::new(
         RANGE_TEST_PARAMS,
-        ValueSpaceAnchor::new(0, hash(0), 1),
+        BlockPointer::new(0, hash(0), 1),
         vec![block(0, [])],
         LogValueStreamTermination::ReachedHead,
     );
@@ -147,7 +147,7 @@ fn durable_resume_rejects_mismatched_starts_and_replay_jumps() {
         MapResumeAnchor::new(MapBoundary::new(0, 0, hash(0)), jumped_pointer).unwrap();
     let stream = LogValueStream::new(
         RANGE_TEST_PARAMS,
-        jumped_anchor.resume_anchor(),
+        jumped_anchor.pointer,
         vec![block(0, [log(1, [])])],
         LogValueStreamTermination::ReachedHead,
     );
@@ -390,7 +390,7 @@ fn malformed_event_errors_follow_protocol_precedence() {
 
 #[test]
 fn constructors_reject_invalid_starts_without_advancing_input() {
-    let actual = ValueSpaceAnchor::new(1, hash(1), 0);
+    let actual = BlockPointer::new(1, hash(1), 0);
     let stream = LogValueStream::new(
         RANGE_TEST_PARAMS,
         actual,

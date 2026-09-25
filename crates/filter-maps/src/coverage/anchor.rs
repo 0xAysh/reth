@@ -1,8 +1,7 @@
 //! Durable map and value-space anchors.
 
 use crate::{
-    coverage::IndexIdentity, BlockPointer, MapBoundary, Params, ValueSpaceAnchor,
-    ValueSpaceVersion, GETH_V1,
+    coverage::IndexIdentity, BlockPointer, MapBoundary, Params, ValueSpaceVersion, GETH_V1,
 };
 
 /// Durable restart metadata for one completed filter map.
@@ -37,15 +36,6 @@ impl MapResumeAnchor {
             return Err(ResumeAnchorMismatch { boundary, pointer })
         }
         Ok(Self { completed_map_index: boundary.completed_map_index, pointer, value_space_version })
-    }
-
-    /// Returns the anchor at which streaming resumes.
-    pub const fn resume_anchor(&self) -> ValueSpaceAnchor {
-        ValueSpaceAnchor::new(
-            self.pointer.block_number,
-            self.pointer.block_hash,
-            self.pointer.first_log_value_index,
-        )
     }
 
     /// Returns the last block closed by the completed map.
@@ -204,7 +194,7 @@ mod tests {
         let pointer = BlockPointer::new(42, hash(42), 500_000);
         let anchor = MapResumeAnchor::new(boundary, pointer).unwrap();
         assert_eq!(anchor.completed_map_index, 7);
-        assert_eq!(anchor.resume_anchor(), ValueSpaceAnchor::new(42, hash(42), 500_000));
+        assert_eq!(anchor.pointer, pointer);
         assert_eq!(anchor.covered_through(), Some(41));
     }
 
@@ -263,9 +253,6 @@ mod tests {
         let checkpoint = checkpoint();
         assert_eq!(checkpoint.identity(), &identity());
         assert_eq!(checkpoint.provenance(), CheckpointProvenance::Recognized { id: 7 });
-        assert_eq!(
-            checkpoint.anchor().resume_anchor(),
-            ValueSpaceAnchor::new(1000, hash(0x10), 123_456)
-        );
+        assert_eq!(checkpoint.anchor().pointer, BlockPointer::new(1000, hash(0x10), 123_456));
     }
 }

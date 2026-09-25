@@ -11,7 +11,7 @@ use reth_filter_maps::{
     },
     AnchoredCompletedMap, BlockInput, BlockPointer, FilterMapMatchSource, FilterMapMatcher,
     FilterMapRenderer, IndexedMatchRange, LogInput, LogValueStream, LogValueStreamTermination,
-    MapBoundary, MatchPattern, ParamsId, RendererOutput, TopicSelection, ValueSpaceAnchor, GETH_V1,
+    MapBoundary, MatchPattern, ParamsId, RendererOutput, TopicSelection, GETH_V1,
 };
 use reth_filter_maps_storage::{FilterMapReadSnapshot, FilterMapStore};
 use reth_filter_maps_test_utils::{
@@ -123,7 +123,7 @@ fn check_fixture(path: &Path, fixture: &Fixture) {
         .collect::<Vec<_>>();
     let stream = LogValueStream::new(
         params,
-        ValueSpaceAnchor::new(origin.block, origin.hash, origin.index),
+        BlockPointer::new(origin.block, origin.hash, origin.index),
         blocks,
         LogValueStreamTermination::ReachedHead,
     );

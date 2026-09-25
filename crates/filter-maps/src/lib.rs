@@ -60,7 +60,7 @@ pub use stream::{
     BatchContinuation, BlockInput, BlockPointer, LogInput, LogValueKind, LogValueSlot,
     LogValueStream, LogValueStreamCompletion, LogValueStreamError, LogValueStreamEvent,
     LogValueStreamItem, LogValueStreamTermination, MapBoundary, PendingDelimiter,
-    UnknownValueSpaceVersion, ValueSpaceAnchor, ValueSpaceVersion, GETH_V1,
+    UnknownValueSpaceVersion, ValueSpaceVersion, GETH_V1,
 };
 pub use value::{address_value, topic_value};
 

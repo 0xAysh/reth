@@ -6,7 +6,7 @@ use reth_filter_maps::{
     address_value, topic_value, BatchContinuation, BlockInput, BlockPointer, LogInput,
     LogValueKind, LogValueSlot, LogValueStream, LogValueStreamCompletion, LogValueStreamError,
     LogValueStreamEvent, LogValueStreamItem, LogValueStreamTermination, PendingDelimiter,
-    ValueSpaceAnchor, DEFAULT_PARAMS,
+    DEFAULT_PARAMS,
 };
 
 const fn value(index: u64, hash: B256, kind: LogValueKind) -> LogValueStreamItem {
@@ -21,7 +21,7 @@ const fn value(index: u64, hash: B256, kind: LogValueKind) -> LogValueStreamItem
 fn a_log_without_topics_emits_one_typed_address_value() {
     let block_hash = B256::repeat_byte(0x11);
     let address = Address::repeat_byte(0xaa);
-    let anchor = ValueSpaceAnchor::new(0, block_hash, 0);
+    let anchor = BlockPointer::new(0, block_hash, 0);
     let block = BlockInput::new(0, block_hash, [LogInput::new(address, [])]);
 
     let items = LogValueStream::new(
@@ -56,7 +56,7 @@ fn a_log_without_topics_emits_one_typed_address_value() {
 fn a_log_with_more_than_four_topics_returns_a_typed_error_before_its_block() {
     let block_hash = B256::repeat_byte(0x11);
     let topics = (0..5).map(B256::repeat_byte);
-    let anchor = ValueSpaceAnchor::new(0, block_hash, 0);
+    let anchor = BlockPointer::new(0, block_hash, 0);
     let block = BlockInput::new(0, block_hash, [LogInput::new(Address::repeat_byte(0xaa), topics)]);
     let mut stream = LogValueStream::new(
         DEFAULT_PARAMS,
@@ -82,7 +82,7 @@ fn an_invalid_later_log_emits_no_events_from_its_block() {
     let valid = LogInput::new(Address::repeat_byte(0xaa), []);
     let invalid = LogInput::new(Address::repeat_byte(0xbb), (0..5).map(B256::repeat_byte));
     let block = BlockInput::new(0, block_hash, [valid, invalid]);
-    let anchor = ValueSpaceAnchor::new(0, block_hash, 0);
+    let anchor = BlockPointer::new(0, block_hash, 0);
     let mut stream = LogValueStream::new(
         DEFAULT_PARAMS,
         anchor,
@@ -110,7 +110,7 @@ fn logs_with_zero_through_four_topics_preserve_topic_order_and_ordinals() {
             .map(|ordinal| B256::repeat_byte(ordinal as u8 + 1))
             .collect::<Vec<_>>();
         let block = BlockInput::new(0, block_hash, [LogInput::new(address, topics.clone())]);
-        let anchor = ValueSpaceAnchor::new(0, block_hash, 0);
+        let anchor = BlockPointer::new(0, block_hash, 0);
 
         let actual = LogValueStream::new(
             DEFAULT_PARAMS,
@@ -143,7 +143,7 @@ fn a_block_with_only_empty_receipts_behaves_like_an_empty_block() {
         [(B256::repeat_byte(0xf0), Vec::<LogInput>::new()), (B256::repeat_byte(0xf1), Vec::new())];
     let flattened_logs = receipts.into_iter().flat_map(|(_transaction_hash, logs)| logs);
     let block = BlockInput::new(0, block_hash, flattened_logs);
-    let anchor = ValueSpaceAnchor::new(0, block_hash, 10);
+    let anchor = BlockPointer::new(0, block_hash, 10);
 
     let actual = LogValueStream::new(
         DEFAULT_PARAMS,
@@ -184,7 +184,7 @@ fn flattened_receipts_emit_only_log_values_in_canonical_order() {
     ];
     let flattened_logs = receipts.into_iter().flat_map(|(_transaction_hash, logs)| logs);
     let block = BlockInput::new(0, block_hash, flattened_logs);
-    let anchor = ValueSpaceAnchor::new(0, block_hash, 10);
+    let anchor = BlockPointer::new(0, block_hash, 10);
 
     let actual = LogValueStream::new(
         DEFAULT_PARAMS,

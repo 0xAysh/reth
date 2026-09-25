@@ -4,7 +4,7 @@ use crate::{
     coverage::{
         IdentityMismatch, IndexIdentity, MapResumeAnchor, PublicationStart, VerifiedCheckpoint,
     },
-    BlockPointer, Params, ValueSpaceAnchor,
+    BlockPointer, Params,
 };
 use std::ops::RangeInclusive;
 
@@ -17,7 +17,7 @@ use std::ops::RangeInclusive;
 pub struct ValidatedSegment {
     identity: IndexIdentity,
     origin: SegmentOrigin,
-    start: ValueSpaceAnchor,
+    start: BlockPointer,
     first_map: u32,
     first_block: u64,
     anchors: Vec<MapResumeAnchor>,
@@ -64,7 +64,7 @@ impl ValidatedSegment {
                 })
             }
             check_resume_order(&previous, anchor, &params)?;
-            previous = anchor.resume_anchor();
+            previous = anchor.pointer;
         }
         Ok(Self { identity, origin, start, first_map, first_block, anchors })
     }
@@ -80,7 +80,7 @@ impl ValidatedSegment {
     }
 
     /// Returns the value-space anchor at which construction of this segment began.
-    pub const fn start(&self) -> ValueSpaceAnchor {
+    pub const fn start(&self) -> BlockPointer {
         self.start
     }
 
@@ -149,7 +149,7 @@ impl ValidatedSegment {
             current.completed_map_index.checked_add(1).ok_or(SegmentError::MapIndexOverflow)?;
         check_map_sequence(first_map, &anchors)?;
         let params = self.identity.params.params();
-        let mut previous = current.resume_anchor();
+        let mut previous = current.pointer;
         for anchor in &anchors {
             if anchor.value_space_version != self.identity.value_space_version {
                 return Err(SegmentError::AnchorValueSpaceVersion {
@@ -158,7 +158,7 @@ impl ValidatedSegment {
                 })
             }
             check_resume_order(&previous, anchor, &params)?;
-            previous = anchor.resume_anchor();
+            previous = anchor.pointer;
         }
         let mut extended = self.clone();
         extended.anchors.extend(anchors);
@@ -262,14 +262,14 @@ impl SegmentOrigin {
         }
     }
 
-    /// Returns the value-space position at which rendering from this origin begins.
+    /// Returns the value-space anchor at which rendering from this origin begins.
     ///
     /// Genesis begins at block zero, value index zero; any other origin at its anchor's resume
     /// pointer.
-    pub const fn start(&self, identity: &IndexIdentity) -> ValueSpaceAnchor {
+    pub const fn start(&self, identity: &IndexIdentity) -> BlockPointer {
         match self.anchor() {
-            None => ValueSpaceAnchor::new(0, identity.genesis_hash, 0),
-            Some(anchor) => anchor.resume_anchor(),
+            None => BlockPointer::new(0, identity.genesis_hash, 0),
+            Some(anchor) => anchor.pointer,
         }
     }
 }
@@ -317,8 +317,8 @@ pub enum SegmentError {
     /// The resume pointer moves backwards or changes for the same block.
     #[error("resume pointer {to:?} does not follow {from:?}")]
     ResumeMovesBackwards {
-        /// Earlier anchor.
-        from: ValueSpaceAnchor,
+        /// Earlier resume pointer.
+        from: BlockPointer,
         /// Later anchor's resume pointer.
         to: BlockPointer,
     },
@@ -328,8 +328,8 @@ pub enum SegmentError {
     /// it lies slots ahead. Accepting one would claim coverage for blocks no map holds.
     #[error("resume {to:?} advances more blocks than slots from {from:?}")]
     ImplausibleResume {
-        /// Earlier anchor.
-        from: ValueSpaceAnchor,
+        /// Earlier resume pointer.
+        from: BlockPointer,
         /// Later anchor's resume pointer.
         to: BlockPointer,
     },
@@ -416,7 +416,7 @@ fn resolve_start(anchor: MapResumeAnchor, params: &Params) -> Result<(u32, u64),
 }
 
 const fn check_resume_order(
-    from: &ValueSpaceAnchor,
+    from: &BlockPointer,
     to: &MapResumeAnchor,
     params: &Params,
 ) -> Result<(), SegmentError> {
@@ -435,7 +435,7 @@ const fn check_resume_order(
 }
 
 /// Returns whether `pointer` cannot follow `from` in the value space.
-const fn pointer_precedes(pointer: &BlockPointer, from: &ValueSpaceAnchor) -> bool {
+const fn pointer_precedes(pointer: &BlockPointer, from: &BlockPointer) -> bool {
     pointer.block_number < from.block_number ||
         pointer.first_log_value_index < from.first_log_value_index ||
         (pointer.block_number == from.block_number &&
@@ -462,7 +462,7 @@ mod tests {
         // Map 0 completes mid-block 5; blocks 0..=4 are whole.
         let segment =
             segment_through(&identity(), SegmentOrigin::Genesis, anchor(0, 5, VPM - 10)).unwrap();
-        assert_eq!(segment.start(), ValueSpaceAnchor::new(0, hash(0), 0));
+        assert_eq!(segment.start(), BlockPointer::new(0, hash(0), 0));
         assert_eq!(segment.maps(), 0..=0);
         assert_eq!(segment.blocks(), Some(0..=4));
         assert!(segment.covers(4));

@@ -75,11 +75,10 @@ impl PublicationStart {
 
     /// Returns the pointer of the block at which rendering of the batch resumed.
     pub const fn start_pointer(&self, identity: &IndexIdentity) -> BlockPointer {
-        let start = match self {
+        match self {
             Self::Open { origin } => origin.start(identity),
-            Self::Extend { from } => from.resume_anchor(),
-        };
-        BlockPointer::new(start.block_number, start.block_hash, start.first_log_value_index)
+            Self::Extend { from } => from.pointer,
+        }
     }
 }
 
@@ -195,8 +194,8 @@ mod tests {
             RejectUnrecognizedCheckpoints, StoredCoverageRecord, VerifiedCheckpoint,
             STORAGE_FORMAT_V1,
         },
-        BlockInput, FilterMapRenderer, LogInput, LogValueStream, LogValueStreamTermination,
-        ParamsId, RendererOutput, ValueSpaceAnchor, GETH_V1, RANGE_TEST_PARAMS,
+        BlockInput, BlockPointer, FilterMapRenderer, LogInput, LogValueStream,
+        LogValueStreamTermination, ParamsId, RendererOutput, GETH_V1, RANGE_TEST_PARAMS,
     };
     use alloy_primitives::{Address, B256};
     use std::{collections::BTreeMap, convert::Infallible};
@@ -227,7 +226,7 @@ mod tests {
         });
         let stream = LogValueStream::new(
             RANGE_TEST_PARAMS,
-            ValueSpaceAnchor::new(0, hash(0), 0),
+            BlockPointer::new(0, hash(0), 0),
             blocks.collect::<Vec<_>>(),
             LogValueStreamTermination::ReachedHead,
         );
