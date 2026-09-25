@@ -7,7 +7,6 @@ use crate::{
     },
     Params,
 };
-use std::ops::RangeInclusive;
 
 /// Ordered, disjoint validated segments under one index identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,19 +58,6 @@ impl CoverageSet {
     /// Returns the segment through which `block_number` is queryable.
     pub fn segment_covering(&self, block_number: u64) -> Option<&ValidatedSegment> {
         self.segments.iter().find(|segment| segment.covers(block_number))
-    }
-
-    /// Returns covered parts of `blocks` and their supporting maps in ascending order.
-    pub fn intersect(&self, blocks: RangeInclusive<u64>) -> Vec<CoveredRange> {
-        self.segments
-            .iter()
-            .filter_map(|segment| {
-                let covered = segment.blocks()?;
-                let start = *covered.start().max(blocks.start());
-                let end = *covered.end().min(blocks.end());
-                (start <= end).then(|| CoveredRange { blocks: start..=end, maps: segment.maps() })
-            })
-            .collect()
     }
 
     /// Publishes a new segment from a trusted origin and one completed-map anchor.
@@ -247,15 +233,6 @@ impl CoverageSet {
     }
 }
 
-/// A covered block subrange and the maps that support it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CoveredRange {
-    /// Queryable blocks.
-    pub blocks: RangeInclusive<u64>,
-    /// Maps of the supporting segment.
-    pub maps: RangeInclusive<u32>,
-}
-
 /// What a reorg contraction removed and where rebuilding resumes.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReorgContraction {
@@ -368,6 +345,7 @@ fn check_adjacent(left: &ValidatedSegment, right: &ValidatedSegment) -> Result<(
 mod tests {
     use super::*;
     use crate::{coverage::test_utils::*, ParamsId};
+    use std::ops::RangeInclusive;
 
     fn blocks(set: &CoverageSet) -> Vec<Option<RangeInclusive<u64>>> {
         set.segments().iter().map(ValidatedSegment::blocks).collect()
@@ -426,13 +404,6 @@ mod tests {
         assert!(!set.covers(20));
         assert!(!set.covers(99));
         assert!(set.covers(100));
-        assert_eq!(
-            set.intersect(10..=110),
-            vec![
-                CoveredRange { blocks: 10..=19, maps: 0..=1 },
-                CoveredRange { blocks: 100..=110, maps: 10..=12 },
-            ]
-        );
     }
 
     #[test]

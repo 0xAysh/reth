@@ -9,13 +9,17 @@ use alloy_primitives::{Address, B256};
 use reth_filter_maps::{
     coverage::{
         CandidateSource, CoverageSet, IndexIdentity, LogQueryTarget, MapResumeAnchor,
-        PlannedSubrange, QueryPlan, SegmentOrigin, STORAGE_FORMAT_V1,
+        PlannedSubrange, QueryPlan, RejectUntrustedOrigins, SegmentOrigin,
+        StructurallyRestoredCoverage, STORAGE_FORMAT_V1,
     },
-    BlockInput, BlockPointer, LogInput, LogValueSlot, LogValueStream, LogValueStreamCompletion,
-    LogValueStreamEvent, LogValueStreamItem, LogValueStreamTermination, MapBoundary, ParamsId,
-    ValueSpaceAnchor, GETH_V1, RANGE_TEST_PARAMS,
+    BlockInput, BlockPointer, IndexedMatchRange, LogInput, LogValueSlot, LogValueStream,
+    LogValueStreamCompletion, LogValueStreamEvent, LogValueStreamItem, LogValueStreamTermination,
+    MapBoundary, ParamsId, ValueSpaceAnchor, GETH_V1, RANGE_TEST_PARAMS,
 };
-use std::collections::HashMap;
+use std::{
+    collections::{BTreeMap, HashMap},
+    convert::Infallible,
+};
 
 const fn hash(number: u64) -> B256 {
     B256::repeat_byte(number as u8 + 1)
@@ -54,6 +58,16 @@ struct Observed {
 
 /// Drives a stream from `anchor` and pairs every boundary with its resume block's pointer.
 fn observe(anchor: ValueSpaceAnchor, blocks: Vec<BlockInput>, next_block: u64) -> Vec<Observed> {
+    observe_with_pointers(anchor, blocks, next_block).0
+}
+
+/// Like [`observe`], also returning every block pointer the stream established, which is what a
+/// publication of these maps would store.
+fn observe_with_pointers(
+    anchor: ValueSpaceAnchor,
+    blocks: Vec<BlockInput>,
+    next_block: u64,
+) -> (Vec<Observed>, BTreeMap<u64, BlockPointer>) {
     let termination = LogValueStreamTermination::BatchExhausted {
         next_block: alloy_eips::BlockNumHash::new(next_block, hash(next_block)),
     };
@@ -82,6 +96,7 @@ fn observe(anchor: ValueSpaceAnchor, blocks: Vec<BlockInput>, next_block: u64) -
                     );
                     let anchor = MapResumeAnchor::new(boundary, pointer).unwrap();
                     observed.push(Observed { anchor, delimiters: count });
+                    pointers.insert(pointer.block_number, pointer);
                 }
                 break
             }
@@ -110,7 +125,7 @@ fn observe(anchor: ValueSpaceAnchor, blocks: Vec<BlockInput>, next_block: u64) -
         }
     }
     assert!(pending.is_none(), "every boundary must be paired before the batch ends");
-    observed
+    (observed, pointers.into_iter().collect())
 }
 
 fn genesis_anchors() -> Vec<Observed> {
@@ -277,25 +292,45 @@ fn reorg_contracts_to_a_map_that_excludes_the_changed_block_and_retention_hides_
 }
 
 #[test]
-fn query_plan_partitions_around_the_published_segments() {
-    let observed = genesis_anchors();
+fn query_plan_partitions_around_canonically_activated_segments() {
+    let (observed, pointers) =
+        observe_with_pointers(ValueSpaceAnchor::new(0, hash(0), 0), chain(), 6);
     let mut set = CoverageSet::new(identity());
     let end = observed.iter().find(|o| o.delimiters == 4).unwrap().anchor;
-    set.open_segment_batch(
-        SegmentOrigin::Genesis,
-        observed
-            .iter()
-            .map(|observed| observed.anchor)
-            .take_while(|anchor| anchor.completed_map_index <= end.completed_map_index),
+    let anchors = observed
+        .iter()
+        .map(|observed| observed.anchor)
+        .take_while(|anchor| anchor.completed_map_index <= end.completed_map_index)
+        .collect::<Vec<_>>();
+    set.open_segment_batch(SegmentOrigin::Genesis, anchors.clone()).unwrap();
+    let restored = StructurallyRestoredCoverage::restore(
+        &identity(),
+        set.stored_record(),
+        anchors,
+        &mut RejectUntrustedOrigins,
     )
     .unwrap();
-    assert_eq!(set.segments()[0].blocks(), Some(0..=3));
+    let queryable = restored
+        .activate(
+            |number| Ok::<_, Infallible>(Some(hash(number))),
+            |number| Ok::<_, Infallible>(pointers.get(&number).copied()),
+        )
+        .unwrap();
+    assert_eq!(queryable.segments()[0].blocks(), Some(0..=3));
 
-    let plan =
-        QueryPlan::new(LogQueryTarget::Range { from: 2, to: 5 }, true, &set, "head-a").unwrap();
+    let plan = QueryPlan::new(LogQueryTarget::Range { from: 2, to: 5 }, true, &queryable, "head-a")
+        .unwrap();
     let CandidateSource::Partitioned(subranges) = plan.source() else { panic!() };
-    assert_eq!(subranges.len(), 2);
-    assert!(matches!(&subranges[0], PlannedSubrange::Indexed { blocks, .. } if *blocks == (2..=3)));
-    assert_eq!(subranges[1], PlannedSubrange::Bloom { blocks: 4..=5 });
+    assert_eq!(
+        subranges,
+        &[
+            PlannedSubrange::Indexed(IndexedMatchRange::new(
+                2..=3,
+                0..=end.completed_map_index,
+                ParamsId::RangeTest
+            )),
+            PlannedSubrange::Bloom { blocks: 4..=5 },
+        ]
+    );
     assert!(plan.revalidate(&"head-b").is_err());
 }

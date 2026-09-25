@@ -406,6 +406,9 @@ pub enum PatternError {
 }
 
 /// One planner-normalized indexed subrange and the maps that support its validated segment.
+///
+/// [`QueryPlan`](crate::coverage::QueryPlan) emits these for the parts of a query that queryable
+/// coverage supports.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IndexedMatchRange {
     blocks: RangeInclusive<u64>,

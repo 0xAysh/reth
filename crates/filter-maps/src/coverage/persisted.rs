@@ -246,6 +246,21 @@ impl StructurallyRestoredCoverage {
 pub struct QueryableCoverage(CoverageSet);
 
 impl QueryableCoverage {
+    /// Returns the identity all segments are bound to.
+    pub const fn identity(&self) -> &IndexIdentity {
+        self.0.identity()
+    }
+
+    /// Returns the canonical segments in ascending order.
+    pub fn segments(&self) -> &[ValidatedSegment] {
+        self.0.segments()
+    }
+
+    /// Returns whether `block_number` is covered by a canonical segment.
+    pub fn covers(&self, block_number: u64) -> bool {
+        self.0.covers(block_number)
+    }
+
     /// Returns current queryable coverage.
     pub const fn coverage(&self) -> &CoverageSet {
         &self.0
@@ -515,36 +530,6 @@ mod tests {
     use crate::coverage::test_utils::*;
     use std::convert::Infallible;
 
-    /// Activates against a chain where every block `number` has hash `hash(number)` unless
-    /// `canonical` says otherwise, with the pointers a real publication would have stored.
-    fn activate(
-        restored: &StructurallyRestoredCoverage,
-        canonical: impl Fn(u64) -> Option<B256>,
-    ) -> QueryableCoverage {
-        let pointers = stored_pointers(restored.segments());
-        restored
-            .activate(
-                |number| Ok::<_, Infallible>(canonical(number)),
-                |number| Ok::<_, Infallible>(pointers.get(&number).copied()),
-            )
-            .unwrap()
-    }
-
-    #[derive(Default)]
-    struct TestOriginVerifier;
-
-    impl StoredOriginVerifier for TestOriginVerifier {
-        fn verify_checkpoint(
-            &mut self,
-            identity: &IndexIdentity,
-            anchor: MapResumeAnchor,
-            _provenance: CheckpointProvenance,
-        ) -> bool {
-            *identity == crate::coverage::test_utils::identity() &&
-                anchor.value_space_version == identity.value_space_version
-        }
-    }
-
     #[test]
     fn stored_catalog_restores_without_granting_queryability() {
         let mut coverage = CoverageSet::new(identity());
@@ -555,7 +540,7 @@ mod tests {
             &identity(),
             coverage.stored_record(),
             anchors,
-            &mut TestOriginVerifier,
+            &mut TestCheckpointVerifier,
         )
         .unwrap();
         assert_eq!(restored.segments().len(), 1);
@@ -576,7 +561,7 @@ mod tests {
             &identity(),
             coverage.stored_record(),
             all_anchors,
-            &mut TestOriginVerifier,
+            &mut TestCheckpointVerifier,
         )
         .unwrap();
 
@@ -606,7 +591,7 @@ mod tests {
             &identity(),
             record,
             anchors,
-            &mut TestOriginVerifier,
+            &mut TestCheckpointVerifier,
         )
         .unwrap();
         let queryable = activate(&restored, |number| {
@@ -626,7 +611,7 @@ mod tests {
             &identity(),
             coverage.stored_record(),
             anchors,
-            &mut TestOriginVerifier,
+            &mut TestCheckpointVerifier,
         )
         .unwrap();
         assert_eq!(restored.segments()[0].blocks(), Some(101..=129));
@@ -806,7 +791,7 @@ mod tests {
                 &identity(),
                 record,
                 [aligned(0, 10)],
-                &mut TestOriginVerifier,
+                &mut TestCheckpointVerifier,
             ),
             Err(PersistedCoverageError::MissingAnchor { map_index: 1 })
         ));
@@ -816,7 +801,7 @@ mod tests {
                 &identity(),
                 empty.clone(),
                 [aligned(0, 10), aligned(0, 10)],
-                &mut TestOriginVerifier,
+                &mut TestCheckpointVerifier,
             ),
             Err(PersistedCoverageError::DuplicateAnchor { map_index: 0 })
         ));
@@ -825,7 +810,7 @@ mod tests {
                 &identity(),
                 empty,
                 [aligned(0, 10)],
-                &mut TestOriginVerifier,
+                &mut TestCheckpointVerifier,
             ),
             Err(PersistedCoverageError::UnexpectedAnchor { map_index: 0 })
         ));

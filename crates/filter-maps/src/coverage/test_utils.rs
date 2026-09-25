@@ -1,12 +1,13 @@
 use crate::{
     coverage::{
-        IndexIdentity, MapResumeAnchor, SegmentOrigin, ValidatedSegment, VerifiedCheckpoint,
-        STORAGE_FORMAT_V1,
+        CheckpointProvenance, CoverageSet, IndexIdentity, MapResumeAnchor, QueryableCoverage,
+        SegmentOrigin, StoredOriginVerifier, StructurallyRestoredCoverage, ValidatedSegment,
+        VerifiedCheckpoint, STORAGE_FORMAT_V1,
     },
     BlockPointer, MapBoundary, ParamsId, DEFAULT_PARAMS, GETH_V1,
 };
 use alloy_primitives::B256;
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, convert::Infallible};
 
 pub(super) const VPM: u64 = DEFAULT_PARAMS.values_per_map();
 
@@ -79,4 +80,50 @@ pub(super) fn stored_pointers<'a>(
         }
     }
     pointers
+}
+
+/// Accepts every checkpoint recorded under the test identity.
+pub(super) struct TestCheckpointVerifier;
+
+impl StoredOriginVerifier for TestCheckpointVerifier {
+    fn verify_checkpoint(
+        &mut self,
+        identity: &IndexIdentity,
+        anchor: MapResumeAnchor,
+        _provenance: CheckpointProvenance,
+    ) -> bool {
+        *identity == self::identity() && anchor.value_space_version == identity.value_space_version
+    }
+}
+
+/// Round-trips `set` through its stored catalog and anchors.
+pub(super) fn restored(set: &CoverageSet) -> StructurallyRestoredCoverage {
+    let anchors = set.segments().iter().flat_map(|segment| segment.anchors().iter().copied());
+    StructurallyRestoredCoverage::restore(
+        set.identity(),
+        set.stored_record(),
+        anchors.collect::<Vec<_>>(),
+        &mut TestCheckpointVerifier,
+    )
+    .unwrap()
+}
+
+/// Activates against a chain where block `number` has `canonical(number)` as its hash, with the
+/// pointers a real publication would have stored.
+pub(super) fn activate(
+    restored: &StructurallyRestoredCoverage,
+    canonical: impl Fn(u64) -> Option<B256>,
+) -> QueryableCoverage {
+    let pointers = stored_pointers(restored.segments());
+    restored
+        .activate(
+            |number| Ok::<_, Infallible>(canonical(number)),
+            |number| Ok::<_, Infallible>(pointers.get(&number).copied()),
+        )
+        .unwrap()
+}
+
+/// Restores and activates `set` on a chain that agrees with every one of its anchors.
+pub(super) fn queryable(set: &CoverageSet) -> QueryableCoverage {
+    activate(&restored(set), |number| Some(hash(number)))
 }

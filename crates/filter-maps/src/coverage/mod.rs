@@ -36,6 +36,4 @@ pub use plan::{
     CandidateSource, CanonicalityChanged, LogQueryTarget, PlanError, PlannedSubrange, QueryPlan,
 };
 pub use segment::{RetainedAnchor, SegmentError, SegmentOrigin, ValidatedSegment};
-pub use set::{
-    ContractionError, CoverageSet, CoveredRange, PublishError, ReorgContraction, RestoreError,
-};
+pub use set::{ContractionError, CoverageSet, PublishError, ReorgContraction, RestoreError};
