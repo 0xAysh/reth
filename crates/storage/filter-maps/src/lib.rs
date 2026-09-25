@@ -261,6 +261,25 @@ mod tests {
                 logical.max_row_length(logical.log_maps_per_epoch())
             );
             assert_eq!(durable.group_size, logical.base_row_group_size());
+
+            let epoch = logical.maps_per_epoch();
+            let group = logical.base_row_group_size();
+            for map_index in [0, 1, group - 1, group, group + 1, epoch - 1, epoch, epoch + 1]
+                .into_iter()
+                .chain([2 * epoch + group + 3, u32::MAX - epoch, u32::MAX])
+            {
+                let key = FilterMapBaseRowKey::new(id.into(), map_index, 0).unwrap();
+                assert_eq!(
+                    key.validate(id.into()).unwrap().group_start,
+                    logical.map_group_index(map_index),
+                    "{id:?} map {map_index}"
+                );
+                assert_eq!(
+                    FilterMapBaseRowKey::slot(id.into(), map_index).unwrap(),
+                    logical.map_group_offset(map_index) as usize,
+                    "{id:?} map {map_index}"
+                );
+            }
         }
         assert!(filter_map_physical_params(0).is_err());
         assert!(filter_map_physical_params(3).is_err());

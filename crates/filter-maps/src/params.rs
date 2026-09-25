@@ -210,13 +210,26 @@ impl Params {
     }
 
     /// Returns the start index of the base row group containing the given map index.
+    ///
+    /// Base row groups never span an epoch, so deleting an epoch's complete key range removes
+    /// whole groups and nothing of a neighbouring epoch. Whenever maps per epoch is a multiple of
+    /// [`base_row_group_size`](Self::base_row_group_size), as for [`DEFAULT_PARAMS`], this is
+    /// exactly Geth's `mapGroupIndex`. For [`RANGE_TEST_PARAMS`], with one map per epoch, every map
+    /// is its own group where Geth would share one across 32 epochs.
     pub const fn map_group_index(&self, index: u32) -> u32 {
-        index & !(self.base_row_group_size - 1)
+        index & !self.map_group_mask()
     }
 
     /// Returns the offset of the given map index within its base row group.
+    ///
+    /// See [`map_group_index`](Self::map_group_index) for how groups relate to epochs and to Geth.
     pub const fn map_group_offset(&self, index: u32) -> u32 {
-        index & (self.base_row_group_size - 1)
+        index & self.map_group_mask()
+    }
+
+    /// Both sizes are powers of two, so the smaller one's low bits select the offset.
+    const fn map_group_mask(&self) -> u32 {
+        (self.base_row_group_size - 1) & (self.maps_per_epoch() - 1)
     }
 
     /// The per-layer shift shared by [`max_row_length`](Self::max_row_length) and
@@ -473,6 +486,11 @@ mod tests {
                     "map index {index} did not survive the split"
                 );
                 assert!(params.map_group_offset(index) < params.base_row_group_size());
+                assert_eq!(
+                    params.map_epoch(params.map_group_index(index)),
+                    params.map_epoch(index),
+                    "map index {index} shares a group across an epoch boundary"
+                );
             }
         }
     }

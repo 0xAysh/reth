@@ -120,7 +120,8 @@ fn final_epoch_is_const_evaluable() {
 }
 
 /// The split of a map index into its base row group and the offset within that group, which is how
-/// base rows are keyed as database entries.
+/// base rows are keyed as database entries. Only DEFAULT is compared: `RANGE_TEST` groups
+/// deliberately stop at epoch boundaries where Geth's do not (see `Params::map_group_index`).
 #[test]
 fn map_group_helpers_match_geth() {
     for (map_index, group_index, group_offset) in vectors::MAP_GROUP_DEFAULT {
