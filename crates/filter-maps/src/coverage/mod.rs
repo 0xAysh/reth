@@ -13,6 +13,7 @@ mod eligibility;
 mod identity;
 mod persisted;
 mod plan;
+mod publication;
 mod segment;
 mod set;
 #[cfg(test)]
@@ -35,6 +36,7 @@ pub use persisted::{
 pub use plan::{
     CandidateSource, CanonicalityChanged, LogQueryTarget, PlanError, PlannedSubrange, QueryPlan,
 };
+pub use publication::{PointerEvidence, PublicationProposal, PublicationStart};
 pub use segment::{RetainedAnchor, SegmentError, SegmentOrigin, ValidatedSegment};
 pub(crate) use set::CoverageSet;
 pub use set::{ContractionError, PublishError, ReorgContraction};

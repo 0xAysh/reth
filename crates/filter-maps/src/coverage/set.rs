@@ -5,7 +5,7 @@ use crate::{
         IdentityMismatch, IndexIdentity, MapResumeAnchor, SegmentError, SegmentOrigin,
         ValidatedSegment, VerifiedCheckpoint,
     },
-    Params,
+    Params, ParamsId,
 };
 
 /// Ordered, disjoint validated segments under one index identity.
@@ -223,6 +223,31 @@ pub struct ReorgContraction {
 /// Reason a publication was rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum PublishError {
+    /// The publication holds no completed map.
+    #[error("publication holds no completed map")]
+    EmptyPublication,
+    /// A map was rendered under another parameter set than the coverage identity's.
+    #[error("map {map_index} was rendered under {actual:?}, coverage requires {expected:?}")]
+    ParamsMismatch {
+        /// Offending map.
+        map_index: u32,
+        /// Parameter set of the coverage identity.
+        expected: ParamsId,
+        /// Parameter set the map was rendered under.
+        actual: ParamsId,
+    },
+    /// The batch's block pointers disagree, leave a gap, regress, or precede its start.
+    #[error("publication pointer evidence is inconsistent at block {block_number}")]
+    InconsistentPointer {
+        /// First block at which the evidence is inconsistent.
+        block_number: u64,
+    },
+    /// A map is already covered, but the batch is not an exact retry of its publication.
+    #[error("map {map_index} is already covered by a different publication")]
+    AlreadyCovered {
+        /// First already covered map of the batch.
+        map_index: u32,
+    },
     /// The extension does not name any segment's current terminal.
     #[error("no segment ends at anchor {anchor:?}")]
     UnknownAnchor {

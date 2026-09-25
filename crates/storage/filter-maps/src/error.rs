@@ -35,21 +35,17 @@ pub enum FilterMapStorageError {
     /// Physical model construction failed.
     #[error(transparent)]
     Model(#[from] FilterMapModelError),
-    /// Publication contains no completed map.
-    #[error("FilterMaps publication is empty")]
-    EmptyPublication,
-    /// Publication contains more than one base group.
+    /// Publication holds more maps than one batch may stage.
     #[error("FilterMaps publication contains {0} maps; maximum is 32")]
     OversizedPublication(usize),
-    /// Publication map indices are not contiguous or cross a group boundary.
-    #[error("FilterMaps publication has invalid map sequence")]
-    InvalidMapSequence,
-    /// A map was rendered under another parameter set.
-    #[error("FilterMaps publication has mixed parameters")]
-    MixedParameters,
-    /// A renderer map and its durable anchor disagree.
-    #[error("FilterMaps map and anchor disagree at map {0}")]
-    MapAnchorMismatch(u32),
+    /// Publication maps do not share one base-row group.
+    #[error("FilterMaps publication maps {first_map}..={last_map} span several base-row groups")]
+    MultipleBaseRowGroups {
+        /// First published map.
+        first_map: u32,
+        /// Last published map.
+        last_map: u32,
+    },
     /// Sparse renderer rows are malformed.
     #[error("FilterMaps rows are malformed at map {map_index}, row {row_index}")]
     MalformedRow {
@@ -58,9 +54,6 @@ pub enum FilterMapStorageError {
         /// Row index.
         row_index: u32,
     },
-    /// Pointer evidence is absent, discontinuous, or regresses.
-    #[error("FilterMaps pointer evidence is incomplete or inconsistent")]
-    InvalidPointers,
     /// Existing protected content disagrees with the publication.
     #[error("FilterMaps publication conflicts with protected {kind} at {key}")]
     ProtectedConflict {

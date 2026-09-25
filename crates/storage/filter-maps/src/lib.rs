@@ -38,7 +38,7 @@ pub use contraction::CleanupRanges;
 pub use error::{FilterMapStorageError, Result};
 pub use matcher::FilterMapSegmentSource;
 pub use snapshot::{ActivatedFilterMapSnapshot, FilterMapReadSnapshot};
-pub use store::{FilterMapStore, PublicationStart};
+pub use store::FilterMapStore;
 
 #[cfg(test)]
 mod tests {
@@ -62,9 +62,9 @@ mod tests {
         address_value,
         coverage::{
             CanonicalActivationError, CheckpointProvenance, CheckpointVerifier, IndexIdentity,
-            MapResumeAnchor, RejectUnrecognizedCheckpoints, SegmentOrigin, StoredCoverageRecord,
-            StoredSegmentOrigin, StoredSegmentRecord, StructurallyRestoredCoverage,
-            STORAGE_FORMAT_V1,
+            MapResumeAnchor, PublicationStart, RejectUnrecognizedCheckpoints, SegmentOrigin,
+            StoredCoverageRecord, StoredSegmentOrigin, StoredSegmentRecord,
+            StructurallyRestoredCoverage, STORAGE_FORMAT_V1,
         },
         BlockInput, FilterMapMatchSource, FilterMapRenderer, LogInput, LogValueStream,
         LogValueStreamTermination, ParamsId, RendererOutput, ValueSpaceAnchor, DEFAULT_PARAMS,
@@ -227,10 +227,19 @@ mod tests {
     /// Renders `count` range-test maps over a chain with one log per block, so every other map
     /// ends on a block boundary.
     fn chain_maps(count: usize) -> Vec<reth_filter_maps::AnchoredCompletedMap> {
+        chain_maps_with_logs(count, 1)
+    }
+
+    /// Renders `count` range-test maps over [`chain_hash`] blocks that each hold `logs` logs.
+    fn chain_maps_with_logs(
+        count: usize,
+        logs: usize,
+    ) -> Vec<reth_filter_maps::AnchoredCompletedMap> {
         let blocks = (0..=count as u64)
             .map(|number| {
-                let hash = if number == 0 { B256::ZERO } else { B256::repeat_byte(number as u8) };
-                BlockInput::new(number, hash, [LogInput::new(Address::repeat_byte(0x11), [])])
+                let hash = chain_hash(number).unwrap().unwrap();
+                let logs = (0..logs).map(|_| LogInput::new(Address::repeat_byte(0x11), []));
+                BlockInput::new(number, hash, logs)
             })
             .collect::<Vec<_>>();
         let stream = LogValueStream::new(
@@ -520,6 +529,64 @@ mod tests {
     }
 
     #[test]
+    fn publication_cannot_rewrite_a_pointer_that_activation_verifies() {
+        // One log per block: map 4 completes inside block 2, which starts at index 4. A checkpoint
+        // segment from that anchor covers only block 3 onwards, but activation still verifies the
+        // stored pointer of its start block 2.
+        let logged = chain_maps(8);
+        let origin = logged[4].resume_anchor();
+        assert_eq!((origin.pointer.block_number, origin.pointer.first_log_value_index), (2, 4));
+        // Empty blocks place block 2 at index 2 instead, a contradictory value space.
+        let empty = chain_maps_with_logs(2, 0);
+        assert_eq!(empty[1].resume_anchor().pointer.block_number, 2);
+
+        let db = create_test_rw_db();
+        let tx = db.tx_mut().unwrap();
+        FilterMapStore::initialize_identity(&tx, &identity()).unwrap();
+        let mut store = FilterMapStore::open(&tx, &identity(), &mut TestOriginVerifier).unwrap();
+        let checkpoint = checkpoint_origin(identity(), origin, logged[5].resume_anchor());
+        let mut start = PublicationStart::Open { origin: checkpoint };
+        for map in &logged[5..=7] {
+            store.publish(start, std::slice::from_ref(map)).unwrap();
+            start = PublicationStart::Extend { from: map.resume_anchor() };
+        }
+        assert_eq!(store.restored().segments()[0].blocks(), Some(3..=3));
+        assert_eq!(store.restored().segments()[0].pointer_span(), 2..=4);
+
+        // The genesis segment's blocks and maps are disjoint from the checkpoint segment's, but its
+        // terminal pointer names block 2.
+        store
+            .publish(PublicationStart::Open { origin: SegmentOrigin::Genesis }, &empty[..1])
+            .unwrap();
+        assert!(matches!(
+            store.publish(PublicationStart::Extend { from: empty[0].resume_anchor() }, &empty[1..]),
+            Err(FilterMapStorageError::ProtectedConflict { kind: "block pointer", key: 2 })
+        ));
+        tx.commit().unwrap();
+
+        let snapshot =
+            FilterMapReadSnapshot::open(db.tx().unwrap(), &identity(), &mut TestOriginVerifier)
+                .unwrap();
+        // Both segments still activate: the genesis map before block 2 and the checkpoint segment.
+        assert_eq!(snapshot.activate(chain_hash).unwrap().coverage().segments().len(), 2);
+    }
+
+    #[test]
+    fn publication_stays_inside_one_base_row_group() {
+        // Range-test epochs hold one map, so every map has its own base-row group.
+        let maps = chain_maps(2);
+        let db = create_test_rw_db();
+        let tx = db.tx_mut().unwrap();
+        FilterMapStore::initialize_identity(&tx, &identity()).unwrap();
+        assert!(matches!(
+            open_store(&tx, &identity())
+                .publish(PublicationStart::Open { origin: SegmentOrigin::Genesis }, &maps),
+            Err(FilterMapStorageError::MultipleBaseRowGroups { first_map: 0, last_map: 1 })
+        ));
+        tx.abort();
+    }
+
+    #[test]
     fn missing_covered_directory_is_corruption() {
         let db = create_test_rw_db();
         let maps = maps();
@@ -599,51 +666,6 @@ mod tests {
         )
         .unwrap();
         tx.commit().unwrap();
-    }
-
-    #[test]
-    fn retries_survive_adjacent_segment_merges() {
-        let maps = maps();
-        let checkpoint =
-            checkpoint_origin(identity(), maps[0].resume_anchor(), maps[1].resume_anchor());
-
-        // Opening an adjacent checkpoint segment merges it into its predecessor. Retrying the
-        // original open publication still compares the exact batch subrange.
-        let db = create_test_rw_db();
-        let tx = db.tx_mut().unwrap();
-        FilterMapStore::initialize_identity(&tx, &identity()).unwrap();
-        let mut store = FilterMapStore::open(&tx, &identity(), &mut TestOriginVerifier).unwrap();
-        store
-            .publish(PublicationStart::Open { origin: SegmentOrigin::Genesis }, &maps[..1])
-            .unwrap();
-        store.publish(PublicationStart::Open { origin: checkpoint.clone() }, &maps[1..]).unwrap();
-        store.publish(PublicationStart::Open { origin: checkpoint }, &maps[1..]).unwrap();
-        tx.commit().unwrap();
-        let snapshot =
-            FilterMapReadSnapshot::open(db.tx().unwrap(), &identity(), &mut TestOriginVerifier)
-                .unwrap();
-        assert_eq!(snapshot.restored().segments().len(), 1);
-
-        // Publishing the predecessor after the following checkpoint segment also merges. An
-        // equivalent extension retry recognizes its predecessor anchor inside the merged segment.
-        let checkpoint =
-            checkpoint_origin(identity(), maps[0].resume_anchor(), maps[1].resume_anchor());
-        let db = create_test_rw_db();
-        let tx = db.tx_mut().unwrap();
-        FilterMapStore::initialize_identity(&tx, &identity()).unwrap();
-        let mut store = FilterMapStore::open(&tx, &identity(), &mut TestOriginVerifier).unwrap();
-        store.publish(PublicationStart::Open { origin: checkpoint }, &maps[1..]).unwrap();
-        store
-            .publish(PublicationStart::Open { origin: SegmentOrigin::Genesis }, &maps[..1])
-            .unwrap();
-        store
-            .publish(PublicationStart::Extend { from: maps[0].resume_anchor() }, &maps[1..])
-            .unwrap();
-        tx.commit().unwrap();
-        let snapshot =
-            FilterMapReadSnapshot::open(db.tx().unwrap(), &identity(), &mut TestOriginVerifier)
-                .unwrap();
-        assert_eq!(snapshot.restored().segments().len(), 1);
     }
 
     #[test]

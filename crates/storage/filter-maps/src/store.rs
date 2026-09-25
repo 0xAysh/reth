@@ -4,7 +4,7 @@
 use crate::{
     codec::{anchor_from_db, catalog_from_db, catalog_to_db, identity_from_db, identity_to_db},
     error::{FilterMapStorageError, Result},
-    validation::{build_publication, PublicationProposal, PublicationWrites},
+    validation::{build_publication, PublicationPlan, PublicationWrites},
 };
 use reth_db_api::{
     models::{StoredCoverageCatalog, StoredMapRowDirectory},
@@ -17,7 +17,7 @@ use reth_db_api::{
 use reth_filter_maps::{
     coverage::{
         CheckpointVerifier, IndexIdentity, MapResumeAnchor, PersistedCoverageError,
-        ReorgContraction, SegmentOrigin, StructurallyRestoredCoverage,
+        PublicationStart, ReorgContraction, StructurallyRestoredCoverage,
     },
     AnchoredCompletedMap,
 };
@@ -194,7 +194,7 @@ impl<'tx, TX: DbTx + DbTxMut> FilterMapStore<'tx, TX> {
         maps: &[AnchoredCompletedMap],
         mut after_phase: impl FnMut(PublicationPhase) -> Result<()>,
     ) -> Result<()> {
-        let PublicationProposal::Write(writes) = build_publication(self, &start, maps)? else {
+        let PublicationPlan::Write(writes) = build_publication(self, &start, maps)? else {
             return Ok(())
         };
         let PublicationWrites { base_groups, extensions, directories, pointers, anchors, coverage } =
@@ -250,21 +250,6 @@ impl<'tx, TX: DbTx + DbTxMut> FilterMapStore<'tx, TX> {
             }
         })
     }
-}
-
-/// Trusted starting point for one contiguous publication.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PublicationStart {
-    /// Opens a separately trusted segment.
-    Open {
-        /// Genesis, verified checkpoint, or retained anchor.
-        origin: SegmentOrigin,
-    },
-    /// Extends the segment whose current terminal equals `from`.
-    Extend {
-        /// Current durable terminal.
-        from: MapResumeAnchor,
-    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

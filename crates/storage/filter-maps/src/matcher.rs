@@ -53,8 +53,9 @@ impl<TX: DbTx> FilterMapSegmentSource<TX> {
             kind: "empty segment",
             key: segment_index as u64,
         })?;
-        let successor = blocks.end().checked_add(1).ok_or(FilterMapStorageError::Arithmetic)?;
-        let pointers = *blocks.start()..=successor;
+        // Activation verified exactly the pointer span, which includes the successor of the last
+        // covered block that bounds it.
+        let pointers = segment.pointer_span();
         Ok(Self { snapshot, maps, blocks, pointers })
     }
 

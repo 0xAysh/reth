@@ -190,7 +190,7 @@ impl StructurallyRestoredCoverage {
     ) -> Result<QueryableCoverage, CanonicalActivationError<E, P>> {
         let mut canonical_segments = Vec::with_capacity(self.segments().len());
         for segment in self.segments() {
-            let canonical = identities_canonical(self.identity(), segment, &mut canonical_hash)?;
+            let canonical = identities_canonical(segment, &mut canonical_hash)?;
             if canonical {
                 verify_pointer_span(segment, &mut canonical_hash, &mut stored_pointer)?;
             }
@@ -468,7 +468,6 @@ pub enum CanonicalActivationError<E, P> {
 
 /// Returns whether the segment's origin, derivation predecessor, and anchors are all canonical.
 fn identities_canonical<E, P>(
-    identity: &IndexIdentity,
     segment: &ValidatedSegment,
     canonical_hash: &mut impl FnMut(u64) -> Result<Option<B256>, E>,
 ) -> Result<bool, CanonicalActivationError<E, P>> {
@@ -477,13 +476,8 @@ fn identities_canonical<E, P>(
             .map(|canonical| canonical == Some(hash))
             .map_err(CanonicalActivationError::CanonicalLookup)
     };
-    let mut canonical = match segment.origin() {
-        SegmentOrigin::Genesis => is_canonical(0, identity.genesis_hash)?,
-        origin => {
-            let anchor = origin.anchor().expect("non-genesis origins have anchors");
-            is_canonical(anchor.pointer.block_number, anchor.pointer.block_hash)?
-        }
-    };
+    let start = segment.start();
+    let mut canonical = is_canonical(start.block_number, start.block_hash)?;
     if let SegmentOrigin::Checkpoint(checkpoint) = segment.origin() &&
         let CheckpointProvenance::DerivedFrom { predecessor } =
             checkpoint.checkpoint().provenance()

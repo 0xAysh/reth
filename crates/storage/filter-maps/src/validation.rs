@@ -1,32 +1,38 @@
-//! Complete publication validation and write-set derivation.
+//! Physical publication checks and write-set derivation.
 //!
-//! The module constructs either a no-op retry or a complete [`PublicationWrites`] proposal before
-//! the store mutates any table. The caller-owned MDBX transaction remains the atomicity boundary.
+//! Publication rules belong to
+//! [`StructurallyRestoredCoverage::propose`](reth_filter_maps::coverage::StructurallyRestoredCoverage::propose).
+//! This module adds only what depends on stored bytes and physical layout, and then constructs
+//! either a no-op retry or a complete [`PublicationWrites`] set before the store mutates any
+//! table. The caller-owned MDBX transaction remains the atomicity boundary.
 
 use crate::{
     codec::anchor_to_db,
     error::{FilterMapStorageError, Result},
     rows::{EncodedMap, RowWrites},
-    store::{FilterMapStore, PublicationStart},
+    store::FilterMapStore,
 };
 use reth_db_api::{
     models::{
         FilterMapBaseRowKey, FilterMapExtendedRowKey, StoredBaseRowGroup, StoredBlockPointer,
         StoredExtendedRow, StoredMapResumeAnchor, StoredMapRowDirectory,
     },
-    tables::{FilterMapAnchors, FilterMapBlockPointers},
+    tables::FilterMapBlockPointers,
     transaction::DbTx,
 };
 use reth_filter_maps::{
-    coverage::{IndexIdentity, StructurallyRestoredCoverage},
-    AnchoredCompletedMap, BlockPointer,
+    coverage::{
+        IndexIdentity, PointerEvidence, PublicationProposal, PublicationStart,
+        StructurallyRestoredCoverage,
+    },
+    AnchoredCompletedMap,
 };
 use std::collections::BTreeMap;
 
 const MAX_BATCH: usize = 32;
 
 #[derive(Debug)]
-pub(crate) enum PublicationProposal {
+pub(crate) enum PublicationPlan {
     Noop,
     Write(PublicationWrites),
 }
@@ -41,51 +47,40 @@ pub(crate) struct PublicationWrites {
     pub coverage: StructurallyRestoredCoverage,
 }
 
+/// Turns the pure publication decision into physical checks and the complete write set.
 pub(crate) fn build_publication<TX: DbTx>(
     store: &FilterMapStore<'_, TX>,
     start: &PublicationStart,
     maps: &[AnchoredCompletedMap],
-) -> Result<PublicationProposal> {
+) -> Result<PublicationPlan> {
     let tx = store.tx();
     let identity = *store.identity();
-    validate_shape(&identity, start, maps)?;
-    store.load_directories()?;
     let current = store.restored();
+    let proposal = current.propose(start, maps)?;
+    check_batch_layout(&identity, maps)?;
+    store.load_directories()?;
+    validate_protected_pointers(tx, current, proposal.pointers())?;
 
-    let mut encoded = Vec::with_capacity(maps.len());
-    let mut directories = BTreeMap::new();
-    let mut anchors = BTreeMap::new();
-    for anchored in maps {
-        let map = anchored.map();
-        let rows = map.rows().iter().map(|row| (row.row_index(), row.columns()));
-        let map_rows = EncodedMap::new(identity.params, map.map_index(), rows)?;
-        directories.insert(map.map_index(), map_rows.directory().clone());
-        anchors.insert(map.map_index(), anchor_to_db(anchored.resume_anchor()));
-        encoded.push(map_rows);
-    }
-
-    let pointers = normalize_pointers(&identity, start, maps)?;
-    validate_protected_pointers(tx, current, &pointers)?;
-
-    let target_maps: Vec<_> = maps.iter().map(|map| map.map().map_index()).collect();
-    let target_covered = target_maps
+    let encoded = maps
         .iter()
-        .map(|target| current.segments().iter().any(|segment| segment.maps().contains(target)))
-        .collect::<Vec<_>>();
-    if target_covered.iter().any(|covered| *covered) {
-        if target_covered.iter().all(|covered| *covered) &&
-            retry_coverage_matches(current, start, maps) &&
-            publication_matches(tx, &encoded, &anchors, &pointers)?
-        {
-            return Ok(PublicationProposal::Noop)
-        }
-        return Err(FilterMapStorageError::IncompletePriorState)
-    }
+        .map(|anchored| {
+            let map = anchored.map();
+            let rows = map.rows().iter().map(|row| (row.row_index(), row.columns()));
+            EncodedMap::new(identity.params, map.map_index(), rows)
+        })
+        .collect::<Result<Vec<_>>>()?;
 
-    let map_anchors = maps.iter().map(AnchoredCompletedMap::resume_anchor);
-    let proposed = match start {
-        PublicationStart::Open { origin } => current.open_segment(origin.clone(), map_anchors)?,
-        PublicationStart::Extend { from } => current.extend(*from, map_anchors)?,
+    let (coverage, pointers) = match proposal {
+        PublicationProposal::AlreadyPublished { .. } => {
+            // Coverage and every protected pointer already match; only row bytes remain unproven.
+            for map_rows in &encoded {
+                if !map_rows.is_stored(tx)? {
+                    return Err(FilterMapStorageError::IncompletePriorState)
+                }
+            }
+            return Ok(PublicationPlan::Noop)
+        }
+        PublicationProposal::Next { coverage, pointers } => (coverage, pointers),
     };
 
     let mut rows = RowWrites::default();
@@ -93,192 +88,75 @@ pub(crate) fn build_publication<TX: DbTx>(
         map_rows.stage(tx, &mut rows)?;
     }
     let RowWrites { base_groups, extensions } = rows;
+    let directories =
+        encoded.iter().map(|map_rows| (map_rows.map_index(), map_rows.directory().clone()));
+    let anchors = maps.iter().map(|anchored| {
+        let anchor = anchored.resume_anchor();
+        (anchor.completed_map_index, anchor_to_db(anchor))
+    });
 
-    Ok(PublicationProposal::Write(PublicationWrites {
+    Ok(PublicationPlan::Write(PublicationWrites {
         base_groups,
         extensions,
-        directories,
-        pointers,
-        anchors,
-        coverage: proposed,
+        directories: directories.collect(),
+        pointers: pointers
+            .pointers()
+            .iter()
+            .map(|pointer| (pointer.block_number, stored(pointer)))
+            .collect(),
+        anchors: anchors.collect(),
+        coverage,
     }))
 }
 
-fn validate_shape(
-    identity: &IndexIdentity,
-    start: &PublicationStart,
-    maps: &[AnchoredCompletedMap],
-) -> Result<()> {
-    if maps.is_empty() {
-        return Err(FilterMapStorageError::EmptyPublication)
-    }
+/// Rejects batches the physical row layout cannot stage as one base-row group.
+///
+/// Runs after the pure proposal, which already established a nonempty, consecutive batch.
+fn check_batch_layout(identity: &IndexIdentity, maps: &[AnchoredCompletedMap]) -> Result<()> {
     if maps.len() > MAX_BATCH {
         return Err(FilterMapStorageError::OversizedPublication(maps.len()))
     }
-    let first = maps[0].map().map_index();
-    let last = maps.last().expect("nonempty").map().map_index();
-    if FilterMapBaseRowKey::new(u8::from(identity.params), first, 0)? !=
-        FilterMapBaseRowKey::new(u8::from(identity.params), last, 0)?
-    {
-        return Err(FilterMapStorageError::InvalidMapSequence)
-    }
-    let expected_first = match start {
-        PublicationStart::Open { origin } => {
-            origin.anchor().map_or(Some(0), |anchor| anchor.completed_map_index.checked_add(1))
-        }
-        PublicationStart::Extend { from } => from.completed_map_index.checked_add(1),
-    }
-    .ok_or(FilterMapStorageError::Arithmetic)?;
-    if first != expected_first {
-        return Err(FilterMapStorageError::InvalidMapSequence)
-    }
-    for (offset, anchored) in maps.iter().enumerate() {
-        let map = anchored.map();
-        let expected = first
-            .checked_add(u32::try_from(offset).map_err(|_| FilterMapStorageError::Arithmetic)?)
-            .ok_or(FilterMapStorageError::Arithmetic)?;
-        if map.map_index() != expected {
-            return Err(FilterMapStorageError::InvalidMapSequence)
-        }
-        if map.params_id() != identity.params {
-            return Err(FilterMapStorageError::MixedParameters)
-        }
-        let anchor = anchored.resume_anchor();
-        let boundary = map.boundary();
-        if anchor.completed_map_index != map.map_index() ||
-            anchor.pointer.block_number != boundary.resume_block_number ||
-            anchor.pointer.block_hash != boundary.resume_block_hash ||
-            anchor.value_space_version != identity.value_space_version
-        {
-            return Err(FilterMapStorageError::MapAnchorMismatch(map.map_index()))
-        }
+    let params = u8::from(identity.params);
+    let first = maps.first().expect("proposal rejects empty batches").map().map_index();
+    let last = maps.last().expect("proposal rejects empty batches").map().map_index();
+    if FilterMapBaseRowKey::new(params, first, 0)? != FilterMapBaseRowKey::new(params, last, 0)? {
+        return Err(FilterMapStorageError::MultipleBaseRowGroups {
+            first_map: first,
+            last_map: last,
+        })
     }
     Ok(())
 }
 
-fn normalize_pointers(
-    identity: &IndexIdentity,
-    start: &PublicationStart,
-    maps: &[AnchoredCompletedMap],
-) -> Result<BTreeMap<u64, StoredBlockPointer>> {
-    let mut evidence = Vec::new();
-    match start {
-        PublicationStart::Open { origin } => match origin.anchor() {
-            Some(anchor) => evidence.push(anchor.pointer),
-            None => evidence.push(BlockPointer::new(0, identity.genesis_hash, 0)),
-        },
-        PublicationStart::Extend { from } => evidence.push(from.pointer),
-    }
-    for anchored in maps {
-        evidence.extend_from_slice(anchored.map().block_pointers());
-        evidence.push(anchored.resume_anchor().pointer);
-    }
-    let mut pointers = BTreeMap::new();
-    for pointer in evidence {
-        let stored = StoredBlockPointer {
-            block_hash: pointer.block_hash,
-            first_log_value_index: pointer.first_log_value_index,
-        };
-        if let Some(existing) = pointers.insert(pointer.block_number, stored) &&
-            existing != stored
-        {
-            return Err(FilterMapStorageError::InvalidPointers)
-        }
-    }
-    if pointers.is_empty() ||
-        pointers.iter().zip(pointers.iter().skip(1)).any(
-            |((left_number, left), (right_number, right))| {
-                left_number.checked_add(1) != Some(*right_number) ||
-                    left.first_log_value_index >= right.first_log_value_index
-            },
-        )
-    {
-        return Err(FilterMapStorageError::InvalidPointers)
-    }
-    Ok(pointers)
-}
-
+/// Requires every stored pointer that activation verifies for a restored segment to already equal
+/// the batch's evidence, so a publication can never rewrite a pointer another segment depends on.
 fn validate_protected_pointers<TX: DbTx>(
     tx: &TX,
     coverage: &StructurallyRestoredCoverage,
-    proposed: &BTreeMap<u64, StoredBlockPointer>,
+    evidence: &PointerEvidence,
 ) -> Result<()> {
-    for (&number, proposed) in proposed {
-        let protected = coverage.segments().iter().any(|segment| {
-            segment.blocks().is_some_and(|blocks| {
-                let successor = blocks.end().checked_add(1);
-                number >= *blocks.start() && successor.is_some_and(|end| number <= end)
-            })
-        });
-        if protected {
-            match tx.get::<FilterMapBlockPointers>(number)? {
-                Some(stored) if stored == *proposed => {}
-                Some(_) => {
-                    return Err(FilterMapStorageError::ProtectedConflict {
-                        kind: "block pointer",
-                        key: number,
-                    })
-                }
-                None => return Err(FilterMapStorageError::IncompletePriorState),
+    for pointer in evidence.pointers() {
+        let number = pointer.block_number;
+        if !coverage.segments().iter().any(|segment| segment.pointer_span().contains(&number)) {
+            continue
+        }
+        match tx.get::<FilterMapBlockPointers>(number)? {
+            Some(existing) if existing == stored(pointer) => {}
+            Some(_) => {
+                return Err(FilterMapStorageError::ProtectedConflict {
+                    kind: "block pointer",
+                    key: number,
+                })
             }
+            None => return Err(FilterMapStorageError::IncompletePriorState),
         }
     }
     Ok(())
 }
 
-fn retry_coverage_matches(
-    coverage: &StructurallyRestoredCoverage,
-    start: &PublicationStart,
-    maps: &[AnchoredCompletedMap],
-) -> bool {
-    let first = maps[0].map().map_index();
-    let last = maps.last().expect("nonempty publication").map().map_index();
-    coverage.segments().iter().any(|segment| {
-        if !segment.maps().contains(&first) || !segment.maps().contains(&last) {
-            return false
-        }
-        let predecessor_matches = match start {
-            PublicationStart::Open { origin } => match origin.anchor() {
-                None => segment.first_map() == 0 && segment.origin() == origin,
-                Some(anchor) => {
-                    anchor.completed_map_index.checked_add(1) == Some(first) &&
-                        segment.contains_anchor(anchor)
-                }
-            },
-            PublicationStart::Extend { from } => {
-                from.completed_map_index.checked_add(1) == Some(first) &&
-                    segment.contains_anchor(*from)
-            }
-        };
-        if !predecessor_matches {
-            return false
-        }
-        maps.iter().all(|map| {
-            let anchor = map.resume_anchor();
-            segment.anchors().get((anchor.completed_map_index - segment.first_map()) as usize) ==
-                Some(&anchor)
-        })
-    })
-}
-
-fn publication_matches<TX: DbTx>(
-    tx: &TX,
-    encoded: &[EncodedMap],
-    anchors: &BTreeMap<u32, StoredMapResumeAnchor>,
-    pointers: &BTreeMap<u64, StoredBlockPointer>,
-) -> Result<bool> {
-    for map_rows in encoded {
-        let map_index = map_rows.map_index();
-        if tx.get::<FilterMapAnchors>(map_index)?.as_ref() != anchors.get(&map_index) ||
-            !map_rows.is_stored(tx)?
-        {
-            return Ok(false)
-        }
+const fn stored(pointer: &reth_filter_maps::BlockPointer) -> StoredBlockPointer {
+    StoredBlockPointer {
+        block_hash: pointer.block_hash,
+        first_log_value_index: pointer.first_log_value_index,
     }
-    for (&number, expected) in pointers {
-        if tx.get::<FilterMapBlockPointers>(number)?.as_ref() != Some(expected) {
-            return Ok(false)
-        }
-    }
-    Ok(true)
 }
