@@ -51,19 +51,7 @@ impl ValidatedSegment {
                 terminal_map: terminal.completed_map_index,
             })
         }
-        let params = identity.params.params();
-        check_map_sequence(first_map, &anchors)?;
-        let mut previous = start;
-        for anchor in &anchors {
-            if anchor.value_space_version != identity.value_space_version {
-                return Err(SegmentError::AnchorValueSpaceVersion {
-                    expected: identity.value_space_version,
-                    actual: anchor.value_space_version,
-                })
-            }
-            check_resume_order(&previous, anchor, &params)?;
-            previous = anchor.pointer;
-        }
+        check_anchor_run(&identity, first_map, start, &anchors)?;
         Ok(Self { identity, origin, start, first_map, first_block, anchors })
     }
 
@@ -145,19 +133,7 @@ impl ValidatedSegment {
         }
         let first_map =
             current.completed_map_index.checked_add(1).ok_or(SegmentError::MapIndexOverflow)?;
-        check_map_sequence(first_map, &anchors)?;
-        let params = self.identity.params.params();
-        let mut previous = current.pointer;
-        for anchor in &anchors {
-            if anchor.value_space_version != self.identity.value_space_version {
-                return Err(SegmentError::AnchorValueSpaceVersion {
-                    expected: self.identity.value_space_version,
-                    actual: anchor.value_space_version,
-                })
-            }
-            check_resume_order(&previous, anchor, &params)?;
-            previous = anchor.pointer;
-        }
+        check_anchor_run(&self.identity, first_map, current.pointer, &anchors)?;
         let mut extended = self.clone();
         extended.anchors.extend(anchors);
         Ok(extended)
@@ -411,6 +387,33 @@ fn resolve_start(anchor: MapResumeAnchor, params: &Params) -> Result<(u32, u64),
         anchor.pointer.block_number.checked_add(1).ok_or(SegmentError::BlockNumberOverflow)?
     };
     Ok((first_map, first_block))
+}
+
+/// Checks that `anchors` complete consecutive maps from `first_map` under `identity`'s value-space
+/// version, and that each resume pointer plausibly follows the previous one, beginning at `start`.
+///
+/// Opening, rebuilding, and extending a segment share this check so that no path can accept an
+/// anchor run another path would reject.
+fn check_anchor_run(
+    identity: &IndexIdentity,
+    first_map: u32,
+    start: BlockPointer,
+    anchors: &[MapResumeAnchor],
+) -> Result<(), SegmentError> {
+    check_map_sequence(first_map, anchors)?;
+    let params = identity.params.params();
+    let mut previous = start;
+    for anchor in anchors {
+        if anchor.value_space_version != identity.value_space_version {
+            return Err(SegmentError::AnchorValueSpaceVersion {
+                expected: identity.value_space_version,
+                actual: anchor.value_space_version,
+            })
+        }
+        check_resume_order(&previous, anchor, &params)?;
+        previous = anchor.pointer;
+    }
+    Ok(())
 }
 
 const fn check_resume_order(
