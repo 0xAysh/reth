@@ -105,6 +105,60 @@ where
         })
     }
 
+    /// Constructs a renderer at the start state of Geth's `FORMAT 2` pipeline oracle.
+    ///
+    /// Production renderers start only at genesis or immediately after a published map, so they
+    /// never render a map from its middle. The oracle does: a checkpoint or batch-continuation
+    /// origin may place the first streamed slot anywhere inside a map, and that map then holds only
+    /// marks from the first streamed slot onward. This constructor reproduces that state so parity
+    /// tests can compare rendered maps with the oracle's without reaching into renderer internals.
+    ///
+    /// A stream starting at an anchor must pass no `previous` pointer. Unless the anchor is at
+    /// absolute index zero, the anchor block's pointer belongs to the already indexed prefix, so
+    /// it is not associated with the first rendered map. A stream continuing a batch must pass the
+    /// last pointer of the previous batch, which orders the stream's first pointer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `previous` is present for an anchor start or absent for a continuation start.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn from_geth_oracle_start(
+        stream: LogValueStream<I>,
+        previous: Option<BlockPointer>,
+    ) -> Result<Self, RendererError> {
+        let (params_id, params) = Self::recognized_params(&stream)?;
+        let start_index = stream.initial_cursor();
+        let map_index = u32::try_from(start_index / params.values_per_map())
+            .map_err(|_| RendererError::ArithmeticOverflow)?;
+        let phase = match (stream.start(), previous) {
+            (StreamStart::Anchor(anchor), None) if anchor.first_log_value_index == 0 => {
+                Phase::Active
+            }
+            // An empty replay window consumes the anchor block's pointer without associating it,
+            // then activates the map at the first streamed slot.
+            (StreamStart::Anchor(_), None) => {
+                Phase::Replaying { first_unpublished_index: start_index }
+            }
+            (StreamStart::Continuation(_), Some(_)) => Phase::Active,
+            (start, previous) => {
+                panic!("oracle start {start:?} is inconsistent with previous pointer {previous:?}")
+            }
+        };
+        Ok(Self {
+            params_id,
+            params,
+            expected_slot_index: start_index,
+            stream,
+            phase,
+            active: (phase == Phase::Active).then(|| ActiveMap::new(map_index)),
+            pending: None,
+            pending_replay_boundary: None,
+            last_pointer: previous,
+            latest_pointer: previous,
+            next_output_map_index: map_index,
+        })
+    }
+
     fn recognized_params(stream: &LogValueStream<I>) -> Result<(ParamsId, Params), RendererError> {
         let params = stream.params();
         let Some(params_id) = ParamsId::of(&params) else {

@@ -1,17 +1,15 @@
-//! Replays fixture inputs through the already implemented [`LogValueStream`].
+//! Replays fixture inputs through the already implemented
+//! [`LogValueStream`](reth_filter_maps::LogValueStream).
 //!
 //! This checks only value-stream evidence: pointers, boundaries, termination, and the source-slot
 //! classifications attached to matcher observations. Rendered rows and candidate selection remain
 //! independent Geth oracle output; this module deliberately does not reproduce either algorithm.
 
-use super::parser::{
-    Block, BoundaryEnding, Fixture, LogIdentity, Origin, ParamsName, Query, SlotClass, Termination,
-};
+use super::parser::{Block, BoundaryEnding, Fixture, LogIdentity, Query, SlotClass, Termination};
 use alloy_eips::BlockNumHash;
 use reth_filter_maps::{
-    BatchContinuation, BlockInput, BlockPointer, LogInput, LogValueKind, LogValueSlot,
-    LogValueStream, LogValueStreamCompletion, LogValueStreamEvent, LogValueStreamItem,
-    LogValueStreamTermination, MapBoundary, ValueSpaceAnchor, DEFAULT_PARAMS, RANGE_TEST_PARAMS,
+    BlockPointer, LogValueKind, LogValueSlot, LogValueStreamCompletion, LogValueStreamEvent,
+    LogValueStreamItem, MapBoundary,
 };
 use std::collections::BTreeMap;
 
@@ -131,15 +129,6 @@ const fn slot_index(slot: LogValueSlot) -> u64 {
     }
 }
 
-fn log_inputs(block: &Block) -> Vec<LogInput> {
-    block
-        .receipts
-        .iter()
-        .flat_map(|receipt| &receipt.logs)
-        .map(|log| LogInput::new(log.address, log.topics.iter().copied()))
-        .collect()
-}
-
 fn log_identities(block: &Block) -> Vec<LogIdentity> {
     block
         .receipts
@@ -152,35 +141,11 @@ fn log_identities(block: &Block) -> Vec<LogIdentity> {
 }
 
 fn drive(fixture: &Fixture) -> Result<Replay, String> {
-    let params = match fixture.params_name {
-        ParamsName::Default => DEFAULT_PARAMS,
-        ParamsName::Range => RANGE_TEST_PARAMS,
-    };
-    let blocks = fixture
-        .blocks
-        .iter()
-        .map(|block| BlockInput::new(block.number, block.hash, log_inputs(block)))
-        .collect::<Vec<_>>();
-    let termination = match fixture.termination {
-        Termination::Head => LogValueStreamTermination::ReachedHead,
-        Termination::Batch { next_block, next_hash } => LogValueStreamTermination::BatchExhausted {
-            next_block: BlockNumHash::new(next_block, next_hash),
-        },
-    };
-    let mut stream = match fixture.origin {
-        Origin::Genesis(anchor) | Origin::Checkpoint(anchor) => LogValueStream::new(
-            params,
-            ValueSpaceAnchor::new(anchor.block, anchor.hash, anchor.index),
-            blocks,
-            termination,
-        ),
-        Origin::Continuation { block, hash, cursor, .. } => LogValueStream::continue_from(
-            params,
-            BatchContinuation::new(BlockNumHash::new(block, hash), cursor),
-            blocks,
-            termination,
-        ),
-    };
+    let mut stream = super::input::stream(
+        fixture,
+        super::input::blocks(fixture),
+        super::input::termination(fixture),
+    );
 
     let mut tracker = Tracker {
         fixture,

@@ -23,4 +23,8 @@ sha2.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+reth-filter-maps = { workspace = true, features = ["test-utils"] }
 reth-filter-maps-test-utils.workspace = true
+
+[features]
+test-utils = ["reth-filter-maps/test-utils"]

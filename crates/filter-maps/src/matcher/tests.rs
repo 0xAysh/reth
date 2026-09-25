@@ -494,7 +494,52 @@ fn pointer_order_and_range_boundaries_fail_closed() {
 fn render_fixture(
     fixture: &crate::golden_pipeline::parser::Fixture,
 ) -> Vec<crate::AnchoredCompletedMap> {
-    let mut renderer = crate::renderer::tests::fixture_renderer(fixture);
+    use crate::{
+        golden_pipeline::parser::{Origin, ParamsName, Termination},
+        BatchContinuation, BlockInput, BlockPointer, FilterMapRenderer, LogInput, LogValueStream,
+        LogValueStreamTermination, ValueSpaceAnchor, RANGE_TEST_PARAMS,
+    };
+    use alloy_eips::BlockNumHash;
+
+    let params = match fixture.params_name {
+        ParamsName::Default => DEFAULT_PARAMS,
+        ParamsName::Range => RANGE_TEST_PARAMS,
+    };
+    let blocks = fixture.blocks.iter().map(|block| {
+        let logs = block
+            .receipts
+            .iter()
+            .flat_map(|receipt| &receipt.logs)
+            .map(|log| LogInput::new(log.address, log.topics.iter().copied()));
+        BlockInput::new(block.number, block.hash, logs)
+    });
+    let termination = match fixture.termination {
+        Termination::Head => LogValueStreamTermination::ReachedHead,
+        Termination::Batch { next_block, next_hash } => LogValueStreamTermination::BatchExhausted {
+            next_block: BlockNumHash::new(next_block, next_hash),
+        },
+    };
+    let (stream, previous) = match fixture.origin {
+        Origin::Genesis(origin) | Origin::Checkpoint(origin) => (
+            LogValueStream::new(
+                params,
+                ValueSpaceAnchor::new(origin.block, origin.hash, origin.index),
+                blocks,
+                termination,
+            ),
+            None,
+        ),
+        Origin::Continuation { block, hash, cursor, previous } => (
+            LogValueStream::continue_from(
+                params,
+                BatchContinuation::new(BlockNumHash::new(block, hash), cursor),
+                blocks,
+                termination,
+            ),
+            Some(BlockPointer::new(previous.block, previous.hash, previous.index)),
+        ),
+    };
+    let mut renderer = FilterMapRenderer::from_geth_oracle_start(stream, previous).unwrap();
     let mut maps = Vec::new();
     while let Some(output) = renderer.render_next() {
         match output.unwrap() {

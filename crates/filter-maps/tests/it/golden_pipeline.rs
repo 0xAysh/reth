@@ -5,8 +5,14 @@
 //! digests, and content counts; its `parser` accepts only the canonical text form and checks the
 //! relationships between sections. The local `replay` module drives every fixture through the pure
 //! log value stream and checks only recorded
-//! pointer, boundary, termination, and slot-classification evidence against emitted events.
+//! pointer, boundary, termination, and slot-classification evidence against emitted events. The
+//! local `render` module drives every fixture through the public renderer and compares its maps
+//! with Geth's rendered rows.
 
+#[path = "golden_pipeline/input.rs"]
+mod input;
+#[path = "golden_pipeline/render.rs"]
+mod render;
 #[path = "golden_pipeline/replay.rs"]
 mod replay;
 
