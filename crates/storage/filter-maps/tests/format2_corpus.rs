@@ -159,10 +159,7 @@ impl RenderedChain {
             .collect::<Vec<_>>();
 
         let mut pointers = BTreeMap::new();
-        let rendered = maps.iter().flat_map(|anchored| {
-            let map = anchored.map().block_pointers().iter().copied();
-            map.chain(std::iter::once(anchored.resume_anchor().pointer))
-        });
+        let rendered = maps.iter().flat_map(AnchoredCompletedMap::established_pointers);
         for pointer in fixture.pointers.iter().copied().map(golden::pointer).chain(rendered) {
             let known = *pointers.entry(pointer.block_number).or_insert(pointer);
             assert_eq!(known, pointer, "the fixture and the renderer disagree on a pointer");

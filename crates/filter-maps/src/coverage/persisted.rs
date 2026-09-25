@@ -556,25 +556,25 @@ mod tests {
 
     #[test]
     fn stored_catalog_restores_without_granting_queryability() {
-        let mut coverage = CoverageSet::new(identity());
+        let mut coverage = CoverageSet::new(identity(PARAMS));
         let anchors = anchors_through(0, aligned(2, 30));
         coverage.open_segment_batch(SegmentOrigin::Genesis, anchors.clone()).unwrap();
 
         let restored = StructurallyRestoredCoverage::restore(
-            &identity(),
+            &identity(PARAMS),
             coverage.stored_record(),
             anchors,
             &mut AcceptAllCheckpoints,
         )
         .unwrap();
         assert_eq!(restored.segments().len(), 1);
-        let queryable = activate(&restored, |number| Some(hash(number)));
+        let queryable = activate(&restored, |number| Some(block_hash(number)));
         assert!(queryable.covers(29));
     }
 
     #[test]
     fn canonical_mismatch_disables_only_affected_segment() {
-        let mut coverage = CoverageSet::new(identity());
+        let mut coverage = CoverageSet::new(identity(PARAMS));
         let first = anchors_through(0, aligned(1, 20));
         let second_origin = aligned(9, 100);
         let second = anchors_through(10, aligned(11, 120));
@@ -582,14 +582,14 @@ mod tests {
         coverage.open_segment_batch(checkpoint(second_origin), second.clone()).unwrap();
         let all_anchors = first.into_iter().chain(second).collect::<Vec<_>>();
         let restored = StructurallyRestoredCoverage::restore(
-            &identity(),
+            &identity(PARAMS),
             coverage.stored_record(),
             all_anchors,
             &mut AcceptAllCheckpoints,
         )
         .unwrap();
 
-        let queryable = activate(&restored, |number| (number < 100).then(|| hash(number)));
+        let queryable = activate(&restored, |number| (number < 100).then(|| block_hash(number)));
         assert_eq!(queryable.segments().len(), 1);
         assert!(queryable.covers(19));
         assert!(!queryable.covers(100));
@@ -601,7 +601,7 @@ mod tests {
         let predecessor = aligned(5, 60);
         let anchors = anchors_through(10, aligned(12, 130));
         let record = StoredCoverageRecord {
-            identity: identity(),
+            identity: identity(PARAMS),
             segments: vec![StoredSegmentRecord {
                 origin: StoredSegmentOrigin::Checkpoint {
                     origin_anchor: origin,
@@ -612,14 +612,14 @@ mod tests {
             }],
         };
         let restored = StructurallyRestoredCoverage::restore(
-            &identity(),
+            &identity(PARAMS),
             record,
             anchors,
             &mut AcceptAllCheckpoints,
         )
         .unwrap();
         let queryable = activate(&restored, |number| {
-            Some(if number == 60 { B256::ZERO } else { hash(number) })
+            Some(if number == 60 { B256::ZERO } else { block_hash(number) })
         });
         assert!(queryable.segments().is_empty());
     }
@@ -629,10 +629,10 @@ mod tests {
         // Block 100 began inside map 9, so it lies in the pointer span but is not covered.
         let origin = anchor(9, 100, 10 * VPM - 3);
         let anchors = anchors_through(10, aligned(12, 130));
-        let mut coverage = CoverageSet::new(identity());
+        let mut coverage = CoverageSet::new(identity(PARAMS));
         coverage.open_segment_batch(checkpoint(origin), anchors.clone()).unwrap();
         let restored = StructurallyRestoredCoverage::restore(
-            &identity(),
+            &identity(PARAMS),
             coverage.stored_record(),
             anchors,
             &mut AcceptAllCheckpoints,
@@ -643,7 +643,7 @@ mod tests {
 
         let activate_with = |pointers: BTreeMap<u64, BlockPointer>| {
             restored.activate(
-                |number| Ok::<_, Infallible>(Some(hash(number))),
+                |number| Ok::<_, Infallible>(Some(block_hash(number))),
                 |number| Ok::<_, Infallible>(pointers.get(&number).copied()),
             )
         };
@@ -658,7 +658,7 @@ mod tests {
         let previous_index = stored[&115].first_log_value_index;
         for (pointers, block_number) in [
             (corrupt(100, &|pointer| pointer.first_log_value_index -= 1), 100),
-            (corrupt(115, &|pointer| pointer.block_hash = hash(0xff)), 115),
+            (corrupt(115, &|pointer| pointer.block_hash = block_hash(0xff)), 115),
             (corrupt(116, &|pointer| pointer.first_log_value_index = previous_index), 116),
             (corrupt(120, &|pointer| pointer.first_log_value_index -= 1), 120),
         ] {
@@ -679,7 +679,8 @@ mod tests {
             Err(CanonicalActivationError::MissingPointer { block_number: 100 })
         ));
         assert!(matches!(
-            restored.activate(|number| Ok::<_, ()>(Some(hash(number))), |_| Err("unreadable")),
+            restored
+                .activate(|number| Ok::<_, ()>(Some(block_hash(number))), |_| Err("unreadable")),
             Err(CanonicalActivationError::PointerLookup("unreadable"))
         ));
     }
@@ -696,7 +697,7 @@ mod tests {
             anchor: MapResumeAnchor,
             provenance: CheckpointProvenance,
         ) -> bool {
-            identity == &crate::coverage::test_utils::identity() &&
+            identity == &crate::coverage::test_utils::identity(crate::coverage::test_utils::PARAMS) &&
                 provenance == CheckpointProvenance::Recognized { id: self.id } &&
                 anchor == self.anchor
         }
@@ -707,7 +708,7 @@ mod tests {
         let origin = aligned(9, 100);
         let terminal = aligned(10, 110);
         let record = StoredCoverageRecord {
-            identity: identity(),
+            identity: identity(PARAMS),
             segments: vec![StoredSegmentRecord {
                 origin: StoredSegmentOrigin::Checkpoint {
                     origin_anchor: origin,
@@ -719,7 +720,7 @@ mod tests {
         };
         assert!(matches!(
             StructurallyRestoredCoverage::restore(
-                &identity(),
+                &identity(PARAMS),
                 record.clone(),
                 [terminal],
                 &mut RejectUnrecognizedCheckpoints,
@@ -727,7 +728,7 @@ mod tests {
             Err(PersistedCoverageError::UnverifiedOrigin)
         ));
         assert!(StructurallyRestoredCoverage::restore(
-            &identity(),
+            &identity(PARAMS),
             record.clone(),
             [terminal],
             &mut ExactCheckpointVerifier { id: 7, anchor: origin },
@@ -735,7 +736,7 @@ mod tests {
         .is_ok());
         assert!(matches!(
             StructurallyRestoredCoverage::restore(
-                &identity(),
+                &identity(PARAMS),
                 record,
                 [terminal],
                 &mut ExactCheckpointVerifier { id: 8, anchor: origin },
@@ -746,7 +747,7 @@ mod tests {
 
     #[test]
     fn self_minted_origins_restore_without_a_checkpoint_verifier() {
-        let mut coverage = CoverageSet::new(identity());
+        let mut coverage = CoverageSet::new(identity(PARAMS));
         let anchors = anchors_through(0, aligned(4, 50));
         coverage.open_segment_batch(SegmentOrigin::Genesis, anchors.clone()).unwrap();
         let checkpoint = queryable(&coverage).derived_checkpoint(anchors[1]).unwrap();
@@ -754,7 +755,7 @@ mod tests {
         let retained = coverage.clone();
         assert!(matches!(retained.segments()[0].origin(), SegmentOrigin::Retained(_)));
         let restored = StructurallyRestoredCoverage::restore(
-            &identity(),
+            &identity(PARAMS),
             retained.stored_record(),
             anchors[2..].iter().copied(),
             &mut RejectUnrecognizedCheckpoints,
@@ -762,12 +763,12 @@ mod tests {
         .unwrap();
         assert_eq!(restored.segments(), retained.segments());
 
-        let mut published = CoverageSet::new(identity());
+        let mut published = CoverageSet::new(identity(PARAMS));
         published
             .open_segment_batch(SegmentOrigin::Checkpoint(checkpoint), anchors[2..].to_vec())
             .unwrap();
         let restored = StructurallyRestoredCoverage::restore(
-            &identity(),
+            &identity(PARAMS),
             published.stored_record(),
             anchors[2..].iter().copied(),
             &mut RejectUnrecognizedCheckpoints,
@@ -778,13 +779,13 @@ mod tests {
 
     #[test]
     fn only_canonically_activated_coverage_mints_published_coverage_checkpoints() {
-        let mut coverage = CoverageSet::new(identity());
+        let mut coverage = CoverageSet::new(identity(PARAMS));
         let canonical = anchors_through(0, aligned(1, 20));
         let reorged = anchors_through(10, aligned(11, 120));
         coverage.open_segment_batch(SegmentOrigin::Genesis, canonical.clone()).unwrap();
         coverage.open_segment_batch(checkpoint(aligned(9, 100)), reorged.clone()).unwrap();
         let restored = restored(&coverage);
-        let queryable = activate(&restored, |number| (number < 100).then(|| hash(number)));
+        let queryable = activate(&restored, |number| (number < 100).then(|| block_hash(number)));
 
         let minted = queryable.derived_checkpoint(canonical[0]).unwrap();
         assert_eq!(minted.anchor(), canonical[0]);
@@ -804,7 +805,7 @@ mod tests {
 
     #[test]
     fn restored_transitions_return_new_states_and_leave_the_source_unchanged() {
-        let mut coverage = CoverageSet::new(identity());
+        let mut coverage = CoverageSet::new(identity(PARAMS));
         let anchors = anchors_through(0, aligned(4, 50));
         coverage.open_segment_batch(SegmentOrigin::Genesis, anchors[..2].to_vec()).unwrap();
         let restored = restored(&coverage);
@@ -827,12 +828,12 @@ mod tests {
 
     #[test]
     fn restoration_fails_closed_on_identity_mismatch() {
-        let mut stored = identity();
+        let mut stored = identity(PARAMS);
         stored.params = crate::ParamsId::RangeTest;
         let record = StoredCoverageRecord { identity: stored, segments: Vec::new() };
         assert!(matches!(
             StructurallyRestoredCoverage::restore(
-                &identity(),
+                &identity(PARAMS),
                 record,
                 [],
                 &mut RejectUnrecognizedCheckpoints,
@@ -846,7 +847,7 @@ mod tests {
         let first = anchors_through(0, aligned(1, 100));
         let second = anchors_through(10, aligned(12, 130));
         let record = StoredCoverageRecord {
-            identity: identity(),
+            identity: identity(PARAMS),
             segments: vec![
                 StoredSegmentRecord {
                     origin: StoredSegmentOrigin::Genesis,
@@ -862,7 +863,7 @@ mod tests {
         };
         assert!(matches!(
             StructurallyRestoredCoverage::restore(
-                &identity(),
+                &identity(PARAMS),
                 record,
                 first.into_iter().chain(second),
                 &mut RejectUnrecognizedCheckpoints,
@@ -875,7 +876,7 @@ mod tests {
     fn restoration_merges_exactly_continuing_segments() {
         let join = aligned(5, 60);
         let record = StoredCoverageRecord {
-            identity: identity(),
+            identity: identity(PARAMS),
             segments: vec![
                 StoredSegmentRecord {
                     origin: StoredSegmentOrigin::Genesis,
@@ -892,7 +893,7 @@ mod tests {
         let anchors =
             anchors_through(0, join).into_iter().chain(anchors_through(6, aligned(8, 90)));
         let restored = StructurallyRestoredCoverage::restore(
-            &identity(),
+            &identity(PARAMS),
             record,
             anchors,
             &mut RejectUnrecognizedCheckpoints,
@@ -905,7 +906,7 @@ mod tests {
     #[test]
     fn derived_checkpoint_requires_explicit_verification() {
         let record = StoredCoverageRecord {
-            identity: identity(),
+            identity: identity(PARAMS),
             segments: vec![StoredSegmentRecord {
                 origin: StoredSegmentOrigin::Checkpoint {
                     origin_anchor: aligned(9, 100),
@@ -917,7 +918,7 @@ mod tests {
         };
         assert!(matches!(
             StructurallyRestoredCoverage::restore(
-                &identity(),
+                &identity(PARAMS),
                 record,
                 [aligned(10, 110)],
                 &mut RejectUnrecognizedCheckpoints,
@@ -929,7 +930,7 @@ mod tests {
     #[test]
     fn restoration_rejects_missing_and_unexpected_anchors() {
         let record = StoredCoverageRecord {
-            identity: identity(),
+            identity: identity(PARAMS),
             segments: vec![StoredSegmentRecord {
                 origin: StoredSegmentOrigin::Genesis,
                 first_map: 0,
@@ -938,17 +939,17 @@ mod tests {
         };
         assert!(matches!(
             StructurallyRestoredCoverage::restore(
-                &identity(),
+                &identity(PARAMS),
                 record,
                 [aligned(0, 10)],
                 &mut AcceptAllCheckpoints,
             ),
             Err(PersistedCoverageError::MissingAnchor { map_index: 1 })
         ));
-        let empty = StoredCoverageRecord { identity: identity(), segments: Vec::new() };
+        let empty = StoredCoverageRecord { identity: identity(PARAMS), segments: Vec::new() };
         assert!(matches!(
             StructurallyRestoredCoverage::restore(
-                &identity(),
+                &identity(PARAMS),
                 empty.clone(),
                 [aligned(0, 10), aligned(0, 10)],
                 &mut AcceptAllCheckpoints,
@@ -957,7 +958,7 @@ mod tests {
         ));
         assert!(matches!(
             StructurallyRestoredCoverage::restore(
-                &identity(),
+                &identity(PARAMS),
                 empty,
                 [aligned(0, 10)],
                 &mut AcceptAllCheckpoints,

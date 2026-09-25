@@ -1,28 +1,29 @@
-pub(super) use crate::test_utils::AcceptAllCheckpoints;
+//! Unit-test helpers that reach coverage internals.
+//!
+//! These hand-build anchors, segments, and checkpoints and round-trip the crate-private
+//! [`CoverageSet`], which the public [`crate::test_utils`] cannot do. The synthetic chain itself,
+//! [`block_hash`] and [`identity`], comes from the public module and is re-exported here, so no
+//! helper is defined in both. Anchors here assume [`PARAMS`]: one map spans [`VPM`] values.
+
+pub(super) use crate::test_utils::{block_hash, identity, AcceptAllCheckpoints};
 use crate::{
     coverage::{
-        CoverageSet, IndexIdentity, QueryableCoverage, SegmentOrigin, StructurallyRestoredCoverage,
-        ValidatedSegment, VerifiedCheckpoint, STORAGE_FORMAT_V1,
+        CoverageSet, QueryableCoverage, SegmentOrigin, StructurallyRestoredCoverage,
+        ValidatedSegment, VerifiedCheckpoint,
     },
-    BlockPointer, MapBoundary, MapResumeAnchor, ParamsId, DEFAULT_PARAMS, GETH_V1,
+    BlockPointer, MapBoundary, MapResumeAnchor, ParamsId, DEFAULT_PARAMS,
 };
 use alloy_primitives::B256;
 use std::{collections::BTreeMap, convert::Infallible};
 
+/// Parameter set every hand-built anchor assumes.
+pub(super) const PARAMS: ParamsId = ParamsId::Default;
 pub(super) const VPM: u64 = DEFAULT_PARAMS.values_per_map();
-
-pub(super) fn hash(byte: u64) -> B256 {
-    B256::repeat_byte(byte as u8)
-}
-
-pub(super) fn identity() -> IndexIdentity {
-    IndexIdentity::new(STORAGE_FORMAT_V1, 1, hash(0), GETH_V1, ParamsId::Default)
-}
 
 pub(super) fn anchor(map: u32, block: u64, index: u64) -> MapResumeAnchor {
     MapResumeAnchor::new(
-        MapBoundary::new(map, block, hash(block)),
-        BlockPointer::new(block, hash(block), index),
+        MapBoundary::new(map, block, block_hash(block)),
+        BlockPointer::new(block, block_hash(block), index),
     )
     .unwrap()
 }
@@ -33,7 +34,7 @@ pub(super) fn aligned(map: u32, block: u64) -> MapResumeAnchor {
 
 pub(super) fn checkpoint(anchor: MapResumeAnchor) -> SegmentOrigin {
     SegmentOrigin::Checkpoint(VerifiedCheckpoint::recognized(
-        identity(),
+        identity(PARAMS),
         anchor,
         u64::from(anchor.completed_map_index),
     ))
@@ -71,8 +72,11 @@ pub(super) fn stored_pointers<'a>(
         pointers.insert(previous.block_number, previous);
         for anchor in segment.anchors() {
             for number in previous.block_number + 1..anchor.pointer.block_number {
-                previous =
-                    BlockPointer::new(number, hash(number), previous.first_log_value_index + 1);
+                previous = BlockPointer::new(
+                    number,
+                    block_hash(number),
+                    previous.first_log_value_index + 1,
+                );
                 pointers.insert(number, previous);
             }
             previous = anchor.pointer;
@@ -111,5 +115,5 @@ pub(super) fn activate(
 
 /// Restores and activates `set` on a chain that agrees with every one of its anchors.
 pub(super) fn queryable(set: &CoverageSet) -> QueryableCoverage {
-    activate(&restored(set), |number| Some(hash(number)))
+    activate(&restored(set), |number| Some(block_hash(number)))
 }

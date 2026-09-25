@@ -93,31 +93,18 @@ impl VerifiedCheckpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{coverage::STORAGE_FORMAT_V1, BlockPointer, MapBoundary, ParamsId, GETH_V1};
-    use alloy_primitives::B256;
-
-    fn hash(byte: u8) -> B256 {
-        B256::repeat_byte(byte)
-    }
-
-    fn identity() -> IndexIdentity {
-        IndexIdentity::new(STORAGE_FORMAT_V1, 1, hash(0xd4), GETH_V1, ParamsId::Default)
-    }
-
-    fn checkpoint() -> ValueSpaceCheckpoint {
-        let anchor = MapResumeAnchor::new(
-            MapBoundary::new(9, 1000, hash(0x10)),
-            BlockPointer::new(1000, hash(0x10), 123_456),
-        )
-        .unwrap();
-        ValueSpaceCheckpoint::new(identity(), anchor, CheckpointProvenance::Recognized { id: 7 })
-    }
+    use crate::coverage::test_utils::{anchor, identity, PARAMS};
 
     #[test]
     fn checkpoint_binds_identity_and_anchor() {
-        let checkpoint = checkpoint();
-        assert_eq!(checkpoint.identity(), &identity());
+        let anchor = anchor(9, 1000, 123_456);
+        let checkpoint = ValueSpaceCheckpoint::new(
+            identity(PARAMS),
+            anchor,
+            CheckpointProvenance::Recognized { id: 7 },
+        );
+        assert_eq!(checkpoint.identity(), &identity(PARAMS));
         assert_eq!(checkpoint.provenance(), CheckpointProvenance::Recognized { id: 7 });
-        assert_eq!(checkpoint.anchor().pointer, BlockPointer::new(1000, hash(0x10), 123_456));
+        assert_eq!(checkpoint.anchor(), anchor);
     }
 }

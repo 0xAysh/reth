@@ -218,7 +218,7 @@ mod tests {
 
     /// Blocks 0..=19 over maps 0..=1 and blocks 100..=129 over maps 10..=12.
     fn coverage() -> QueryableCoverage {
-        let mut set = CoverageSet::new(identity());
+        let mut set = CoverageSet::new(identity(PARAMS));
         set.open_segment_batch(SegmentOrigin::Genesis, anchors_through(0, aligned(1, 20))).unwrap();
         set.open_segment_batch(checkpoint(aligned(9, 100)), anchors_through(10, aligned(12, 130)))
             .unwrap();
@@ -272,8 +272,9 @@ mod tests {
     #[test]
     fn block_hash_query_bypasses_coverage() {
         let plan =
-            QueryPlan::new(LogQueryTarget::BlockHash(hash(7)), true, &coverage(), 0u64).unwrap();
-        assert_eq!(plan.source(), &CandidateSource::ResolveBlockHash(hash(7)));
+            QueryPlan::new(LogQueryTarget::BlockHash(block_hash(7)), true, &coverage(), 0u64)
+                .unwrap();
+        assert_eq!(plan.source(), &CandidateSource::ResolveBlockHash(block_hash(7)));
     }
 
     #[test]

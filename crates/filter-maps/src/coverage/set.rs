@@ -359,7 +359,7 @@ mod tests {
 
     #[test]
     fn genesis_segment_grows_through_its_terminal_only() {
-        let mut set = CoverageSet::new(identity());
+        let mut set = CoverageSet::new(identity(PARAMS));
         open_through(&mut set, SegmentOrigin::Genesis, aligned(0, 10)).unwrap();
         assert_eq!(blocks(&set), vec![Some(0..=9)]);
 
@@ -376,7 +376,7 @@ mod tests {
 
     #[test]
     fn disjoint_checkpoint_segments_remain_independent() {
-        let mut set = CoverageSet::new(identity());
+        let mut set = CoverageSet::new(identity(PARAMS));
         open_through(&mut set, SegmentOrigin::Genesis, aligned(1, 20)).unwrap();
         open_through(&mut set, checkpoint(aligned(9, 100)), aligned(12, 130)).unwrap();
         assert_eq!(blocks(&set), vec![Some(0..=19), Some(100..=129)]);
@@ -389,7 +389,7 @@ mod tests {
     #[test]
     fn adjacent_segments_merge_only_under_exact_anchor_continuity() {
         let join = anchor(9, 100, 10 * VPM - 5);
-        let mut set = CoverageSet::new(identity());
+        let mut set = CoverageSet::new(identity(PARAMS));
         open_through(&mut set, SegmentOrigin::Genesis, aligned(1, 20)).unwrap();
         open_through(&mut set, checkpoint(join), aligned(12, 130)).unwrap();
         // Block 100 straddles the join and is not yet covered by either side.
@@ -417,7 +417,7 @@ mod tests {
 
     #[test]
     fn a_new_segment_merges_into_the_one_it_continues() {
-        let mut set = CoverageSet::new(identity());
+        let mut set = CoverageSet::new(identity(PARAMS));
         open_through(&mut set, SegmentOrigin::Genesis, aligned(1, 20)).unwrap();
         open_through(&mut set, checkpoint(aligned(1, 20)), aligned(4, 50)).unwrap();
         assert_eq!(blocks(&set), vec![Some(0..=49)]);
@@ -425,7 +425,7 @@ mod tests {
 
     #[test]
     fn overlapping_publication_is_rejected() {
-        let mut set = CoverageSet::new(identity());
+        let mut set = CoverageSet::new(identity(PARAMS));
         open_through(&mut set, SegmentOrigin::Genesis, aligned(5, 60)).unwrap();
         assert!(matches!(
             open_through(&mut set, checkpoint(aligned(2, 30)), aligned(8, 90)),
@@ -440,8 +440,8 @@ mod tests {
 
     #[test]
     fn checkpoint_for_another_identity_is_rejected() {
-        let mut set = CoverageSet::new(identity());
-        let mut other = identity();
+        let mut set = CoverageSet::new(identity(PARAMS));
+        let mut other = identity(PARAMS);
         other.chain_id = 2;
         let foreign = VerifiedCheckpoint::derived(other, aligned(9, 100));
         assert!(matches!(
@@ -449,7 +449,7 @@ mod tests {
             Err(PublishError::Segment(SegmentError::Identity(_)))
         ));
 
-        other = identity();
+        other = identity(PARAMS);
         other.params = ParamsId::RangeTest;
         let foreign = VerifiedCheckpoint::derived(other, aligned(9, 100));
         assert!(matches!(
@@ -460,7 +460,7 @@ mod tests {
 
     #[test]
     fn reorg_contracts_to_the_preceding_safe_anchor() {
-        let mut set = CoverageSet::new(identity());
+        let mut set = CoverageSet::new(identity(PARAMS));
         let safe = aligned(2, 30);
         open_through(&mut set, SegmentOrigin::Genesis, safe).unwrap();
         extend_through(&mut set, safe, aligned(5, 60)).unwrap();
@@ -476,7 +476,7 @@ mod tests {
 
     #[test]
     fn reorg_rejects_an_anchor_whose_map_holds_the_changed_block() {
-        let mut set = CoverageSet::new(identity());
+        let mut set = CoverageSet::new(identity(PARAMS));
         open_through(&mut set, SegmentOrigin::Genesis, aligned(5, 60)).unwrap();
         let before = set.clone();
 
@@ -498,7 +498,7 @@ mod tests {
 
     #[test]
     fn reorg_without_a_safe_anchor_disables_the_segment() {
-        let mut set = CoverageSet::new(identity());
+        let mut set = CoverageSet::new(identity(PARAMS));
         open_through(&mut set, SegmentOrigin::Genesis, aligned(5, 60)).unwrap();
         let outcome = set.contract_for_reorg(33, None).unwrap();
         assert_eq!(outcome.rebuild_from, None);
@@ -508,7 +508,7 @@ mod tests {
 
     #[test]
     fn reorg_disables_segments_that_lie_beyond_the_change_and_keeps_earlier_ones() {
-        let mut set = CoverageSet::new(identity());
+        let mut set = CoverageSet::new(identity(PARAMS));
         open_through(&mut set, SegmentOrigin::Genesis, aligned(1, 20)).unwrap();
         let second_origin = aligned(9, 100);
         let safe = aligned(10, 110);
@@ -525,7 +525,7 @@ mod tests {
     #[test]
     fn reorg_at_a_checkpoint_segment_origin_removes_it_and_keeps_the_origin() {
         let origin = aligned(9, 100);
-        let mut set = CoverageSet::new(identity());
+        let mut set = CoverageSet::new(identity(PARAMS));
         open_through(&mut set, checkpoint(origin), aligned(12, 130)).unwrap();
         let outcome = set.contract_for_reorg(105, Some(origin)).unwrap();
         assert_eq!(outcome.rebuild_from, Some(origin));
@@ -535,7 +535,7 @@ mod tests {
 
     #[test]
     fn retention_contraction_immediately_removes_visibility() {
-        let mut set = CoverageSet::new(identity());
+        let mut set = CoverageSet::new(identity(PARAMS));
         let tail = anchor(2, 30, 3 * VPM - 1);
         open_through(&mut set, SegmentOrigin::Genesis, tail).unwrap();
         extend_through(&mut set, tail, aligned(5, 60)).unwrap();
@@ -556,7 +556,7 @@ mod tests {
 
     #[test]
     fn retention_rejects_an_anchor_the_set_did_not_publish() {
-        let mut set = CoverageSet::new(identity());
+        let mut set = CoverageSet::new(identity(PARAMS));
         open_through(&mut set, SegmentOrigin::Genesis, aligned(1, 20)).unwrap();
         open_through(&mut set, checkpoint(aligned(9, 100)), aligned(12, 130)).unwrap();
         let before = set.clone();
@@ -575,14 +575,14 @@ mod tests {
         use crate::coverage::BlockReceiptEvidence;
         use alloy_eips::BlockNumHash;
 
-        let mut set = CoverageSet::new(identity());
+        let mut set = CoverageSet::new(identity(PARAMS));
         open_through(&mut set, SegmentOrigin::Genesis, aligned(5, 60)).unwrap();
 
         // Block 60 retained only selected receipts: construction stops before releasing it, so
         // the segment ends at the last safely publishable map.
         let hole = BlockReceiptEvidence {
-            block: BlockNumHash::new(60, hash(60)),
-            canonical_hash: Some(hash(60)),
+            block: BlockNumHash::new(60, block_hash(60)),
+            canonical_hash: Some(block_hash(60)),
             persisted: true,
             transaction_count: 4,
             receipt_count: Some(1),

@@ -96,10 +96,7 @@ impl PointerEvidence {
     /// Normalizes the start pointer, every map's block pointers, and every resume anchor pointer.
     fn collect(start: BlockPointer, maps: &[AnchoredCompletedMap]) -> Result<Self, PublishError> {
         let mut pointers = std::iter::once(start)
-            .chain(maps.iter().flat_map(|anchored| {
-                let map = anchored.map().block_pointers().iter().copied();
-                map.chain(std::iter::once(anchored.resume_anchor().pointer))
-            }))
+            .chain(maps.iter().flat_map(AnchoredCompletedMap::established_pointers))
             .collect::<Vec<_>>();
         // Sorting groups every report of one block. Dropping exact repeats leaves two entries for
         // a block only when they disagree, which the consecutive-block check below rejects.
@@ -190,36 +187,22 @@ impl StructurallyRestoredCoverage {
 mod tests {
     use super::*;
     use crate::{
-        coverage::{RejectUnrecognizedCheckpoints, StoredCoverageRecord, STORAGE_FORMAT_V1},
-        test_utils::{recognized_checkpoint, render_from_genesis},
-        BlockInput, LogInput, ParamsId, GETH_V1, RANGE_TEST_PARAMS,
+        test_utils::{
+            block_hash, empty_coverage, identity, recognized_checkpoint, render_from_genesis,
+        },
+        BlockInput, LogInput, ParamsId, RANGE_TEST_PARAMS,
     };
-    use alloy_primitives::{Address, B256};
+    use alloy_primitives::Address;
     use std::{collections::BTreeMap, convert::Infallible};
 
-    fn hash(number: u64) -> B256 {
-        B256::repeat_byte(number as u8)
-    }
-
-    fn identity() -> IndexIdentity {
-        IndexIdentity::new(STORAGE_FORMAT_V1, 1, hash(0), GETH_V1, ParamsId::RangeTest)
-    }
-
-    fn empty() -> StructurallyRestoredCoverage {
-        StructurallyRestoredCoverage::restore(
-            &identity(),
-            StoredCoverageRecord { identity: identity(), segments: Vec::new() },
-            [],
-            &mut RejectUnrecognizedCheckpoints,
-        )
-        .unwrap()
-    }
+    /// Identity under which [`render`]'s maps are published.
+    const IDENTITY: IndexIdentity = identity(ParamsId::RangeTest);
 
     /// Renders `count` one-slot maps from genesis over blocks that each hold `logs` logs.
     fn render(count: usize, logs: usize) -> Vec<AnchoredCompletedMap> {
         let blocks = (0..=count as u64).map(|number| {
             let logs = (0..logs).map(|_| LogInput::new(Address::repeat_byte(0x11), []));
-            BlockInput::new(number, hash(number), logs)
+            BlockInput::new(number, block_hash(number), logs)
         });
         let mut maps = render_from_genesis(RANGE_TEST_PARAMS, blocks.collect()).maps;
         assert!(maps.len() >= count, "expected {count} maps");
@@ -242,7 +225,7 @@ mod tests {
         for logs in 0..=3 {
             let maps = render(MAPS, logs);
             let genesis = PublicationStart::Open { origin: SegmentOrigin::Genesis };
-            let (whole, _) = next(empty().propose(&genesis, &maps).unwrap());
+            let (whole, _) = next(empty_coverage(&IDENTITY).propose(&genesis, &maps).unwrap());
 
             for splits in 0u32..1 << (MAPS - 1) {
                 // Bit `i` of `splits` starts a new batch at map `i + 1`.
@@ -252,7 +235,7 @@ mod tests {
                     .collect::<Vec<_>>();
                 let batches = bounds.windows(2).map(|pair| pair[0]..pair[1]).collect::<Vec<_>>();
 
-                let mut coverage = empty();
+                let mut coverage = empty_coverage(&IDENTITY);
                 let mut stored = BTreeMap::new();
                 let mut starts = Vec::new();
                 let mut start = genesis.clone();
@@ -260,7 +243,7 @@ mod tests {
                     let (published, pointers) =
                         next(coverage.propose(&start, &maps[batch.clone()]).unwrap());
                     let first = pointers.pointers()[0];
-                    assert_eq!(first, start.start_pointer(&identity()), "{logs} logs, {batches:?}");
+                    assert_eq!(first, start.start_pointer(&IDENTITY), "{logs} logs, {batches:?}");
                     for pointer in pointers.pointers() {
                         let previous = stored.insert(pointer.block_number, *pointer);
                         assert!(previous.is_none_or(|previous| previous == *pointer));
@@ -274,7 +257,7 @@ mod tests {
                 assert!(stored.keys().copied().eq(segment.pointer_span()));
                 coverage
                     .activate(
-                        |number| Ok::<_, Infallible>(Some(hash(number))),
+                        |number| Ok::<_, Infallible>(Some(block_hash(number))),
                         |number| Ok::<_, Infallible>(stored.get(&number).copied()),
                     )
                     .unwrap();
@@ -294,9 +277,10 @@ mod tests {
     fn retry_is_recognized_inside_a_merged_segment() {
         let maps = render(4, 1);
         let origin =
-            recognized_checkpoint(identity(), maps[1].resume_anchor(), maps[2].resume_anchor());
+            recognized_checkpoint(IDENTITY, maps[1].resume_anchor(), maps[2].resume_anchor());
         let checkpoint_start = PublicationStart::Open { origin };
-        let (coverage, _) = next(empty().propose(&checkpoint_start, &maps[2..]).unwrap());
+        let (coverage, _) =
+            next(empty_coverage(&IDENTITY).propose(&checkpoint_start, &maps[2..]).unwrap());
         let genesis = PublicationStart::Open { origin: SegmentOrigin::Genesis };
         let (coverage, _) = next(coverage.propose(&genesis, &maps[..2]).unwrap());
         assert_eq!(coverage.segments().len(), 1, "exactly continuing segments merge");
@@ -317,7 +301,8 @@ mod tests {
     #[test]
     fn covered_maps_accept_only_an_exact_retry() {
         let genesis = PublicationStart::Open { origin: SegmentOrigin::Genesis };
-        let (coverage, _) = next(empty().propose(&genesis, &render(2, 1)).unwrap());
+        let (coverage, _) =
+            next(empty_coverage(&IDENTITY).propose(&genesis, &render(2, 1)).unwrap());
         assert_eq!(
             coverage.propose(&genesis, &render(2, 0)),
             Err(PublishError::AlreadyCovered { map_index: 0 })
@@ -328,32 +313,27 @@ mod tests {
     fn batch_shape_is_checked_against_the_start() {
         let maps = render(4, 1);
         let genesis = PublicationStart::Open { origin: SegmentOrigin::Genesis };
-        assert_eq!(empty().propose(&genesis, &[]), Err(PublishError::EmptyPublication));
         assert_eq!(
-            empty().propose(&genesis, &maps[1..]),
+            empty_coverage(&IDENTITY).propose(&genesis, &[]),
+            Err(PublishError::EmptyPublication)
+        );
+        assert_eq!(
+            empty_coverage(&IDENTITY).propose(&genesis, &maps[1..]),
             Err(SegmentError::MissingMapAnchor { expected: 0, actual: 1 }.into())
         );
         let mut gap = render(3, 1);
         gap.remove(1);
         assert_eq!(
-            empty().propose(&genesis, &gap),
+            empty_coverage(&IDENTITY).propose(&genesis, &gap),
             Err(SegmentError::MissingMapAnchor { expected: 1, actual: 2 }.into())
         );
         let extend = PublicationStart::Extend { from: maps[0].resume_anchor() };
         assert_eq!(
-            empty().propose(&extend, &maps[2..]),
+            empty_coverage(&IDENTITY).propose(&extend, &maps[2..]),
             Err(SegmentError::MissingMapAnchor { expected: 1, actual: 2 }.into())
         );
 
-        let mut other = identity();
-        other.params = ParamsId::Default;
-        let coverage = StructurallyRestoredCoverage::restore(
-            &other,
-            StoredCoverageRecord { identity: other, segments: Vec::new() },
-            [],
-            &mut RejectUnrecognizedCheckpoints,
-        )
-        .unwrap();
+        let coverage = empty_coverage(&identity(ParamsId::Default));
         assert_eq!(
             coverage.propose(&genesis, &maps[..1]),
             Err(PublishError::ParamsMismatch {
@@ -368,7 +348,7 @@ mod tests {
     fn start_pointer_must_agree_with_the_batch_pointers() {
         let maps = render(4, 1);
         let genesis = PublicationStart::Open { origin: SegmentOrigin::Genesis };
-        let (coverage, _) = next(empty().propose(&genesis, &maps[..2]).unwrap());
+        let (coverage, _) = next(empty_coverage(&IDENTITY).propose(&genesis, &maps[..2]).unwrap());
 
         // A predecessor that names map 1 but places its resume block elsewhere in the value space.
         let mut from = maps[1].resume_anchor();

@@ -7,37 +7,32 @@
 //! [`RANGE_TEST_PARAMS`] gives one slot per map, so every slot completes a map and every block
 //! with logs spans several maps.
 
-use alloy_primitives::{Address, B256};
+use alloy_primitives::Address;
 use reth_filter_maps::{
     coverage::{
         CandidateSource, IndexIdentity, LogQueryTarget, PlannedSubrange, PublicationProposal,
-        PublicationStart, QueryPlan, QueryableCoverage, RejectUnrecognizedCheckpoints,
-        SegmentOrigin, StoredCoverageRecord, StructurallyRestoredCoverage, STORAGE_FORMAT_V1,
+        PublicationStart, QueryPlan, QueryableCoverage, SegmentOrigin,
+        StructurallyRestoredCoverage,
     },
+    test_utils::{block_hash, empty_coverage, identity},
     AnchoredCompletedMap, BlockInput, BlockPointer, FilterMapRenderer, IndexedMatchRange, LogInput,
     LogValueSlot, LogValueStream, LogValueStreamEvent, LogValueStreamItem,
     LogValueStreamTermination, MapResumeAnchor, ParamsId, RendererCompletion, RendererOutput,
-    GETH_V1, RANGE_TEST_PARAMS,
+    RANGE_TEST_PARAMS,
 };
 use std::{collections::BTreeMap, convert::Infallible};
 
 /// Empty head block that follows the bounded batch of [`chain`].
 const HEAD: u64 = 6;
 
-const fn hash(number: u64) -> B256 {
-    B256::repeat_byte(number as u8 + 1)
-}
-
-const fn identity() -> IndexIdentity {
-    IndexIdentity::new(STORAGE_FORMAT_V1, 1, hash(0), GETH_V1, ParamsId::RangeTest)
-}
+const IDENTITY: IndexIdentity = identity(ParamsId::RangeTest);
 
 fn block(number: u64, log_count: usize) -> BlockInput {
     // Every log is topic-free: under the range-test parameters a map holds one slot, so a wider log
     // could never fit.
     BlockInput::new(
         number,
-        hash(number),
+        block_hash(number),
         (0..log_count).map(|_| LogInput::new(Address::repeat_byte(number as u8), [])),
     )
 }
@@ -58,7 +53,7 @@ fn batch(
     blocks: Vec<BlockInput>,
 ) -> LogValueStream<std::vec::IntoIter<BlockInput>> {
     let termination = LogValueStreamTermination::BatchExhausted {
-        next_block: alloy_eips::BlockNumHash::new(HEAD, hash(HEAD)),
+        next_block: alloy_eips::BlockNumHash::new(HEAD, block_hash(HEAD)),
     };
     LogValueStream::new(RANGE_TEST_PARAMS, start, blocks, termination)
 }
@@ -85,14 +80,14 @@ fn render(
 }
 
 fn genesis_maps() -> Vec<AnchoredCompletedMap> {
-    let stream = batch(BlockPointer::new(0, hash(0), 0), chain());
+    let stream = batch(BlockPointer::new(0, block_hash(0), 0), chain());
     render(FilterMapRenderer::from_genesis(stream).unwrap())
 }
 
 /// Counts the block delimiters the stream materializes in maps through `map_index`.
 fn delimiters_through(map_index: u32) -> u64 {
     let maps_end = (u64::from(map_index) + 1) * RANGE_TEST_PARAMS.values_per_map();
-    let delimiters = batch(BlockPointer::new(0, hash(0), 0), chain()).filter(|item| {
+    let delimiters = batch(BlockPointer::new(0, block_hash(0), 0), chain()).filter(|item| {
         matches!(
             item.as_ref().unwrap(),
             LogValueStreamItem::Event(LogValueStreamEvent::Slot(
@@ -101,28 +96,6 @@ fn delimiters_through(map_index: u32) -> u64 {
         )
     });
     delimiters.count() as u64
-}
-
-/// Every block pointer the rendered maps established, which is what publishing them stores.
-fn pointers(maps: &[AnchoredCompletedMap]) -> BTreeMap<u64, BlockPointer> {
-    maps.iter()
-        .flat_map(|anchored| {
-            let map = anchored.map().block_pointers().iter().copied();
-            map.chain(std::iter::once(anchored.resume_anchor().pointer))
-        })
-        .map(|pointer| (pointer.block_number, pointer))
-        .collect()
-}
-
-/// Coverage of a freshly initialized store.
-fn empty() -> StructurallyRestoredCoverage {
-    StructurallyRestoredCoverage::restore(
-        &identity(),
-        StoredCoverageRecord { identity: identity(), segments: Vec::new() },
-        [],
-        &mut RejectUnrecognizedCheckpoints,
-    )
-    .unwrap()
 }
 
 /// Returns the coverage after publishing `maps` from `start`.
@@ -140,17 +113,26 @@ fn publish(
 /// Activates `coverage` on the fixture chain with the pointers genesis construction stored. A
 /// checkpoint enters the same value space, so those pointers serve every segment.
 fn activate(coverage: &StructurallyRestoredCoverage) -> QueryableCoverage {
-    let pointers = pointers(&genesis_maps());
+    // Publishing the maps stores every pointer they establish.
+    let pointers = genesis_maps()
+        .iter()
+        .flat_map(AnchoredCompletedMap::established_pointers)
+        .map(|pointer| (pointer.block_number, pointer))
+        .collect::<BTreeMap<_, _>>();
     coverage
         .activate(
-            |number| Ok::<_, Infallible>(Some(hash(number))),
+            |number| Ok::<_, Infallible>(Some(block_hash(number))),
             |number| Ok::<_, Infallible>(pointers.get(&number).copied()),
         )
         .unwrap()
 }
 
 fn genesis_through(maps: &[AnchoredCompletedMap]) -> StructurallyRestoredCoverage {
-    publish(&empty(), &PublicationStart::Open { origin: SegmentOrigin::Genesis }, maps)
+    publish(
+        &empty_coverage(&IDENTITY),
+        &PublicationStart::Open { origin: SegmentOrigin::Genesis },
+        maps,
+    )
 }
 
 fn checkpoint(anchor: MapResumeAnchor) -> SegmentOrigin {
@@ -190,7 +172,7 @@ fn anchors_claim_exactly_the_blocks_whose_delimiters_completed_maps() {
 
 #[test]
 fn a_block_spanning_maps_is_not_visible_early() {
-    let mut coverage = empty();
+    let mut coverage = empty_coverage(&IDENTITY);
     let mut start = PublicationStart::Open { origin: SegmentOrigin::Genesis };
     for map in &genesis_maps() {
         coverage = publish(&coverage, &start, std::slice::from_ref(map));
@@ -237,8 +219,11 @@ fn a_checkpoint_segment_joins_genesis_construction_only_at_the_same_anchor() {
     let from_checkpoint = render(FilterMapRenderer::resume(stream, join).unwrap());
     assert_eq!(from_checkpoint, maps[join_at + 1..], "a checkpoint enters the same value space");
 
-    let coverage =
-        publish(&empty(), &PublicationStart::Open { origin: checkpoint(join) }, &from_checkpoint);
+    let coverage = publish(
+        &empty_coverage(&IDENTITY),
+        &PublicationStart::Open { origin: checkpoint(join) },
+        &from_checkpoint,
+    );
     // Block 3 straddles the checkpoint map and is excluded until both halves are published.
     assert_eq!(coverage.segments()[0].blocks(), Some(4..=5));
     let coverage = publish(

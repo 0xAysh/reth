@@ -1,23 +1,29 @@
 //! Test support shared by the `FilterMaps` crates.
 //!
-//! Maps come only from the public renderer, so tests exercise the same anchored output a node
-//! publishes. [`InMemoryMatchSource`] is the reference [`FilterMapMatchSource`] that durable
-//! sources must agree with. [`recognized_checkpoint`] mints a checkpoint origin the way a store
-//! restores one, through a [`CheckpointVerifier`]. [`golden`] adapts the pinned Geth `FORMAT 2`
-//! corpus into renderer and matcher inputs.
+//! Everything here is built on the crate's public API, so integration tests and dependent crates
+//! use it exactly as unit tests do. Maps come only from the public renderer, so tests exercise the
+//! same anchored output a node publishes. [`block_hash`], [`identity`], and [`empty_coverage`]
+//! describe the synthetic chain those tests render. [`InMemoryMatchSource`] is the reference
+//! [`FilterMapMatchSource`] that durable sources must agree with. [`recognized_checkpoint`] mints a
+//! checkpoint origin the way a store restores one, through a [`CheckpointVerifier`]. [`golden`]
+//! adapts the pinned Geth `FORMAT 2` corpus into renderer and matcher inputs.
+//!
+//! Unit-test helpers that need crate-private coverage internals, such as hand-built anchors or a
+//! `CoverageSet`, live in the crate-private `coverage::test_utils` module and build on these.
 
 pub mod golden;
 
 use crate::{
     coverage::{
-        CheckpointProvenance, CheckpointVerifier, IndexIdentity, SegmentOrigin,
-        StoredCoverageRecord, StoredSegmentOrigin, StoredSegmentRecord,
-        StructurallyRestoredCoverage,
+        CheckpointProvenance, CheckpointVerifier, IndexIdentity, RejectUnrecognizedCheckpoints,
+        SegmentOrigin, StoredCoverageRecord, StoredSegmentOrigin, StoredSegmentRecord,
+        StructurallyRestoredCoverage, STORAGE_FORMAT_V1,
     },
     AnchoredCompletedMap, BlockInput, BlockPointer, FilterMapMatchSource, FilterMapRenderer,
     LogValueStream, LogValueStreamTermination, MapResumeAnchor, Params, ParamsId,
-    RendererCompletion, RendererOutput,
+    RendererCompletion, RendererOutput, GETH_V1,
 };
+use alloy_primitives::B256;
 
 /// Reference [`FilterMapMatchSource`] serving rendered maps and block pointers from memory.
 #[derive(Debug)]
@@ -193,6 +199,30 @@ impl CheckpointVerifier for AcceptAllCheckpoints {
     ) -> bool {
         true
     }
+}
+
+/// Returns the hash of block `number` on the synthetic test chain.
+///
+/// Only the low byte of `number` is used, so hashes repeat every 256 blocks.
+pub const fn block_hash(number: u64) -> B256 {
+    B256::repeat_byte(number as u8)
+}
+
+/// Returns the index identity of the synthetic test chain under `params`, whose genesis is
+/// [`block_hash`]`(0)`.
+pub const fn identity(params: ParamsId) -> IndexIdentity {
+    IndexIdentity::new(STORAGE_FORMAT_V1, 1, block_hash(0), GETH_V1, params)
+}
+
+/// Returns the coverage a freshly initialized store under `identity` restores.
+///
+/// # Panics
+///
+/// Panics if restoration rejects the empty record, which would be a restoration bug.
+pub fn empty_coverage(identity: &IndexIdentity) -> StructurallyRestoredCoverage {
+    let record = StoredCoverageRecord { identity: *identity, segments: Vec::new() };
+    StructurallyRestoredCoverage::restore(identity, record, [], &mut RejectUnrecognizedCheckpoints)
+        .expect("empty coverage restores under its own identity")
 }
 
 /// Pulls `renderer` until it completes.
