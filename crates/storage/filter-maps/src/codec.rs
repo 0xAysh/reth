@@ -1,7 +1,6 @@
 //! Translation between storage-independent domain records and strict database models.
 //!
-//! Identity conversion rejects unknown versions and parameter sets. Anchor records arrive already
-//! version-checked by the strict database decoders. None of these conversions establishes
+//! These conversions reject unknown version and parameter identities. None of them establishes
 //! checkpoint provenance or current canonicality.
 
 use crate::error::{FilterMapStorageError, Result};
@@ -53,13 +52,11 @@ pub(crate) fn anchor_to_db(anchor: MapResumeAnchor) -> DbAnchor {
 
 /// Converts a decoded anchor record.
 ///
-/// # Panics
-///
-/// Panics if `anchor` carries an unknown value-space version. Every caller passes a record read
-/// through the `FilterMapAnchors` or `FilterMapCoverage` decoder, which already rejects those.
+/// The database decoders already reject unknown value-space versions; the conversion still maps
+/// one to an error rather than panicking so a record built outside those decoders fails closed.
 pub(crate) fn anchor_from_db(anchor: DbAnchor) -> Result<MapResumeAnchor> {
     let version = ValueSpaceVersion::try_from(anchor.value_space_version)
-        .expect("stored anchor decoding rejects unknown value-space versions");
+        .map_err(|_| FilterMapStorageError::UnknownIdentity("anchor value-space version"))?;
     let boundary =
         MapBoundary::new(anchor.completed_map_index, anchor.block_number, anchor.block_hash);
     MapResumeAnchor::new_versioned(
