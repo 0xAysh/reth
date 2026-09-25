@@ -4,11 +4,10 @@
 //! the store mutates any table. The caller-owned MDBX transaction remains the atomicity boundary.
 
 use crate::{
-    codec::{anchor_to_db, catalog_to_db},
+    codec::anchor_to_db,
     error::{FilterMapStorageError, Result},
-    restore::{load_directories, load_metadata},
     rows::{EncodedMap, RowWrites},
-    store::PublicationStart,
+    store::{FilterMapStore, PublicationStart},
 };
 use reth_db_api::{
     models::{
@@ -19,7 +18,7 @@ use reth_db_api::{
     transaction::DbTx,
 };
 use reth_filter_maps::{
-    coverage::{IndexIdentity, StoredOriginVerifier, StructurallyRestoredCoverage},
+    coverage::{IndexIdentity, StructurallyRestoredCoverage},
     AnchoredCompletedMap, BlockPointer,
 };
 use std::collections::BTreeMap;
@@ -39,21 +38,19 @@ pub(crate) struct PublicationWrites {
     pub directories: BTreeMap<u32, StoredMapRowDirectory>,
     pub pointers: BTreeMap<u64, StoredBlockPointer>,
     pub anchors: BTreeMap<u32, StoredMapResumeAnchor>,
-    pub coverage: reth_db_api::models::StoredCoverageCatalog,
+    pub coverage: StructurallyRestoredCoverage,
 }
 
 pub(crate) fn build_publication<TX: DbTx>(
-    tx: &TX,
-    running: &IndexIdentity,
+    store: &FilterMapStore<'_, TX>,
     start: &PublicationStart,
     maps: &[AnchoredCompletedMap],
-    verifier: &mut impl StoredOriginVerifier,
 ) -> Result<PublicationProposal> {
-    let metadata = load_metadata(tx, running, verifier)?;
-    validate_shape(&metadata.identity, start, maps)?;
-    load_directories(tx, &metadata)?;
-    let identity = metadata.identity;
-    let current = metadata.coverage;
+    let tx = store.tx();
+    let identity = *store.identity();
+    validate_shape(&identity, start, maps)?;
+    store.load_directories()?;
+    let current = store.restored();
 
     let mut encoded = Vec::with_capacity(maps.len());
     let mut directories = BTreeMap::new();
@@ -68,7 +65,7 @@ pub(crate) fn build_publication<TX: DbTx>(
     }
 
     let pointers = normalize_pointers(&identity, start, maps)?;
-    validate_protected_pointers(tx, &current, &pointers)?;
+    validate_protected_pointers(tx, current, &pointers)?;
 
     let target_maps: Vec<_> = maps.iter().map(|map| map.map().map_index()).collect();
     let target_covered = target_maps
@@ -77,7 +74,7 @@ pub(crate) fn build_publication<TX: DbTx>(
         .collect::<Vec<_>>();
     if target_covered.iter().any(|covered| *covered) {
         if target_covered.iter().all(|covered| *covered) &&
-            retry_coverage_matches(&current, start, maps) &&
+            retry_coverage_matches(current, start, maps) &&
             publication_matches(tx, &encoded, &anchors, &pointers)?
         {
             return Ok(PublicationProposal::Noop)
@@ -85,7 +82,7 @@ pub(crate) fn build_publication<TX: DbTx>(
         return Err(FilterMapStorageError::IncompletePriorState)
     }
 
-    let mut proposed = current;
+    let mut proposed = current.clone();
     let map_anchors = maps.iter().map(AnchoredCompletedMap::resume_anchor);
     match start {
         PublicationStart::Open { origin } => {
@@ -106,7 +103,7 @@ pub(crate) fn build_publication<TX: DbTx>(
         directories,
         pointers,
         anchors,
-        coverage: catalog_to_db(proposed.stored_record()),
+        coverage: proposed,
     }))
 }
 

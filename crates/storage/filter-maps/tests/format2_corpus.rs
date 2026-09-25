@@ -13,9 +13,7 @@ use reth_filter_maps::{
     FilterMapRenderer, IndexedMatchRange, LogInput, LogValueStream, LogValueStreamTermination,
     MapBoundary, MatchPattern, ParamsId, RendererOutput, TopicSelection, ValueSpaceAnchor, GETH_V1,
 };
-use reth_filter_maps_storage::{
-    initialize_identity, publish_with_origin_verifier, FilterMapReadSnapshot, PublicationStart,
-};
+use reth_filter_maps_storage::{FilterMapReadSnapshot, FilterMapStore, PublicationStart};
 use reth_filter_maps_test_utils::{
     manifest::load_and_validate_corpus,
     parser::{Fixture, Origin, ParamsName, Planner, QueryResult, Termination, TopicConstraint},
@@ -32,10 +30,6 @@ impl StoredOriginVerifier for TestOriginVerifier {
         anchor: MapResumeAnchor,
         _provenance: CheckpointProvenance,
     ) -> bool {
-        anchor.value_space_version == identity.value_space_version
-    }
-
-    fn verify_retained(&mut self, identity: &IndexIdentity, anchor: MapResumeAnchor) -> bool {
         anchor.value_space_version == identity.value_space_version
     }
 }
@@ -152,17 +146,11 @@ fn check_fixture(path: &Path, fixture: &Fixture) {
     {
         let db = init_db(directory.path(), DatabaseArguments::test()).unwrap();
         let tx = db.tx_mut().unwrap();
-        initialize_identity(&tx, &identity).unwrap();
+        FilterMapStore::initialize_identity(&tx, &identity).unwrap();
+        let mut store = FilterMapStore::open(&tx, &identity, &mut TestOriginVerifier).unwrap();
         let mut start = PublicationStart::Open { origin: publication_origin };
         for map in &rendered {
-            publish_with_origin_verifier(
-                &tx,
-                &identity,
-                start,
-                std::slice::from_ref(map),
-                &mut TestOriginVerifier,
-            )
-            .unwrap();
+            store.publish(start, std::slice::from_ref(map)).unwrap();
             start = PublicationStart::Extend { from: map.resume_anchor() };
         }
         tx.commit().unwrap();
@@ -208,16 +196,13 @@ fn check_fixture(path: &Path, fixture: &Fixture) {
         assert_eq!(expected.potential_indices(), query.potential_indices);
         assert_eq!(expected.candidate_blocks(), query.candidate_blocks);
 
-        let source = FilterMapReadSnapshot::new_with_origin_verifier(
-            db.tx().unwrap(),
-            &identity,
-            &mut TestOriginVerifier,
-        )
-        .unwrap()
-        .activate(|number| Ok::<_, Infallible>(canonical.get(&number).copied()))
-        .unwrap()
-        .into_segment_source(0)
-        .unwrap();
+        let source =
+            FilterMapReadSnapshot::open(db.tx().unwrap(), &identity, &mut TestOriginVerifier)
+                .unwrap()
+                .activate(|number| Ok::<_, Infallible>(canonical.get(&number).copied()))
+                .unwrap()
+                .into_segment_source(0)
+                .unwrap();
         let actual = FilterMapMatcher::new(source).match_subrange(&pattern, range).unwrap();
         assert_eq!(actual, expected, "{}: {}", path.display(), query.id);
         assert_eq!(actual.potential_indices(), query.potential_indices);

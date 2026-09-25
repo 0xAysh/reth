@@ -2,7 +2,7 @@
 
 use crate::{
     error::{FilterMapStorageError, Result},
-    restore::{load_directories, load_metadata},
+    store::FilterMapStore,
 };
 use reth_db_api::{
     models::{StoredBlockPointer, StoredMapRowDirectory},
@@ -10,8 +10,8 @@ use reth_db_api::{
     transaction::DbTx,
 };
 use reth_filter_maps::coverage::{
-    CanonicalActivationError, IndexIdentity, QueryableCoverage, RejectUntrustedOrigins,
-    SegmentOrigin, StoredOriginVerifier, StructurallyRestoredCoverage,
+    CanonicalActivationError, IndexIdentity, QueryableCoverage, SegmentOrigin,
+    StoredOriginVerifier, StructurallyRestoredCoverage,
 };
 use std::collections::BTreeMap;
 
@@ -25,24 +25,20 @@ pub struct FilterMapReadSnapshot<TX> {
 }
 
 impl<TX: DbTx> FilterMapReadSnapshot<TX> {
-    /// Eagerly validates identity, coverage, anchors, and directory metadata.
+    /// Opens the store over an owned read transaction and eagerly validates identity, coverage,
+    /// anchors, and directory metadata.
     ///
-    /// Persisted checkpoint and retained origins are rejected. Call
-    /// [`Self::new_with_origin_verifier`] when an authenticated registry or local publication
-    /// authority is available.
-    pub fn new(tx: TX, running: &IndexIdentity) -> Result<Self> {
-        Self::new_with_origin_verifier(tx, running, &mut RejectUntrustedOrigins)
-    }
-
-    /// Eagerly validates metadata and re-establishes trust in persisted non-genesis origins.
-    pub fn new_with_origin_verifier(
+    /// The snapshot owns its transaction so a segment source can outlive this call. Origin trust
+    /// follows [`FilterMapStore::open`].
+    pub fn open(
         tx: TX,
         running: &IndexIdentity,
-        verifier: &mut impl StoredOriginVerifier,
+        checkpoints: &mut impl StoredOriginVerifier,
     ) -> Result<Self> {
-        let metadata = load_metadata(&tx, running, verifier)?;
-        let directories = load_directories(&tx, &metadata)?;
-        Ok(Self { tx, identity: metadata.identity, restored: metadata.coverage, directories })
+        let store = FilterMapStore::open(&tx, running, checkpoints)?;
+        let directories = store.load_directories()?;
+        let (identity, restored) = store.into_parts();
+        Ok(Self { tx, identity, restored, directories })
     }
 
     /// Returns the snapshot identity.

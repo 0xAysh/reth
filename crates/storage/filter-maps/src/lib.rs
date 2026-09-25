@@ -29,20 +29,16 @@ mod codec;
 mod contraction;
 mod error;
 mod matcher;
-mod restore;
 mod rows;
 mod snapshot;
 mod store;
 mod validation;
 
-pub use contraction::{
-    contract_for_reorg, contract_for_reorg_with_origin_verifier, retain_after,
-    retain_after_with_origin_verifier, CleanupRanges,
-};
+pub use contraction::CleanupRanges;
 pub use error::{FilterMapStorageError, Result};
 pub use matcher::FilterMapSegmentSource;
 pub use snapshot::{ActivatedFilterMapSnapshot, FilterMapActivationError, FilterMapReadSnapshot};
-pub use store::{initialize_identity, publish, publish_with_origin_verifier, PublicationStart};
+pub use store::{FilterMapStore, PublicationStart};
 
 #[cfg(test)]
 mod tests {
@@ -65,9 +61,9 @@ mod tests {
     use reth_filter_maps::{
         address_value,
         coverage::{
-            CheckpointProvenance, IndexIdentity, MapResumeAnchor, SegmentOrigin,
-            StoredCoverageRecord, StoredOriginVerifier, StoredSegmentOrigin, StoredSegmentRecord,
-            StructurallyRestoredCoverage, STORAGE_FORMAT_V1,
+            CheckpointProvenance, IndexIdentity, MapResumeAnchor, RejectUntrustedOrigins,
+            SegmentOrigin, StoredCoverageRecord, StoredOriginVerifier, StoredSegmentOrigin,
+            StoredSegmentRecord, StructurallyRestoredCoverage, STORAGE_FORMAT_V1,
         },
         BlockInput, FilterMapMatchSource, FilterMapRenderer, LogInput, LogValueStream,
         LogValueStreamTermination, ParamsId, RendererOutput, ValueSpaceAnchor, DEFAULT_PARAMS,
@@ -98,10 +94,6 @@ mod tests {
             anchor: MapResumeAnchor,
             _provenance: CheckpointProvenance,
         ) -> bool {
-            anchor.value_space_version == identity.value_space_version
-        }
-
-        fn verify_retained(&mut self, identity: &IndexIdentity, anchor: MapResumeAnchor) -> bool {
             anchor.value_space_version == identity.value_space_version
         }
     }
@@ -145,17 +137,23 @@ mod tests {
     where
         TX: DbTx + DbTxMut,
     {
+        let mut store = open_store(tx, identity);
         for map in maps {
-            publish_with_origin_verifier(
-                tx,
-                identity,
-                start,
-                std::slice::from_ref(map),
-                &mut TestOriginVerifier,
-            )?;
+            store.publish(start, std::slice::from_ref(map))?;
             start = PublicationStart::Extend { from: map.resume_anchor() };
         }
         Ok(())
+    }
+
+    fn open_store<'tx, TX: DbTx>(tx: &'tx TX, identity: &IndexIdentity) -> FilterMapStore<'tx, TX> {
+        FilterMapStore::open(tx, identity, &mut RejectUntrustedOrigins).unwrap()
+    }
+
+    fn read_snapshot<TX: DbTx>(
+        tx: TX,
+        identity: &IndexIdentity,
+    ) -> Result<FilterMapReadSnapshot<TX>> {
+        FilterMapReadSnapshot::open(tx, identity, &mut RejectUntrustedOrigins)
     }
 
     fn render_address_map(
@@ -223,6 +221,36 @@ mod tests {
         assert!(overflow_length > DEFAULT_PARAMS.base_row_length() as usize);
         assert!(base_length <= DEFAULT_PARAMS.base_row_length() as usize);
         (overflow, base, target_row)
+    }
+
+    /// Renders `count` range-test maps over a chain with one log per block, so every other map
+    /// ends on a block boundary.
+    fn chain_maps(count: usize) -> Vec<reth_filter_maps::AnchoredCompletedMap> {
+        let blocks = (0..=count as u64)
+            .map(|number| {
+                let hash = if number == 0 { B256::ZERO } else { B256::repeat_byte(number as u8) };
+                BlockInput::new(number, hash, [LogInput::new(Address::repeat_byte(0x11), [])])
+            })
+            .collect::<Vec<_>>();
+        let stream = LogValueStream::new(
+            RANGE_TEST_PARAMS,
+            ValueSpaceAnchor::new(0, B256::ZERO, 0),
+            blocks,
+            LogValueStreamTermination::ReachedHead,
+        );
+        let mut renderer = FilterMapRenderer::from_genesis(stream).unwrap();
+        let mut maps = Vec::new();
+        while maps.len() < count {
+            match renderer.render_next().unwrap().unwrap() {
+                RendererOutput::Map(map) => maps.push(map),
+                RendererOutput::Complete(_) => panic!("expected {count} maps"),
+            }
+        }
+        maps
+    }
+
+    fn chain_hash(number: u64) -> std::result::Result<Option<B256>, std::convert::Infallible> {
+        Ok(Some(if number == 0 { B256::ZERO } else { B256::repeat_byte(number as u8) }))
     }
 
     fn maps_with_address(address: u8, count: usize) -> Vec<reth_filter_maps::AnchoredCompletedMap> {
@@ -301,7 +329,7 @@ mod tests {
     fn pristine_store_is_missing_identity() {
         let db = create_test_rw_db();
         assert!(matches!(
-            FilterMapReadSnapshot::new(db.tx().unwrap(), &identity()),
+            read_snapshot(db.tx().unwrap(), &identity()),
             Err(FilterMapStorageError::MissingIdentity)
         ));
     }
@@ -310,11 +338,11 @@ mod tests {
     fn identity_initialization_is_explicit_and_idempotent() {
         let db = create_test_rw_db();
         let tx = db.tx_mut().unwrap();
-        initialize_identity(&tx, &identity()).unwrap();
-        initialize_identity(&tx, &identity()).unwrap();
+        FilterMapStore::initialize_identity(&tx, &identity()).unwrap();
+        FilterMapStore::initialize_identity(&tx, &identity()).unwrap();
         tx.commit().unwrap();
 
-        let snapshot = FilterMapReadSnapshot::new(db.tx().unwrap(), &identity()).unwrap();
+        let snapshot = read_snapshot(db.tx().unwrap(), &identity()).unwrap();
         assert!(snapshot.restored().segments().is_empty());
     }
 
@@ -331,12 +359,12 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            initialize_identity(&tx, &identity()),
+            FilterMapStore::initialize_identity(&tx, &identity()),
             Err(FilterMapStorageError::IncompleteStore)
         ));
         tx.commit().unwrap();
         assert!(matches!(
-            FilterMapReadSnapshot::new(db.tx().unwrap(), &identity()),
+            read_snapshot(db.tx().unwrap(), &identity()),
             Err(FilterMapStorageError::IncompleteStore)
         ));
     }
@@ -348,7 +376,7 @@ mod tests {
         tx.put::<FilterMapIdentity>(1, crate::codec::identity_to_db(&identity())).unwrap();
         tx.commit().unwrap();
         assert!(matches!(
-            FilterMapReadSnapshot::new(db.tx().unwrap(), &identity()),
+            read_snapshot(db.tx().unwrap(), &identity()),
             Err(FilterMapStorageError::IncompleteStore)
         ));
 
@@ -358,14 +386,14 @@ mod tests {
         tx.put::<FilterMapCoverage>(1, StoredCoverageCatalog { segments: Vec::new() }).unwrap();
         tx.commit().unwrap();
         assert!(matches!(
-            FilterMapReadSnapshot::new(db.tx().unwrap(), &identity()),
+            read_snapshot(db.tx().unwrap(), &identity()),
             Err(FilterMapStorageError::IncompleteStore)
         ));
     }
 
     #[test]
     fn every_failed_publication_phase_keeps_new_coverage_invisible() {
-        use crate::store::{publish_with_fault, PublicationPhase};
+        use crate::store::PublicationPhase;
 
         for phase in [
             PublicationPhase::BaseRows,
@@ -377,16 +405,14 @@ mod tests {
         ] {
             let db = create_test_rw_db();
             let tx = db.tx_mut().unwrap();
-            initialize_identity(&tx, &identity()).unwrap();
+            FilterMapStore::initialize_identity(&tx, &identity()).unwrap();
             tx.commit().unwrap();
 
             // Commit the deliberately partial physical writes. Coverage remains the visibility
             // fence, so even this hostile caller behavior cannot make them queryable.
             let tx = db.tx_mut().unwrap();
             let maps = maps();
-            let result = publish_with_fault(
-                &tx,
-                &identity(),
+            let result = open_store(&tx, &identity()).publish_with_fault(
                 PublicationStart::Open { origin: SegmentOrigin::Genesis },
                 &maps[..1],
                 phase,
@@ -397,7 +423,7 @@ mod tests {
             );
             tx.commit().unwrap();
 
-            let snapshot = FilterMapReadSnapshot::new(db.tx().unwrap(), &identity()).unwrap();
+            let snapshot = read_snapshot(db.tx().unwrap(), &identity()).unwrap();
             assert!(snapshot.restored().segments().is_empty(), "phase {phase:?}");
             assert!(snapshot.activate(|_| Ok::<_, std::convert::Infallible>(None)).is_ok());
         }
@@ -405,7 +431,7 @@ mod tests {
 
     #[test]
     fn failures_inside_multi_record_row_loops_keep_coverage_invisible() {
-        use crate::store::{publish_with_fault, PublicationPhase};
+        use crate::store::PublicationPhase;
 
         let (map, _, _) = replacement_transition_maps();
         let identity =
@@ -413,15 +439,13 @@ mod tests {
         for phase in [PublicationPhase::BaseRowWrite, PublicationPhase::ExtensionWrite] {
             let db = create_test_rw_db();
             let tx = db.tx_mut().unwrap();
-            initialize_identity(&tx, &identity).unwrap();
+            FilterMapStore::initialize_identity(&tx, &identity).unwrap();
             tx.commit().unwrap();
 
             // Commit the deliberately interrupted physical loop. Coverage remains unchanged, so
             // neither the first written base group nor extension is queryable.
             let tx = db.tx_mut().unwrap();
-            let result = publish_with_fault(
-                &tx,
-                &identity,
+            let result = open_store(&tx, &identity).publish_with_fault(
                 PublicationStart::Open { origin: SegmentOrigin::Genesis },
                 std::slice::from_ref(&map),
                 phase,
@@ -432,7 +456,7 @@ mod tests {
             );
             tx.commit().unwrap();
 
-            let snapshot = FilterMapReadSnapshot::new(db.tx().unwrap(), &identity).unwrap();
+            let snapshot = read_snapshot(db.tx().unwrap(), &identity).unwrap();
             assert!(snapshot.restored().segments().is_empty(), "phase {phase:?}");
         }
     }
@@ -441,7 +465,7 @@ mod tests {
     fn aborted_publication_exposes_no_progress() {
         let db = create_test_rw_db();
         let tx = db.tx_mut().unwrap();
-        initialize_identity(&tx, &identity()).unwrap();
+        FilterMapStore::initialize_identity(&tx, &identity()).unwrap();
         tx.commit().unwrap();
 
         let tx = db.tx_mut().unwrap();
@@ -454,7 +478,7 @@ mod tests {
         .unwrap();
         tx.abort();
 
-        let snapshot = FilterMapReadSnapshot::new(db.tx().unwrap(), &identity()).unwrap();
+        let snapshot = read_snapshot(db.tx().unwrap(), &identity()).unwrap();
         assert!(snapshot.restored().segments().is_empty());
     }
 
@@ -463,7 +487,7 @@ mod tests {
         let db = create_test_rw_db();
         let maps = maps();
         let tx = db.tx_mut().unwrap();
-        initialize_identity(&tx, &identity()).unwrap();
+        FilterMapStore::initialize_identity(&tx, &identity()).unwrap();
         publish_maps(
             &tx,
             &identity(),
@@ -499,7 +523,7 @@ mod tests {
         let db = create_test_rw_db();
         let maps = maps();
         let tx = db.tx_mut().unwrap();
-        initialize_identity(&tx, &identity()).unwrap();
+        FilterMapStore::initialize_identity(&tx, &identity()).unwrap();
         publish_maps(
             &tx,
             &identity(),
@@ -513,15 +537,15 @@ mod tests {
         tx.delete::<FilterMapDirectories>(0, None).unwrap();
         tx.commit().unwrap();
         assert!(matches!(
-            FilterMapReadSnapshot::new(db.tx().unwrap(), &identity()),
+            read_snapshot(db.tx().unwrap(), &identity()),
             Err(FilterMapStorageError::MissingDirectory(0))
         ));
 
         // Metadata-only contraction remains available to hide corrupt payload state.
         let tx = db.tx_mut().unwrap();
-        contract_for_reorg(&tx, &identity(), 0, None).unwrap();
+        open_store(&tx, &identity()).contract_for_reorg(0, None).unwrap();
         tx.commit().unwrap();
-        assert!(FilterMapReadSnapshot::new(db.tx().unwrap(), &identity())
+        assert!(read_snapshot(db.tx().unwrap(), &identity())
             .unwrap()
             .restored()
             .segments()
@@ -533,7 +557,7 @@ mod tests {
         let db = create_test_rw_db();
         let maps = maps();
         let tx = db.tx_mut().unwrap();
-        initialize_identity(&tx, &identity()).unwrap();
+        FilterMapStore::initialize_identity(&tx, &identity()).unwrap();
         publish_maps(
             &tx,
             &identity(),
@@ -543,7 +567,7 @@ mod tests {
         .unwrap();
         tx.commit().unwrap();
 
-        let activated = FilterMapReadSnapshot::new(db.tx().unwrap(), &identity())
+        let activated = read_snapshot(db.tx().unwrap(), &identity())
             .unwrap()
             .activate(|_| Ok::<_, std::convert::Infallible>(Some(B256::repeat_byte(0xff))))
             .unwrap();
@@ -555,7 +579,7 @@ mod tests {
         let db = create_test_rw_db();
         let maps = maps();
         let tx = db.tx_mut().unwrap();
-        initialize_identity(&tx, &identity()).unwrap();
+        FilterMapStore::initialize_identity(&tx, &identity()).unwrap();
         publish_maps(
             &tx,
             &identity(),
@@ -586,38 +610,17 @@ mod tests {
         // original open publication still compares the exact batch subrange.
         let db = create_test_rw_db();
         let tx = db.tx_mut().unwrap();
-        initialize_identity(&tx, &identity()).unwrap();
-        publish_with_origin_verifier(
-            &tx,
-            &identity(),
-            PublicationStart::Open { origin: SegmentOrigin::Genesis },
-            &maps[..1],
-            &mut TestOriginVerifier,
-        )
-        .unwrap();
-        publish_with_origin_verifier(
-            &tx,
-            &identity(),
-            PublicationStart::Open { origin: checkpoint.clone() },
-            &maps[1..],
-            &mut TestOriginVerifier,
-        )
-        .unwrap();
-        publish_with_origin_verifier(
-            &tx,
-            &identity(),
-            PublicationStart::Open { origin: checkpoint },
-            &maps[1..],
-            &mut TestOriginVerifier,
-        )
-        .unwrap();
+        FilterMapStore::initialize_identity(&tx, &identity()).unwrap();
+        let mut store = FilterMapStore::open(&tx, &identity(), &mut TestOriginVerifier).unwrap();
+        store
+            .publish(PublicationStart::Open { origin: SegmentOrigin::Genesis }, &maps[..1])
+            .unwrap();
+        store.publish(PublicationStart::Open { origin: checkpoint.clone() }, &maps[1..]).unwrap();
+        store.publish(PublicationStart::Open { origin: checkpoint }, &maps[1..]).unwrap();
         tx.commit().unwrap();
-        let snapshot = FilterMapReadSnapshot::new_with_origin_verifier(
-            db.tx().unwrap(),
-            &identity(),
-            &mut TestOriginVerifier,
-        )
-        .unwrap();
+        let snapshot =
+            FilterMapReadSnapshot::open(db.tx().unwrap(), &identity(), &mut TestOriginVerifier)
+                .unwrap();
         assert_eq!(snapshot.restored().segments().len(), 1);
 
         // Publishing the predecessor after the following checkpoint segment also merges. An
@@ -626,38 +629,19 @@ mod tests {
             checkpoint_origin(identity(), maps[0].resume_anchor(), maps[1].resume_anchor());
         let db = create_test_rw_db();
         let tx = db.tx_mut().unwrap();
-        initialize_identity(&tx, &identity()).unwrap();
-        publish_with_origin_verifier(
-            &tx,
-            &identity(),
-            PublicationStart::Open { origin: checkpoint },
-            &maps[1..],
-            &mut TestOriginVerifier,
-        )
-        .unwrap();
-        publish_with_origin_verifier(
-            &tx,
-            &identity(),
-            PublicationStart::Open { origin: SegmentOrigin::Genesis },
-            &maps[..1],
-            &mut TestOriginVerifier,
-        )
-        .unwrap();
-        publish_with_origin_verifier(
-            &tx,
-            &identity(),
-            PublicationStart::Extend { from: maps[0].resume_anchor() },
-            &maps[1..],
-            &mut TestOriginVerifier,
-        )
-        .unwrap();
+        FilterMapStore::initialize_identity(&tx, &identity()).unwrap();
+        let mut store = FilterMapStore::open(&tx, &identity(), &mut TestOriginVerifier).unwrap();
+        store.publish(PublicationStart::Open { origin: checkpoint }, &maps[1..]).unwrap();
+        store
+            .publish(PublicationStart::Open { origin: SegmentOrigin::Genesis }, &maps[..1])
+            .unwrap();
+        store
+            .publish(PublicationStart::Extend { from: maps[0].resume_anchor() }, &maps[1..])
+            .unwrap();
         tx.commit().unwrap();
-        let snapshot = FilterMapReadSnapshot::new_with_origin_verifier(
-            db.tx().unwrap(),
-            &identity(),
-            &mut TestOriginVerifier,
-        )
-        .unwrap();
+        let snapshot =
+            FilterMapReadSnapshot::open(db.tx().unwrap(), &identity(), &mut TestOriginVerifier)
+                .unwrap();
         assert_eq!(snapshot.restored().segments().len(), 1);
     }
 
@@ -666,7 +650,7 @@ mod tests {
         let db = create_test_rw_db();
         let maps = maps();
         let tx = db.tx_mut().unwrap();
-        initialize_identity(&tx, &identity()).unwrap();
+        FilterMapStore::initialize_identity(&tx, &identity()).unwrap();
         publish_maps(
             &tx,
             &identity(),
@@ -714,7 +698,7 @@ mod tests {
         let db = create_test_rw_db();
         let maps = maps();
         let tx = db.tx_mut().unwrap();
-        initialize_identity(&tx, &identity()).unwrap();
+        FilterMapStore::initialize_identity(&tx, &identity()).unwrap();
         publish_maps(
             &tx,
             &identity(),
@@ -740,7 +724,7 @@ mod tests {
         tx.commit().unwrap();
 
         assert!(matches!(
-            FilterMapReadSnapshot::new(db.tx().unwrap(), &identity()),
+            read_snapshot(db.tx().unwrap(), &identity()),
             Err(FilterMapStorageError::Database(reth_db_api::DatabaseError::Decode))
         ));
     }
@@ -752,7 +736,7 @@ mod tests {
         let row = maps[0].map().rows()[0].row_index();
         let key = FilterMapBaseRowKey::new(ParamsId::RangeTest.into(), 0, row).unwrap();
         let tx = db.tx_mut().unwrap();
-        initialize_identity(&tx, &identity()).unwrap();
+        FilterMapStore::initialize_identity(&tx, &identity()).unwrap();
         publish_maps(
             &tx,
             &identity(),
@@ -767,7 +751,7 @@ mod tests {
         tx.commit().unwrap();
 
         // Snapshot construction is metadata-only and must not touch the missing row payload.
-        let snapshot = FilterMapReadSnapshot::new(db.tx().unwrap(), &identity()).unwrap();
+        let snapshot = read_snapshot(db.tx().unwrap(), &identity()).unwrap();
         let activated = snapshot
             .activate(|number| {
                 Ok::<_, std::convert::Infallible>(Some(if number == 0 {
@@ -791,7 +775,7 @@ mod tests {
             let db = create_test_rw_db();
             let maps = maps();
             let tx = db.tx_mut().unwrap();
-            initialize_identity(&tx, &identity()).unwrap();
+            FilterMapStore::initialize_identity(&tx, &identity()).unwrap();
             publish_maps(
                 &tx,
                 &identity(),
@@ -811,15 +795,13 @@ mod tests {
             tx.put::<FilterMapBlockPointers>(0, pointer).unwrap();
             tx.commit().unwrap();
 
-            let result = FilterMapReadSnapshot::new(db.tx().unwrap(), &identity())
-                .unwrap()
-                .activate(|number| {
-                    Ok::<_, std::convert::Infallible>(Some(if number == 0 {
-                        B256::ZERO
-                    } else {
-                        B256::repeat_byte(number as u8)
-                    }))
-                });
+            let result = read_snapshot(db.tx().unwrap(), &identity()).unwrap().activate(|number| {
+                Ok::<_, std::convert::Infallible>(Some(if number == 0 {
+                    B256::ZERO
+                } else {
+                    B256::repeat_byte(number as u8)
+                }))
+            });
             assert!(matches!(
                 result,
                 Err(FilterMapActivationError::Storage(FilterMapStorageError::PointerMismatch(0)))
@@ -831,9 +813,9 @@ mod tests {
     fn old_and_new_transactions_observe_coherent_coverage() {
         let db = create_test_rw_db();
         let tx = db.tx_mut().unwrap();
-        initialize_identity(&tx, &identity()).unwrap();
+        FilterMapStore::initialize_identity(&tx, &identity()).unwrap();
         tx.commit().unwrap();
-        let old = FilterMapReadSnapshot::new(db.tx().unwrap(), &identity()).unwrap();
+        let old = read_snapshot(db.tx().unwrap(), &identity()).unwrap();
 
         let tx = db.tx_mut().unwrap();
         publish_maps(
@@ -846,7 +828,7 @@ mod tests {
         tx.commit().unwrap();
 
         assert!(old.restored().segments().is_empty());
-        let new = FilterMapReadSnapshot::new(db.tx().unwrap(), &identity()).unwrap();
+        let new = read_snapshot(db.tx().unwrap(), &identity()).unwrap();
         assert_eq!(new.restored().segments().len(), 1);
     }
 
@@ -861,17 +843,16 @@ mod tests {
             FilterMapExtendedRowKey::new(ParamsId::Default.into(), 0, target_row).unwrap();
 
         let tx = db.tx_mut().unwrap();
-        initialize_identity(&tx, &production_identity).unwrap();
-        publish(
-            &tx,
-            &production_identity,
-            PublicationStart::Open { origin: SegmentOrigin::Genesis },
-            std::slice::from_ref(&overflow),
-        )
-        .unwrap();
+        FilterMapStore::initialize_identity(&tx, &production_identity).unwrap();
+        open_store(&tx, &production_identity)
+            .publish(
+                PublicationStart::Open { origin: SegmentOrigin::Genesis },
+                std::slice::from_ref(&overflow),
+            )
+            .unwrap();
         tx.commit().unwrap();
         let tx = db.tx_mut().unwrap();
-        contract_for_reorg(&tx, &production_identity, 0, None).unwrap();
+        open_store(&tx, &production_identity).contract_for_reorg(0, None).unwrap();
         let mut group = tx.get::<FilterMapBaseRows>(key).unwrap().unwrap();
         group.slots[1] = vec![7, 8, 9];
         tx.put::<FilterMapBaseRows>(key, group).unwrap();
@@ -880,13 +861,12 @@ mod tests {
         // Extended → base-only also removes obsolete extension data and preserves another map's
         // byte-for-byte slot in the shared group.
         let tx = db.tx_mut().unwrap();
-        publish(
-            &tx,
-            &production_identity,
-            PublicationStart::Open { origin: SegmentOrigin::Genesis },
-            std::slice::from_ref(&base),
-        )
-        .unwrap();
+        open_store(&tx, &production_identity)
+            .publish(
+                PublicationStart::Open { origin: SegmentOrigin::Genesis },
+                std::slice::from_ref(&base),
+            )
+            .unwrap();
         tx.commit().unwrap();
         let tx = db.tx().unwrap();
         assert!(!tx.get::<FilterMapDirectories>(0).unwrap().unwrap().is_extended(target_row));
@@ -895,17 +875,16 @@ mod tests {
         drop(tx);
 
         let tx = db.tx_mut().unwrap();
-        contract_for_reorg(&tx, &production_identity, 0, None).unwrap();
+        open_store(&tx, &production_identity).contract_for_reorg(0, None).unwrap();
         tx.commit().unwrap();
         // Base-only → extended recreates the required extension.
         let tx = db.tx_mut().unwrap();
-        publish(
-            &tx,
-            &production_identity,
-            PublicationStart::Open { origin: SegmentOrigin::Genesis },
-            std::slice::from_ref(&overflow),
-        )
-        .unwrap();
+        open_store(&tx, &production_identity)
+            .publish(
+                PublicationStart::Open { origin: SegmentOrigin::Genesis },
+                std::slice::from_ref(&overflow),
+            )
+            .unwrap();
         tx.commit().unwrap();
         let tx = db.tx().unwrap();
         assert!(tx.get::<FilterMapDirectories>(0).unwrap().unwrap().is_extended(target_row));
@@ -929,6 +908,72 @@ mod tests {
     }
 
     #[test]
+    fn contraction_and_republication_share_one_opened_store() {
+        let db = create_test_rw_db();
+        let original = maps_with_address(1, 2);
+        let replacement = maps_with_address(2, 2);
+        let tx = db.tx_mut().unwrap();
+        FilterMapStore::initialize_identity(&tx, &identity()).unwrap();
+        publish_maps(
+            &tx,
+            &identity(),
+            PublicationStart::Open { origin: SegmentOrigin::Genesis },
+            &original,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        // The replacement reuses the original anchors, so a handle still holding the contracted
+        // coverage would treat it as a mismatched retry instead of a new publication.
+        let tx = db.tx_mut().unwrap();
+        let mut store = open_store(&tx, &identity());
+        let outcome = store.contract_for_reorg(0, None).unwrap();
+        assert_eq!(outcome.disabled.len(), 1);
+        assert!(store.restored().segments().is_empty());
+        let mut start = PublicationStart::Open { origin: SegmentOrigin::Genesis };
+        for map in &replacement {
+            store.publish(start, std::slice::from_ref(map)).unwrap();
+            start = PublicationStart::Extend { from: map.resume_anchor() };
+        }
+        let published = store.restored().clone();
+        tx.commit().unwrap();
+
+        let snapshot = read_snapshot(db.tx().unwrap(), &identity()).unwrap();
+        assert_eq!(snapshot.restored(), &published);
+        let row = replacement[0].map().rows()[0].row_index();
+        let mut source = snapshot.activate(chain_hash).unwrap().into_segment_source(0).unwrap();
+        assert_eq!(
+            source.read_row_prefixes(&[0], row, 4).unwrap(),
+            vec![replacement[0].map().rows()[0].columns().to_vec()]
+        );
+    }
+
+    #[test]
+    fn recognized_checkpoint_origins_still_require_the_verifier() {
+        let db = create_test_rw_db();
+        let maps = maps();
+        let checkpoint =
+            checkpoint_origin(identity(), maps[0].resume_anchor(), maps[1].resume_anchor());
+        let tx = db.tx_mut().unwrap();
+        FilterMapStore::initialize_identity(&tx, &identity()).unwrap();
+        open_store(&tx, &identity())
+            .publish(PublicationStart::Open { origin: checkpoint }, &maps[1..])
+            .unwrap();
+        tx.commit().unwrap();
+
+        assert!(matches!(
+            read_snapshot(db.tx().unwrap(), &identity()),
+            Err(FilterMapStorageError::Coverage(
+                reth_filter_maps::coverage::PersistedCoverageError::UnverifiedOrigin
+            ))
+        ));
+        let snapshot =
+            FilterMapReadSnapshot::open(db.tx().unwrap(), &identity(), &mut TestOriginVerifier)
+                .unwrap();
+        assert_eq!(snapshot.restored().segments()[0].maps(), 1..=1);
+    }
+
+    #[test]
     fn uncovered_stale_maps_can_be_replaced() {
         let db = create_test_rw_db();
         let original = maps_with_address(1, 2);
@@ -937,7 +982,7 @@ mod tests {
         let new_row = replacement[0].map().rows()[0].row_index();
         let expected = replacement[0].map().rows()[0].columns().to_vec();
         let tx = db.tx_mut().unwrap();
-        initialize_identity(&tx, &identity()).unwrap();
+        FilterMapStore::initialize_identity(&tx, &identity()).unwrap();
         publish_maps(
             &tx,
             &identity(),
@@ -948,7 +993,7 @@ mod tests {
         tx.commit().unwrap();
 
         let tx = db.tx_mut().unwrap();
-        contract_for_reorg(&tx, &identity(), 0, None).unwrap();
+        open_store(&tx, &identity()).contract_for_reorg(0, None).unwrap();
         tx.commit().unwrap();
         let tx = db.tx_mut().unwrap();
         publish_maps(
@@ -960,7 +1005,7 @@ mod tests {
         .unwrap();
         tx.commit().unwrap();
 
-        let activated = FilterMapReadSnapshot::new(db.tx().unwrap(), &identity())
+        let activated = read_snapshot(db.tx().unwrap(), &identity())
             .unwrap()
             .activate(|number| {
                 Ok::<_, std::convert::Infallible>(Some(if number == 0 {
@@ -981,12 +1026,93 @@ mod tests {
     }
 
     #[test]
+    fn retained_origin_restores_and_extends_without_external_verifier() {
+        let db = create_test_rw_db();
+        let maps = chain_maps(5);
+        let tail = maps[1].resume_anchor();
+        let tx = db.tx_mut().unwrap();
+        FilterMapStore::initialize_identity(&tx, &identity()).unwrap();
+        publish_maps(
+            &tx,
+            &identity(),
+            PublicationStart::Open { origin: SegmentOrigin::Genesis },
+            &maps[..4],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let tx = db.tx_mut().unwrap();
+        open_store(&tx, &identity()).retain_after(tail).unwrap();
+        tx.commit().unwrap();
+
+        let snapshot = read_snapshot(db.tx().unwrap(), &identity()).unwrap();
+        let segment = &snapshot.restored().segments()[0];
+        assert!(
+            matches!(segment.origin(), SegmentOrigin::Retained(retained) if retained.anchor() == tail)
+        );
+        assert_eq!(segment.maps(), 2..=3);
+
+        let tx = db.tx_mut().unwrap();
+        open_store(&tx, &identity())
+            .publish(PublicationStart::Extend { from: maps[3].resume_anchor() }, &maps[4..])
+            .unwrap();
+        tx.commit().unwrap();
+
+        let activated =
+            read_snapshot(db.tx().unwrap(), &identity()).unwrap().activate(chain_hash).unwrap();
+        assert_eq!(activated.coverage().coverage().segments()[0].maps(), 2..=4);
+    }
+
+    #[test]
+    fn published_coverage_checkpoint_restores_without_external_verifier() {
+        let db = create_test_rw_db();
+        let maps = chain_maps(4);
+        let tx = db.tx_mut().unwrap();
+        FilterMapStore::initialize_identity(&tx, &identity()).unwrap();
+        publish_maps(
+            &tx,
+            &identity(),
+            PublicationStart::Open { origin: SegmentOrigin::Genesis },
+            &maps[..2],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        // A checkpoint derived from activated published coverage keeps the value space reachable
+        // after retention drops every map that produced it.
+        let checkpoint = read_snapshot(db.tx().unwrap(), &identity())
+            .unwrap()
+            .activate(chain_hash)
+            .unwrap()
+            .coverage()
+            .coverage()
+            .derived_checkpoint(maps[1].resume_anchor())
+            .unwrap();
+        let tx = db.tx_mut().unwrap();
+        open_store(&tx, &identity()).retain_after(maps[1].resume_anchor()).unwrap();
+        publish_maps(
+            &tx,
+            &identity(),
+            PublicationStart::Open { origin: SegmentOrigin::Checkpoint(checkpoint) },
+            &maps[2..],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let activated =
+            read_snapshot(db.tx().unwrap(), &identity()).unwrap().activate(chain_hash).unwrap();
+        let segment = &activated.coverage().coverage().segments()[0];
+        assert_eq!(segment.origin(), &SegmentOrigin::Checkpoint(checkpoint));
+        assert_eq!(segment.maps(), 2..=3);
+    }
+
+    #[test]
     fn retention_contraction_persists_without_deletion() {
         let db = create_test_rw_db();
         let maps = maps();
         let terminal = maps[1].resume_anchor();
         let tx = db.tx_mut().unwrap();
-        initialize_identity(&tx, &identity()).unwrap();
+        FilterMapStore::initialize_identity(&tx, &identity()).unwrap();
         publish_maps(
             &tx,
             &identity(),
@@ -997,15 +1123,11 @@ mod tests {
         tx.commit().unwrap();
 
         let tx = db.tx_mut().unwrap();
-        retain_after(&tx, &identity(), terminal).unwrap();
+        open_store(&tx, &identity()).retain_after(terminal).unwrap();
         tx.commit().unwrap();
         let tx = db.tx().unwrap();
         assert!(tx.get::<FilterMapDirectories>(0).unwrap().is_some());
-        assert!(FilterMapReadSnapshot::new(tx, &identity())
-            .unwrap()
-            .restored()
-            .segments()
-            .is_empty());
+        assert!(read_snapshot(tx, &identity()).unwrap().restored().segments().is_empty());
     }
 
     #[test]
@@ -1013,7 +1135,7 @@ mod tests {
         let db = create_test_rw_db();
         let maps = maps();
         let tx = db.tx_mut().unwrap();
-        initialize_identity(&tx, &identity()).unwrap();
+        FilterMapStore::initialize_identity(&tx, &identity()).unwrap();
         publish_maps(
             &tx,
             &identity(),
@@ -1024,14 +1146,14 @@ mod tests {
         tx.commit().unwrap();
 
         let tx = db.tx_mut().unwrap();
-        contract_for_reorg(&tx, &identity(), 0, None).unwrap();
+        open_store(&tx, &identity()).contract_for_reorg(0, None).unwrap();
         tx.commit().unwrap();
 
         let tx = db.tx().unwrap();
         assert!(tx.get::<FilterMapCoverage>(0).unwrap().is_some());
         assert!(tx.get::<FilterMapDirectories>(0).unwrap().is_some());
         assert!(tx.get::<FilterMapBlockPointers>(0).unwrap().is_some());
-        let snapshot = FilterMapReadSnapshot::new(tx, &identity()).unwrap();
+        let snapshot = read_snapshot(tx, &identity()).unwrap();
         assert!(snapshot.restored().segments().is_empty());
     }
 }
