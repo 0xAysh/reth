@@ -4,7 +4,7 @@
 use crate::{
     codec::{anchor_from_db, catalog_from_db, catalog_to_db, identity_from_db, identity_to_db},
     error::{FilterMapStorageError, Result},
-    validation::{build_publication, PublicationPlan, PublicationWrite},
+    publication::{build_publication, PublicationPlan, PublicationWrite},
 };
 use reth_db_api::{
     models::{StoredCoverageCatalog, StoredMapRowDirectory},
@@ -184,8 +184,9 @@ impl<'tx, TX: DbTx + DbTxMut> FilterMapStore<'tx, TX> {
 
     /// Atomically drops visibility through a published tail anchor.
     ///
-    /// A tail inside a segment leaves the remainder under a retained origin, which later openings
-    /// trust because only this operation mints it.
+    /// A tail inside a segment leaves the remainder under a retained origin. Later openings trust
+    /// it by kind, without a checkpoint verifier, because this operation writes it in the same
+    /// transaction as the coverage it retains.
     pub fn retain_after(&mut self, tail: MapResumeAnchor) -> Result<()> {
         let retained = self.coverage.retain_after(tail)?;
         self.write_coverage(retained)

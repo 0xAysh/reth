@@ -115,11 +115,8 @@ where
     /// A stream starting at an anchor must pass no `previous` pointer. Unless the anchor is at
     /// absolute index zero, the anchor block's pointer belongs to the already indexed prefix, so
     /// it is not associated with the first rendered map. A stream continuing a batch must pass the
-    /// last pointer of the previous batch, which orders the stream's first pointer.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `previous` is present for an anchor start or absent for a continuation start.
+    /// last pointer of the previous batch, which orders the stream's first pointer. Any other
+    /// pairing is [`RendererError::OracleStartMismatch`].
     #[cfg(any(test, feature = "test-utils"))]
     pub fn from_geth_oracle_start(
         stream: LogValueStream<I>,
@@ -139,8 +136,8 @@ where
                 Phase::Replaying { first_unpublished_index: start_index }
             }
             (StreamStart::Continuation(_), Some(_)) => Phase::Active,
-            (start, previous) => {
-                panic!("oracle start {start:?} is inconsistent with previous pointer {previous:?}")
+            (StreamStart::Anchor(_), Some(_)) | (StreamStart::Continuation(_), None) => {
+                return Err(RendererError::OracleStartMismatch { previous })
             }
         };
         Ok(Self {

@@ -412,4 +412,26 @@ fn constructors_reject_invalid_starts_without_advancing_input() {
         FilterMapRenderer::from_genesis(stream),
         Err(RendererError::GenesisFromContinuation { actual }) if actual == continuation
     ));
+
+    let anchored = LogValueStream::new(
+        RANGE_TEST_PARAMS,
+        actual,
+        vec![block(1, [])],
+        LogValueStreamTermination::ReachedHead,
+    );
+    let previous = Some(BlockPointer::new(0, hash(0), 0));
+    assert!(matches!(
+        FilterMapRenderer::from_geth_oracle_start(anchored, previous),
+        Err(RendererError::OracleStartMismatch { previous: found }) if found == previous
+    ));
+    let continued = LogValueStream::continue_from(
+        RANGE_TEST_PARAMS,
+        continuation,
+        vec![block(1, [])],
+        LogValueStreamTermination::ReachedHead,
+    );
+    assert!(matches!(
+        FilterMapRenderer::from_geth_oracle_start(continued, None),
+        Err(RendererError::OracleStartMismatch { previous: None })
+    ));
 }

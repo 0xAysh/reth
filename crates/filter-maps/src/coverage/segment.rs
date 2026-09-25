@@ -8,9 +8,11 @@ use std::ops::RangeInclusive;
 
 /// One contiguous run of covered blocks and its supporting completed maps.
 ///
-/// Segments are built and transformed only inside the crate, so an origin minted by a
-/// transformation, such as a [`SegmentOrigin::Retained`] anchor, always comes from coverage that
-/// passed restoration.
+/// Segments are built and transformed only inside the crate, so an origin a transformation mints,
+/// such as a [`SegmentOrigin::Retained`] anchor, comes from coverage that passed restoration.
+/// Restoration trusts a stored retained origin by kind, though, so one restored from a hand-built
+/// [`StoredCoverageRecord`](crate::coverage::StoredCoverageRecord) carries no such provenance; see
+/// [`CheckpointVerifier`](crate::coverage::CheckpointVerifier).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedSegment {
     identity: IndexIdentity,

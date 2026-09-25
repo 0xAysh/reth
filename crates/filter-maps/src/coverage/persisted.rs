@@ -50,47 +50,6 @@ pub enum StoredSegmentOrigin {
     },
 }
 
-/// Authority that re-establishes trust in persisted externally supplied checkpoints.
-///
-/// Restoration consults it only for [`CheckpointProvenance::Recognized`] and
-/// [`CheckpointProvenance::DerivedFrom`] origins, whose numerical pointers came from outside the
-/// node's own published coverage. Implementations must bind recognized identifiers to an exact
-/// identity and anchor and prove derived checkpoints against a trusted predecessor. Returning
-/// `false` fails closed.
-///
-/// Self-minted origins restore without it. A [`SegmentOrigin::Retained`] origin is minted only by
-/// [`StructurallyRestoredCoverage::retain_after`], and a
-/// [`CheckpointProvenance::PublishedCoverage`] checkpoint only by
-/// [`QueryableCoverage::derived_checkpoint`], so both name anchors of coverage that passed
-/// restoration, and the checkpoint also canonical activation. Whoever can forge such a record can
-/// equally forge the anchors and rows it describes, so a verifier could add no evidence the store
-/// does not already hold. Canonical activation still checks every origin hash against the current
-/// chain.
-pub trait CheckpointVerifier {
-    /// Verifies the exact checkpoint record, including its numerical pointer.
-    fn verify_checkpoint(
-        &mut self,
-        identity: &IndexIdentity,
-        anchor: MapResumeAnchor,
-        provenance: CheckpointProvenance,
-    ) -> bool;
-}
-
-/// Verifier used when no checkpoint registry is present: every external checkpoint is rejected.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct RejectUnrecognizedCheckpoints;
-
-impl CheckpointVerifier for RejectUnrecognizedCheckpoints {
-    fn verify_checkpoint(
-        &mut self,
-        _identity: &IndexIdentity,
-        _anchor: MapResumeAnchor,
-        _provenance: CheckpointProvenance,
-    ) -> bool {
-        false
-    }
-}
-
 /// Coverage whose persisted structure and origins are valid but not yet current-chain verified.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructurallyRestoredCoverage(CoverageSet);
@@ -276,10 +235,11 @@ impl QueryableCoverage {
 
     /// Returns a checkpoint for an anchor this canonical coverage published.
     ///
-    /// This is the only way to mint a [`CheckpointProvenance::PublishedCoverage`] checkpoint,
-    /// which later openings of the store trust without a [`CheckpointVerifier`]. Minting requires
-    /// canonical activation, so neither fabricated coverage nor structurally restored coverage
-    /// whose segments failed activation can produce one:
+    /// This is the only coverage transition that mints a
+    /// [`CheckpointProvenance::PublishedCoverage`] checkpoint, which later openings of the store
+    /// trust without a [`CheckpointVerifier`]. It requires canonical activation, so neither
+    /// fabricated coverage nor structurally restored coverage whose segments failed activation can
+    /// produce one here:
     ///
     /// ```compile_fail,E0599
     /// use reth_filter_maps::{coverage::StructurallyRestoredCoverage, MapResumeAnchor};
@@ -296,11 +256,65 @@ impl QueryableCoverage {
     ///     let _ = CoverageSet::new(identity);
     /// }
     /// ```
+    ///
+    /// Restoration trusts that provenance by kind, however, so a hand-built
+    /// [`StoredCoverageRecord`] declaring it bypasses this requirement; see
+    /// [`CheckpointVerifier`].
     pub fn derived_checkpoint(
         &self,
         anchor: MapResumeAnchor,
     ) -> Result<VerifiedCheckpoint, PublishError> {
         self.0.derived_checkpoint(anchor)
+    }
+}
+
+/// Authority that re-establishes trust in persisted externally supplied checkpoints.
+///
+/// Restoration consults it only for [`CheckpointProvenance::Recognized`] and
+/// [`CheckpointProvenance::DerivedFrom`] origins, whose numerical pointers came from outside the
+/// node's own published coverage. Implementations must bind recognized identifiers to an exact
+/// identity and anchor and prove derived checkpoints against a trusted predecessor. Returning
+/// `false` fails closed.
+///
+/// Self-minted origin kinds restore without it: [`StructurallyRestoredCoverage::restore`] trusts a
+/// [`StoredSegmentOrigin::Retained`] origin and a [`CheckpointProvenance::PublishedCoverage`]
+/// checkpoint by their kind alone. Coverage transitions mint the first only in
+/// [`StructurallyRestoredCoverage::retain_after`] and the second only in
+/// [`QueryableCoverage::derived_checkpoint`], and a store persists either in the same transaction
+/// as the coverage it belongs to. A record read back from the store's own tables therefore names
+/// anchors of coverage that passed restoration, and for the checkpoint also canonical activation,
+/// provided every origin that entered that coverage was itself minted this way or verified.
+/// Whoever can forge such a record in the store can equally forge the anchors and rows it
+/// describes.
+///
+/// That guarantee covers only records read from the store's own tables. [`StoredCoverageRecord`]
+/// and restoration are public, so a hand-built record declaring either kind for an arbitrary
+/// anchor restores as a trusted origin without consulting this verifier, and that origin can then
+/// open a segment through [`PublicationStart::Open`](crate::coverage::PublicationStart::Open),
+/// which does not re-check how the origin was minted. Canonical activation still checks every
+/// origin hash against the current chain.
+pub trait CheckpointVerifier {
+    /// Verifies the exact checkpoint record, including its numerical pointer.
+    fn verify_checkpoint(
+        &mut self,
+        identity: &IndexIdentity,
+        anchor: MapResumeAnchor,
+        provenance: CheckpointProvenance,
+    ) -> bool;
+}
+
+/// Verifier used when no checkpoint registry is present: every external checkpoint is rejected.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RejectUnrecognizedCheckpoints;
+
+impl CheckpointVerifier for RejectUnrecognizedCheckpoints {
+    fn verify_checkpoint(
+        &mut self,
+        _identity: &IndexIdentity,
+        _anchor: MapResumeAnchor,
+        _provenance: CheckpointProvenance,
+    ) -> bool {
+        false
     }
 }
 

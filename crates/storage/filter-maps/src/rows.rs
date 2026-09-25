@@ -9,10 +9,11 @@
 //! ```
 //!
 //! Encoding and decoding live together so the split point, the group/slot arithmetic, and the
-//! per-row length check cannot drift apart between publication, retry comparison, and queries.
-//! The directory is authoritative: every decoded row is checked against its declared length, so a
-//! payload that disagrees with the directory is corruption even when the map's total mark count
-//! happens to agree.
+//! per-row length checks cannot drift apart between publication, retry comparison, and queries.
+//! The directory is authoritative: every payload a read returns is checked against the row's
+//! declared length, so a payload that disagrees with the directory is corruption even when the
+//! map's total mark count happens to agree. [`RowRead`] lists exactly which checks each read mode
+//! performs; a prefix read leaves unverified only records it never reads.
 
 use crate::error::{FilterMapStorageError, Result};
 use reth_db_api::{
@@ -174,14 +175,35 @@ pub(crate) struct RowWrites {
     pub extensions: BTreeMap<FilterMapExtendedRowKey, Option<StoredExtendedRow>>,
 }
 
-/// How much of a row a [`RowReader`] decodes and how much stale payload it tolerates.
+/// How much of a row a [`RowReader`] decodes, and therefore which records it verifies.
+///
+/// Both modes check every record they read against the directory:
+///
+/// - a row the directory declares nonempty needs a nonempty base slot
+///   ([`MissingBaseRow`](FilterMapStorageError::MissingBaseRow) otherwise);
+/// - a base-only row's slot holds exactly the declared length
+///   ([`PayloadCountMismatch`](FilterMapStorageError::PayloadCountMismatch) otherwise);
+/// - an extended row's slot is full, holding exactly `base_row_length` columns
+///   ([`MissingBaseRow`](FilterMapStorageError::MissingBaseRow) otherwise);
+/// - when an extended row's extension is read, it exists
+///   ([`MissingExtension`](FilterMapStorageError::MissingExtension) otherwise) and the slot plus
+///   the extension hold exactly the declared length
+///   ([`PayloadCountMismatch`](FilterMapStorageError::PayloadCountMismatch) otherwise).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RowRead {
-    /// The complete row; payload in a directory-empty row or an extension on a base-only row is
-    /// [`FilterMapStorageError::ContradictedPayload`].
+    /// The complete row, reading every record the row could occupy.
+    ///
+    /// Beyond the shared checks, an extended row's extension is always read, and stale payload is
+    /// rejected as [`FilterMapStorageError::ContradictedPayload`]: a nonempty base slot or any
+    /// extension for a row the directory declares empty, or an extension for a base-only row.
     Strict,
-    /// At most this many leading columns. Rows the directory declares empty are not read, and an
-    /// extension is read only when the prefix reaches past the base slot.
+    /// At most this many leading columns, reading only the records those columns occupy.
+    ///
+    /// A row the directory declares empty returns no columns without reading its base slot or
+    /// extension, and a base-only row's extension is never read, so stale payload in either goes
+    /// undetected. An extended row's extension is read, and verified, only when the limit exceeds
+    /// `base_row_length`; at or below it the full base slot alone proves the returned columns and
+    /// the extension is neither read nor checked.
     Prefix(usize),
 }
 

@@ -33,6 +33,14 @@ pub enum RendererError {
         /// Configured stream anchor.
         actual: BlockPointer,
     },
+    /// A Geth-oracle start passed a previous pointer with an anchor stream, or none with a
+    /// batch-continuation stream. Only the `test-utils` oracle constructor reports it.
+    #[error("oracle start previous pointer {previous:?} does not match the stream start")]
+    OracleStartMismatch {
+        /// Supplied previous pointer; `Some` means the stream starts at an anchor, `None` that it
+        /// continues a batch.
+        previous: Option<BlockPointer>,
+    },
     /// A durable renderer resume was attempted from a raw continuation stream.
     #[error("renderer cannot durably resume from a batch-continuation stream")]
     ResumeFromContinuation {
