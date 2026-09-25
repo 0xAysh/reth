@@ -4,7 +4,7 @@
 use crate::{
     codec::{anchor_from_db, catalog_from_db, catalog_to_db, identity_from_db, identity_to_db},
     error::{FilterMapStorageError, Result},
-    validation::{build_publication, PublicationPlan, PublicationWrites},
+    validation::{build_publication, PublicationPlan, PublicationWrite},
 };
 use reth_db_api::{
     models::{StoredCoverageCatalog, StoredMapRowDirectory},
@@ -164,7 +164,10 @@ impl<'tx, TX: DbTx + DbTxMut> FilterMapStore<'tx, TX> {
         start: PublicationStart,
         maps: &[AnchoredCompletedMap],
     ) -> Result<()> {
-        self.publish_observed(start, maps, |_| Ok(()))
+        let PublicationPlan::Write(writes) = build_publication(self, &start, maps)? else {
+            return Ok(())
+        };
+        writes.into_iter().try_for_each(|write| self.apply(write))
     }
 
     /// Contracts query visibility before rebuilding a changed canonical branch.
@@ -188,44 +191,30 @@ impl<'tx, TX: DbTx + DbTxMut> FilterMapStore<'tx, TX> {
         self.write_coverage(retained)
     }
 
-    fn publish_observed(
-        &mut self,
-        start: PublicationStart,
-        maps: &[AnchoredCompletedMap],
-        mut after_phase: impl FnMut(PublicationPhase) -> Result<()>,
-    ) -> Result<()> {
-        let PublicationPlan::Write(writes) = build_publication(self, &start, maps)? else {
-            return Ok(())
-        };
-        let PublicationWrites { base_groups, extensions, directories, pointers, anchors, coverage } =
-            writes;
-        for (key, group) in base_groups {
-            self.tx.put::<FilterMapBaseRows>(key, group)?;
-            after_phase(PublicationPhase::BaseRowWrite)?;
-        }
-        after_phase(PublicationPhase::BaseRows)?;
-        for (key, extension) in extensions {
-            self.tx.delete::<FilterMapExtendedRows>(key, None)?;
-            if let Some(extension) = extension {
-                self.tx.put::<FilterMapExtendedRows>(key, extension)?;
+    /// Applies one publication write; the coverage write also adopts the published coverage.
+    pub(crate) fn apply(&mut self, write: PublicationWrite) -> Result<()> {
+        match write {
+            PublicationWrite::BaseRowGroup(key, group) => {
+                self.tx.put::<FilterMapBaseRows>(key, group)?
             }
-            after_phase(PublicationPhase::ExtensionWrite)?;
+            PublicationWrite::ExtendedRow(key, row) => {
+                self.tx.delete::<FilterMapExtendedRows>(key, None)?;
+                if let Some(row) = row {
+                    self.tx.put::<FilterMapExtendedRows>(key, row)?;
+                }
+            }
+            PublicationWrite::Directory(map_index, directory) => {
+                self.tx.put::<FilterMapDirectories>(map_index, directory)?
+            }
+            PublicationWrite::BlockPointer(block_number, pointer) => {
+                self.tx.put::<FilterMapBlockPointers>(block_number, pointer)?
+            }
+            PublicationWrite::Anchor(map_index, anchor) => {
+                self.tx.put::<FilterMapAnchors>(map_index, anchor)?
+            }
+            PublicationWrite::Coverage(coverage) => self.write_coverage(coverage)?,
         }
-        after_phase(PublicationPhase::Extensions)?;
-        for (map_index, directory) in directories {
-            self.tx.put::<FilterMapDirectories>(map_index, directory)?;
-        }
-        after_phase(PublicationPhase::Directories)?;
-        for (block_number, pointer) in pointers {
-            self.tx.put::<FilterMapBlockPointers>(block_number, pointer)?;
-        }
-        after_phase(PublicationPhase::Pointers)?;
-        for (map_index, anchor) in anchors {
-            self.tx.put::<FilterMapAnchors>(map_index, anchor)?;
-        }
-        after_phase(PublicationPhase::Anchors)?;
-        after_phase(PublicationPhase::BeforeCoverage)?;
-        self.write_coverage(coverage)
+        Ok(())
     }
 
     /// Writes the coverage visibility fence and adopts it only once the write succeeded.
@@ -234,34 +223,6 @@ impl<'tx, TX: DbTx + DbTxMut> FilterMapStore<'tx, TX> {
         self.coverage = coverage;
         Ok(())
     }
-
-    #[cfg(test)]
-    pub(crate) fn publish_with_fault(
-        &mut self,
-        start: PublicationStart,
-        maps: &[AnchoredCompletedMap],
-        fault_after: PublicationPhase,
-    ) -> Result<()> {
-        self.publish_observed(start, maps, |phase| {
-            if phase == fault_after {
-                Err(FilterMapStorageError::InjectedPublicationFailure)
-            } else {
-                Ok(())
-            }
-        })
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PublicationPhase {
-    BaseRowWrite,
-    BaseRows,
-    ExtensionWrite,
-    Extensions,
-    Directories,
-    Pointers,
-    Anchors,
-    BeforeCoverage,
 }
 
 /// Returns whether any table other than identity holds a record.

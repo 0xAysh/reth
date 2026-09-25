@@ -3,7 +3,7 @@
 //! Publication rules belong to
 //! [`StructurallyRestoredCoverage::propose`](reth_filter_maps::coverage::StructurallyRestoredCoverage::propose).
 //! This module adds only what depends on stored bytes and physical layout, and then constructs
-//! either a no-op retry or a complete [`PublicationWrites`] set before the store mutates any
+//! either a no-op retry or the complete ordered [`PublicationWrites`] before the store mutates any
 //! table. The caller-owned MDBX transaction remains the atomicity boundary.
 
 use crate::{
@@ -27,7 +27,6 @@ use reth_filter_maps::{
     },
     AnchoredCompletedMap,
 };
-use std::collections::BTreeMap;
 
 const MAX_BATCH: usize = 32;
 
@@ -37,14 +36,47 @@ pub(crate) enum PublicationPlan {
     Write(PublicationWrites),
 }
 
+/// Every record one publication writes, in write order, ending with the coverage record.
+///
+/// Coverage is the visibility fence: published coverage references none of the physical records
+/// before it, so any strict prefix, even one a caller commits, leaves the publication invisible.
 #[derive(Debug)]
-pub(crate) struct PublicationWrites {
-    pub base_groups: BTreeMap<FilterMapBaseRowKey, StoredBaseRowGroup>,
-    pub extensions: BTreeMap<FilterMapExtendedRowKey, Option<StoredExtendedRow>>,
-    pub directories: BTreeMap<u32, StoredMapRowDirectory>,
-    pub pointers: BTreeMap<u64, StoredBlockPointer>,
-    pub anchors: BTreeMap<u32, StoredMapResumeAnchor>,
-    pub coverage: StructurallyRestoredCoverage,
+pub(crate) struct PublicationWrites(Vec<PublicationWrite>);
+
+impl PublicationWrites {
+    fn new(
+        physical: impl IntoIterator<Item = PublicationWrite>,
+        coverage: StructurallyRestoredCoverage,
+    ) -> Self {
+        Self(
+            physical
+                .into_iter()
+                .chain(std::iter::once(PublicationWrite::Coverage(coverage)))
+                .collect(),
+        )
+    }
+}
+
+impl IntoIterator for PublicationWrites {
+    type Item = PublicationWrite;
+    type IntoIter = std::vec::IntoIter<PublicationWrite>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+/// One record write of a publication.
+#[derive(Debug)]
+pub(crate) enum PublicationWrite {
+    BaseRowGroup(FilterMapBaseRowKey, StoredBaseRowGroup),
+    /// Replaces an extended row, or deletes a stale one when `None`.
+    ExtendedRow(FilterMapExtendedRowKey, Option<StoredExtendedRow>),
+    Directory(u32, StoredMapRowDirectory),
+    BlockPointer(u64, StoredBlockPointer),
+    Anchor(u32, StoredMapResumeAnchor),
+    /// The visibility fence, and therefore always the last write.
+    Coverage(StructurallyRestoredCoverage),
 }
 
 /// Turns the pure publication decision into physical checks and the complete write set.
@@ -88,25 +120,23 @@ pub(crate) fn build_publication<TX: DbTx>(
         map_rows.stage(tx, &mut rows)?;
     }
     let RowWrites { base_groups, extensions } = rows;
-    let directories =
-        encoded.iter().map(|map_rows| (map_rows.map_index(), map_rows.directory().clone()));
+    let base_groups =
+        base_groups.into_iter().map(|(key, group)| PublicationWrite::BaseRowGroup(key, group));
+    let extensions =
+        extensions.into_iter().map(|(key, row)| PublicationWrite::ExtendedRow(key, row));
+    let directories = encoded.iter().map(|map_rows| {
+        PublicationWrite::Directory(map_rows.map_index(), map_rows.directory().clone())
+    });
+    let pointers = pointers
+        .pointers()
+        .iter()
+        .map(|pointer| PublicationWrite::BlockPointer(pointer.block_number, stored(pointer)));
     let anchors = maps.iter().map(|anchored| {
         let anchor = anchored.resume_anchor();
-        (anchor.completed_map_index, anchor_to_db(anchor))
+        PublicationWrite::Anchor(anchor.completed_map_index, anchor_to_db(anchor))
     });
-
-    Ok(PublicationPlan::Write(PublicationWrites {
-        base_groups,
-        extensions,
-        directories: directories.collect(),
-        pointers: pointers
-            .pointers()
-            .iter()
-            .map(|pointer| (pointer.block_number, stored(pointer)))
-            .collect(),
-        anchors: anchors.collect(),
-        coverage,
-    }))
+    let physical = base_groups.chain(extensions).chain(directories).chain(pointers).chain(anchors);
+    Ok(PublicationPlan::Write(PublicationWrites::new(physical, coverage)))
 }
 
 /// Rejects batches the physical row layout cannot stage as one base-row group.

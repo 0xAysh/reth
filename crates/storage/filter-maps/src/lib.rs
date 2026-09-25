@@ -43,6 +43,7 @@ pub use store::FilterMapStore;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::validation::{build_publication, PublicationPlan, PublicationWrite};
     use alloy_primitives::{Address, B256};
     use reth_db::test_utils::create_test_rw_db;
     use reth_db_api::{
@@ -259,6 +260,30 @@ mod tests {
         maps
     }
 
+    /// Renders two default-geometry maps that repeat one address, so their few rows fill several
+    /// layers and most of them overflow into extensions.
+    fn overflowing_maps() -> Vec<reth_filter_maps::AnchoredCompletedMap> {
+        let logs = |count| (0..count).map(|_| LogInput::new(Address::repeat_byte(0x5a), []));
+        let blocks = vec![
+            BlockInput::new(0, B256::ZERO, logs(70_000)),
+            BlockInput::new(1, B256::repeat_byte(1), logs(70_000)),
+            BlockInput::new(2, B256::repeat_byte(2), []),
+        ];
+        let stream = LogValueStream::new(
+            DEFAULT_PARAMS,
+            BlockPointer::new(0, B256::ZERO, 0),
+            blocks,
+            LogValueStreamTermination::ReachedHead,
+        );
+        let mut renderer = FilterMapRenderer::from_genesis(stream).unwrap();
+        let mut maps = Vec::new();
+        while let RendererOutput::Map(map) = renderer.render_next().unwrap().unwrap() {
+            maps.push(map);
+        }
+        assert_eq!(maps.len(), 2);
+        maps
+    }
+
     fn chain_hash(number: u64) -> std::result::Result<Option<B256>, std::convert::Infallible> {
         Ok(Some(if number == 0 { B256::ZERO } else { B256::repeat_byte(number as u8) }))
     }
@@ -402,73 +427,47 @@ mod tests {
     }
 
     #[test]
-    fn every_failed_publication_phase_keeps_new_coverage_invisible() {
-        use crate::store::PublicationPhase;
-
-        for phase in [
-            PublicationPhase::BaseRows,
-            PublicationPhase::Extensions,
-            PublicationPhase::Directories,
-            PublicationPhase::Pointers,
-            PublicationPhase::Anchors,
-            PublicationPhase::BeforeCoverage,
-        ] {
-            let db = create_test_rw_db();
-            let tx = db.tx_mut().unwrap();
-            FilterMapStore::initialize_identity(&tx, &identity()).unwrap();
-            tx.commit().unwrap();
-
-            // Commit the deliberately partial physical writes. Coverage remains the visibility
-            // fence, so even this hostile caller behavior cannot make them queryable.
-            let tx = db.tx_mut().unwrap();
-            let maps = maps();
-            let result = open_store(&tx, &identity()).publish_with_fault(
-                PublicationStart::Open { origin: SegmentOrigin::Genesis },
-                &maps[..1],
-                phase,
-            );
-            assert!(
-                matches!(result, Err(FilterMapStorageError::InjectedPublicationFailure)),
-                "phase {phase:?}: {result:?}"
-            );
-            tx.commit().unwrap();
-
-            let snapshot = read_snapshot(db.tx().unwrap(), &identity()).unwrap();
-            assert!(snapshot.restored().segments().is_empty(), "phase {phase:?}");
-            assert!(snapshot.activate(|_| Ok::<_, std::convert::Infallible>(None)).is_ok());
-        }
-    }
-
-    #[test]
-    fn failures_inside_multi_record_row_loops_keep_coverage_invisible() {
-        use crate::store::PublicationPhase;
-
-        let (map, _, _) = replacement_transition_maps();
+    fn every_strict_prefix_of_a_publication_keeps_new_coverage_invisible() {
         let identity =
             IndexIdentity::new(STORAGE_FORMAT_V1, 1, B256::ZERO, GETH_V1, ParamsId::Default);
-        for phase in [PublicationPhase::BaseRowWrite, PublicationPhase::ExtensionWrite] {
-            let db = create_test_rw_db();
-            let tx = db.tx_mut().unwrap();
-            FilterMapStore::initialize_identity(&tx, &identity).unwrap();
-            tx.commit().unwrap();
+        let maps = overflowing_maps();
+        let db = create_test_rw_db();
+        let tx = db.tx_mut().unwrap();
+        FilterMapStore::initialize_identity(&tx, &identity).unwrap();
+        tx.commit().unwrap();
 
-            // Commit the deliberately interrupted physical loop. Coverage remains unchanged, so
-            // neither the first written base group nor extension is queryable.
-            let tx = db.tx_mut().unwrap();
-            let result = open_store(&tx, &identity).publish_with_fault(
-                PublicationStart::Open { origin: SegmentOrigin::Genesis },
-                std::slice::from_ref(&map),
-                phase,
-            );
-            assert!(
-                matches!(result, Err(FilterMapStorageError::InjectedPublicationFailure)),
-                "phase {phase:?}: {result:?}"
-            );
-            tx.commit().unwrap();
+        let tx = db.tx_mut().unwrap();
+        let start = PublicationStart::Open { origin: SegmentOrigin::Genesis };
+        let PublicationPlan::Write(writes) =
+            build_publication(&open_store(&tx, &identity), &start, &maps).unwrap()
+        else {
+            panic!("a fresh publication writes")
+        };
+        tx.abort();
+        let writes = writes.into_iter().collect::<Vec<_>>();
+        let count = |kind: fn(&PublicationWrite) -> bool| writes.iter().filter(|w| kind(w)).count();
+        assert!(count(|write| matches!(write, PublicationWrite::BaseRowGroup(..))) > 1);
+        assert!(count(|write| matches!(write, PublicationWrite::ExtendedRow(..))) > 1);
+        assert_eq!(count(|write| matches!(write, PublicationWrite::Directory(..))), 2);
+        assert!(count(|write| matches!(write, PublicationWrite::BlockPointer(..))) > 1);
+        assert_eq!(count(|write| matches!(write, PublicationWrite::Anchor(..))), 2);
+        assert_eq!(count(|write| matches!(write, PublicationWrite::Coverage(..))), 1);
+        assert!(matches!(writes.last(), Some(PublicationWrite::Coverage(..))));
 
+        // Committing one more write per round commits every prefix in turn. Even this hostile
+        // caller cannot make partial physical writes visible: coverage is the fence.
+        let total = writes.len();
+        for (applied, write) in writes.into_iter().enumerate() {
             let snapshot = read_snapshot(db.tx().unwrap(), &identity).unwrap();
-            assert!(snapshot.restored().segments().is_empty(), "phase {phase:?}");
+            assert!(snapshot.restored().segments().is_empty(), "{applied} of {total} writes");
+            assert!(snapshot.activate(|_| Ok::<_, std::convert::Infallible>(None)).is_ok());
+
+            let tx = db.tx_mut().unwrap();
+            open_store(&tx, &identity).apply(write).unwrap();
+            tx.commit().unwrap();
         }
+        let snapshot = read_snapshot(db.tx().unwrap(), &identity).unwrap();
+        assert_eq!(snapshot.restored().segments()[0].maps(), 0..=1);
     }
 
     #[test]
