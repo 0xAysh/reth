@@ -1110,4 +1110,35 @@ mod tests {
         invalid.push(0xff);
         assert!(StoredCoverageCatalog::decompress(&invalid).is_err());
     }
+
+    #[test]
+    fn anchors_with_unknown_value_space_versions_do_not_decode() {
+        let unknown = StoredMapResumeAnchor {
+            completed_map_index: 9,
+            block_number: 100,
+            block_hash: B256::repeat_byte(100),
+            first_log_value_index: 1234,
+            value_space_version: 2,
+        };
+        assert!(StoredMapResumeAnchor::decompress(&unknown.compress()).is_err());
+
+        let known = StoredMapResumeAnchor { value_space_version: 1, ..unknown };
+        let origins = [
+            StoredSegmentOrigin::Retained { anchor: unknown },
+            StoredSegmentOrigin::Checkpoint {
+                anchor: unknown,
+                provenance: StoredCheckpointProvenance::Recognized(1),
+            },
+            StoredSegmentOrigin::Checkpoint {
+                anchor: known,
+                provenance: StoredCheckpointProvenance::DerivedFrom(unknown),
+            },
+        ];
+        for origin in origins {
+            let catalog = StoredCoverageCatalog {
+                segments: vec![StoredSegmentDescriptor { origin, first_map: 10, terminal_map: 12 }],
+            };
+            assert!(StoredCoverageCatalog::decompress(&catalog.compress()).is_err());
+        }
+    }
 }
