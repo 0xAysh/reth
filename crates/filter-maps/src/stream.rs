@@ -94,6 +94,21 @@ impl<I: Iterator<Item = BlockInput>> LogValueStream<I> {
         }
     }
 
+    pub(crate) const fn params(&self) -> Params {
+        self.params
+    }
+
+    pub(crate) const fn start(&self) -> StreamStart {
+        self.start
+    }
+
+    pub(crate) const fn initial_cursor(&self) -> u64 {
+        match self.start {
+            StreamStart::Anchor(anchor) => anchor.first_log_value_index,
+            StreamStart::Continuation(continuation) => continuation.next_log_value_index,
+        }
+    }
+
     /// Continues a stream at the raw cursor returned by a bounded batch.
     ///
     /// Unlike a [`ValueSpaceAnchor`], a continuation cursor can precede padding required by the
@@ -749,7 +764,7 @@ pub enum LogValueStreamError {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum StreamStart {
+pub(crate) enum StreamStart {
     Anchor(ValueSpaceAnchor),
     Continuation(BatchContinuation),
 }

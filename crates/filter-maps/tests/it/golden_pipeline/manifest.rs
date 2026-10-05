@@ -17,13 +17,13 @@ use std::{
 
 /// Per-fixture content counts recorded by the manifest.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(super) struct Counts {
-    pub(super) completed_maps: usize,
-    pub(super) partial_maps: usize,
-    pub(super) rows: usize,
-    pub(super) marks: usize,
-    pub(super) queries: usize,
-    pub(super) potential_indices: usize,
+pub(crate) struct Counts {
+    pub(crate) completed_maps: usize,
+    pub(crate) partial_maps: usize,
+    pub(crate) rows: usize,
+    pub(crate) marks: usize,
+    pub(crate) queries: usize,
+    pub(crate) potential_indices: usize,
 }
 
 impl Counts {
@@ -63,15 +63,15 @@ impl Counts {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct ManifestEntry {
+pub(crate) struct ManifestEntry {
     /// Path relative to the corpus root, with `/` separators.
-    pub(super) path: String,
-    pub(super) class: FixtureClass,
-    pub(super) params_name: ParamsName,
-    pub(super) bytes: usize,
+    pub(crate) path: String,
+    pub(crate) class: FixtureClass,
+    pub(crate) params_name: ParamsName,
+    pub(crate) bytes: usize,
     /// Lowercase hex SHA-256 of the file's bytes.
-    pub(super) digest: String,
-    pub(super) counts: Counts,
+    pub(crate) digest: String,
+    pub(crate) counts: Counts,
 }
 
 /// Checks a manifested path against the corpus layout and returns the class its directory
@@ -115,7 +115,7 @@ fn entry_from(fields: &[&str]) -> ParseResult<ManifestEntry> {
 }
 
 /// Parses the manifest text; `path` only labels error messages.
-pub(super) fn parse_manifest(path: &str, text: &str) -> ParseResult<Vec<ManifestEntry>> {
+pub(crate) fn parse_manifest(path: &str, text: &str) -> ParseResult<Vec<ManifestEntry>> {
     let mut lines = Lines::new(path, text)?;
     lines.exact(&["PIPELINE_MANIFEST", "1"])?;
     lines.exact(&["FIXTURE_FORMAT", "2"])?;
@@ -214,7 +214,7 @@ fn check_entry(entry: &ManifestEntry, fixture: &Fixture) -> ParseResult<()> {
 }
 
 /// Loads the manifest, reconciles it with the directory, and parses every manifested fixture.
-pub(super) fn load_and_validate_corpus() -> ParseResult<Vec<(ManifestEntry, Fixture)>> {
+pub(crate) fn load_and_validate_corpus() -> ParseResult<Vec<(ManifestEntry, Fixture)>> {
     let root = corpus_dir();
     let manifest_path = root.join("MANIFEST.txt");
     let text = io(fs::read_to_string(&manifest_path), &manifest_path)?;

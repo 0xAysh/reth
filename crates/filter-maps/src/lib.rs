@@ -19,9 +19,10 @@
 //! usable as a correctness oracle, if these functions agree bit for bit. The port is pinned by
 //! golden vectors generated from Geth (see `tests/golden`).
 //!
-//! Nothing here touches storage: the stream and mapping functions produce the input that a later
-//! rendering layer can persist. That layer is responsible for atomically publishing rendered rows,
-//! map resume metadata, the numerical block pointer, and its valid-range update.
+//! Nothing here touches storage: the stream and renderer produce immutable logical maps that a
+//! later layer can persist. Every completed renderer output is paired with a validated numerical
+//! resume anchor, but publication must still atomically write rows, restart metadata, and its
+//! valid-range update. Incomplete head and batch state never expands indexed coverage.
 
 #![doc(
     html_logo_url = "https://raw.githubusercontent.com/paradigmxyz/reth/main/assets/reth-docs.png",
@@ -31,13 +32,21 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+#[cfg(test)]
+extern crate self as reth_filter_maps;
+
 pub mod coverage;
 mod params;
+mod renderer;
 mod stream;
 mod value;
 
 pub use params::{
     Params, ParamsError, ParamsId, UnknownParamsId, DEFAULT_PARAMS, RANGE_TEST_PARAMS,
+};
+pub use renderer::{
+    AnchoredCompletedMap, CompletedMap, FilterMapRenderer, RenderedRow, RendererCompletion,
+    RendererContinuation, RendererError, RendererOutput,
 };
 pub use stream::{
     BatchContinuation, BlockInput, BlockPointer, LogInput, LogValueKind, LogValueSlot,
@@ -46,3 +55,9 @@ pub use stream::{
     UnknownValueSpaceVersion, ValueSpaceAnchor, ValueSpaceVersion, GETH_V1,
 };
 pub use value::{address_value, topic_value};
+
+// The FORMAT 2 parser is also compiled into crate tests so private renderer state can be checked
+// without exposing a production test adapter.
+#[cfg(test)]
+#[path = "../tests/it/golden_pipeline.rs"]
+mod golden_pipeline;

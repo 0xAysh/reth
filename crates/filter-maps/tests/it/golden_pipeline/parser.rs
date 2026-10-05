@@ -11,9 +11,9 @@ use sha2::{Digest, Sha256};
 use std::{collections::HashSet, fmt, str::FromStr};
 
 /// The go-ethereum revision every fixture must name.
-pub(super) const GETH_REVISION: &str = "af7c0fd8ee09de71b1034dbe6d1112556b49b59f";
+pub(crate) const GETH_REVISION: &str = "af7c0fd8ee09de71b1034dbe6d1112556b49b59f";
 /// The fork revision of the generator every fixture must name.
-pub(super) const GENERATOR_REVISION: &str = "ce40051a0c308cb01df7005cb25e6481da78616f";
+pub(crate) const GENERATOR_REVISION: &str = "ce40051a0c308cb01df7005cb25e6481da78616f";
 /// The `SplitMix64` seed shared by every stress fixture; the ordinal selects the sequence.
 const STRESS_SEED: &str = "0xaf7c0fd8ee09de71";
 const GENERATOR_PREFIX: &str = "https://github.com/0xAysh/reth/blob/";
@@ -21,17 +21,17 @@ const GENERATOR_SUFFIX: &str = "/tools/filtermaps-oracles/pipeline/gen_pipeline_
 /// Ethereum's topic limit, which also bounds a query's positional constraints.
 const MAX_TOPICS: usize = 4;
 
-pub(super) type ParseResult<T> = Result<T, String>;
+pub(crate) type ParseResult<T> = Result<T, String>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum FixtureClass {
+pub(crate) enum FixtureClass {
     Focused,
     EndToEnd,
     Stress,
 }
 
 impl FixtureClass {
-    pub(super) fn parse(token: &str) -> Option<Self> {
+    pub(crate) fn parse(token: &str) -> Option<Self> {
         match token {
             "FOCUSED" => Some(Self::Focused),
             "END_TO_END" => Some(Self::EndToEnd),
@@ -42,13 +42,13 @@ impl FixtureClass {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum ParamsName {
+pub(crate) enum ParamsName {
     Default,
     Range,
 }
 
 impl ParamsName {
-    pub(super) fn parse(token: &str) -> Option<Self> {
+    pub(crate) fn parse(token: &str) -> Option<Self> {
         match token {
             "DEFAULT" => Some(Self::Default),
             "RANGE" => Some(Self::Range),
@@ -56,7 +56,7 @@ impl ParamsName {
         }
     }
 
-    pub(super) const fn params(self) -> Params {
+    pub(crate) const fn params(self) -> Params {
         match self {
             Self::Default => DEFAULT_PARAMS,
             Self::Range => RANGE_TEST_PARAMS,
@@ -66,14 +66,14 @@ impl ParamsName {
 
 /// A block identity bound to an absolute log value index.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Pointer {
-    pub(super) block: u64,
-    pub(super) hash: B256,
-    pub(super) index: u64,
+pub(crate) struct Pointer {
+    pub(crate) block: u64,
+    pub(crate) hash: B256,
+    pub(crate) index: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Origin {
+pub(crate) enum Origin {
     Genesis(Pointer),
     Checkpoint(Pointer),
     Continuation { block: u64, hash: B256, cursor: u64, previous: Pointer },
@@ -81,7 +81,7 @@ pub(super) enum Origin {
 
 impl Origin {
     /// The identity of the first block the fixture feeds to the stream.
-    pub(super) const fn first_block(&self) -> (u64, B256) {
+    pub(crate) const fn first_block(&self) -> (u64, B256) {
         match self {
             Self::Genesis(anchor) | Self::Checkpoint(anchor) => (anchor.block, anchor.hash),
             Self::Continuation { block, hash, .. } => (*block, *hash),
@@ -90,32 +90,32 @@ impl Origin {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Termination {
+pub(crate) enum Termination {
     Head,
     Batch { next_block: u64, next_hash: B256 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct Log {
-    pub(super) address: Address,
-    pub(super) topics: Vec<B256>,
+pub(crate) struct Log {
+    pub(crate) address: Address,
+    pub(crate) topics: Vec<B256>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct Receipt {
-    pub(super) logs: Vec<Log>,
+pub(crate) struct Receipt {
+    pub(crate) logs: Vec<Log>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct Block {
-    pub(super) number: u64,
-    pub(super) hash: B256,
-    pub(super) receipts: Vec<Receipt>,
+pub(crate) struct Block {
+    pub(crate) number: u64,
+    pub(crate) hash: B256,
+    pub(crate) receipts: Vec<Receipt>,
 }
 
 /// The kind of slot that completed a map.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum BoundaryEnding {
+pub(crate) enum BoundaryEnding {
     Value,
     Delimiter,
     Padding,
@@ -133,51 +133,51 @@ impl BoundaryEnding {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct StreamBoundary {
-    pub(super) map: u32,
-    pub(super) block: u64,
-    pub(super) hash: B256,
-    pub(super) ending: BoundaryEnding,
+pub(crate) struct StreamBoundary {
+    pub(crate) map: u32,
+    pub(crate) block: u64,
+    pub(crate) hash: B256,
+    pub(crate) ending: BoundaryEnding,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct Row {
-    pub(super) index: u32,
-    pub(super) columns: Vec<u32>,
+pub(crate) struct Row {
+    pub(crate) index: u32,
+    pub(crate) columns: Vec<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct CompletedMap {
-    pub(super) index: u32,
-    pub(super) epoch: u32,
-    pub(super) last_block: u64,
-    pub(super) last_hash: B256,
-    pub(super) pointer_blocks: Vec<u64>,
-    pub(super) rows: Vec<Row>,
-    pub(super) mark_count: usize,
-    pub(super) boundary: Pointer,
+pub(crate) struct CompletedMap {
+    pub(crate) index: u32,
+    pub(crate) epoch: u32,
+    pub(crate) last_block: u64,
+    pub(crate) last_hash: B256,
+    pub(crate) pointer_blocks: Vec<u64>,
+    pub(crate) rows: Vec<Row>,
+    pub(crate) mark_count: usize,
+    pub(crate) boundary: Pointer,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct PartialMap {
-    pub(super) index: u32,
-    pub(super) epoch: u32,
-    pub(super) last_block: u64,
-    pub(super) last_hash: B256,
-    pub(super) pending_delimiter: u64,
-    pub(super) rows: Vec<Row>,
-    pub(super) mark_count: usize,
+pub(crate) struct PartialMap {
+    pub(crate) index: u32,
+    pub(crate) epoch: u32,
+    pub(crate) last_block: u64,
+    pub(crate) last_hash: B256,
+    pub(crate) pending_delimiter: u64,
+    pub(crate) rows: Vec<Row>,
+    pub(crate) mark_count: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum TopicConstraint {
+pub(crate) enum TopicConstraint {
     Any,
     Values(Vec<B256>),
 }
 
 /// Classification of a candidate slot reported by the matcher.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum SlotClass {
+pub(crate) enum SlotClass {
     Address,
     Topic(u8),
     Delimiter,
@@ -200,23 +200,23 @@ impl SlotClass {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum QueryResult {
+pub(crate) enum QueryResult {
     Ok,
     ErrMatchAll,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Planner {
+pub(crate) enum Planner {
     Matcher,
     EveryBlock,
 }
 
 /// A log named by block number, receipt ordinal, and ordinal within the receipt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) struct LogIdentity {
-    pub(super) block: u64,
-    pub(super) receipt: usize,
-    pub(super) log: usize,
+pub(crate) struct LogIdentity {
+    pub(crate) block: u64,
+    pub(crate) receipt: usize,
+    pub(crate) log: usize,
 }
 
 impl fmt::Display for LogIdentity {
@@ -226,82 +226,82 @@ impl fmt::Display for LogIdentity {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct Query {
-    pub(super) id: String,
-    pub(super) first_block: u64,
-    pub(super) last_block: u64,
-    pub(super) addresses: Vec<Address>,
-    pub(super) topics: Vec<TopicConstraint>,
-    pub(super) index_range: (u64, u64),
-    pub(super) map_range: (u32, u32),
-    pub(super) result: QueryResult,
-    pub(super) potential_indices: Vec<u64>,
-    pub(super) slot_classes: Vec<SlotClass>,
-    pub(super) candidate_blocks: Vec<u64>,
-    pub(super) potential_logs: Vec<LogIdentity>,
-    pub(super) exact_logs: Vec<LogIdentity>,
-    pub(super) exact_blocks: Vec<u64>,
-    pub(super) planner: Planner,
+pub(crate) struct Query {
+    pub(crate) id: String,
+    pub(crate) first_block: u64,
+    pub(crate) last_block: u64,
+    pub(crate) addresses: Vec<Address>,
+    pub(crate) topics: Vec<TopicConstraint>,
+    pub(crate) index_range: (u64, u64),
+    pub(crate) map_range: (u32, u32),
+    pub(crate) result: QueryResult,
+    pub(crate) potential_indices: Vec<u64>,
+    pub(crate) slot_classes: Vec<SlotClass>,
+    pub(crate) candidate_blocks: Vec<u64>,
+    pub(crate) potential_logs: Vec<LogIdentity>,
+    pub(crate) exact_logs: Vec<LogIdentity>,
+    pub(crate) exact_blocks: Vec<u64>,
+    pub(crate) planner: Planner,
 }
 
 impl Query {
     /// Whether Geth normalizes this query to `ErrMatchAll`: no address and no topic constraint.
-    pub(super) const fn is_match_all(&self) -> bool {
+    pub(crate) const fn is_match_all(&self) -> bool {
         self.addresses.is_empty() && self.topics.is_empty()
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct Fixture {
-    pub(super) scenario: String,
-    pub(super) class: FixtureClass,
-    pub(super) params_name: ParamsName,
-    pub(super) stress_ordinal: Option<u64>,
-    pub(super) origin: Origin,
-    pub(super) termination: Termination,
-    pub(super) blocks: Vec<Block>,
-    pub(super) successor: Option<Block>,
-    pub(super) boundaries: Vec<StreamBoundary>,
-    pub(super) pointers: Vec<Pointer>,
-    pub(super) completed_maps: Vec<CompletedMap>,
-    pub(super) partial_maps: Vec<PartialMap>,
-    pub(super) queries: Vec<Query>,
+pub(crate) struct Fixture {
+    pub(crate) scenario: String,
+    pub(crate) class: FixtureClass,
+    pub(crate) params_name: ParamsName,
+    pub(crate) stress_ordinal: Option<u64>,
+    pub(crate) origin: Origin,
+    pub(crate) termination: Termination,
+    pub(crate) blocks: Vec<Block>,
+    pub(crate) successor: Option<Block>,
+    pub(crate) boundaries: Vec<StreamBoundary>,
+    pub(crate) pointers: Vec<Pointer>,
+    pub(crate) completed_maps: Vec<CompletedMap>,
+    pub(crate) partial_maps: Vec<PartialMap>,
+    pub(crate) queries: Vec<Query>,
 }
 
 impl Fixture {
-    pub(super) fn row_count(&self) -> usize {
+    pub(crate) fn row_count(&self) -> usize {
         self.completed_maps.iter().map(|map| map.rows.len()).sum::<usize>() +
             self.partial_maps.iter().map(|map| map.rows.len()).sum::<usize>()
     }
 
-    pub(super) fn mark_count(&self) -> usize {
+    pub(crate) fn mark_count(&self) -> usize {
         self.completed_maps.iter().map(|map| map.mark_count).sum::<usize>() +
             self.partial_maps.iter().map(|map| map.mark_count).sum::<usize>()
     }
 
-    pub(super) fn potential_count(&self) -> usize {
+    pub(crate) fn potential_count(&self) -> usize {
         self.queries.iter().map(|query| query.potential_indices.len()).sum()
     }
 
-    pub(super) fn pointer(&self, block: u64) -> Option<&Pointer> {
+    pub(crate) fn pointer(&self, block: u64) -> Option<&Pointer> {
         self.pointers.iter().find(|pointer| pointer.block == block)
     }
 
-    pub(super) fn log(&self, identity: LogIdentity) -> Option<&Log> {
+    pub(crate) fn log(&self, identity: LogIdentity) -> Option<&Log> {
         let block = self.blocks.iter().find(|block| block.number == identity.block)?;
         block.receipts.get(identity.receipt)?.logs.get(identity.log)
     }
 }
 
 /// Line cursor over fixture text that enforces the canonical single-space layout.
-pub(super) struct Lines<'a> {
+pub(crate) struct Lines<'a> {
     path: &'a str,
     lines: Vec<&'a str>,
     position: usize,
 }
 
 impl<'a> Lines<'a> {
-    pub(super) fn new(path: &'a str, text: &'a str) -> ParseResult<Self> {
+    pub(crate) fn new(path: &'a str, text: &'a str) -> ParseResult<Self> {
         let Some(body) = text.strip_suffix('\n') else {
             return Err(format!("{path}: missing final newline"))
         };
@@ -321,16 +321,16 @@ impl<'a> Lines<'a> {
     }
 
     /// Prefixes a message with the location of the most recently consumed line.
-    pub(super) fn error(&self, message: impl fmt::Display) -> String {
+    pub(crate) fn error(&self, message: impl fmt::Display) -> String {
         format!("{}:{}: {message}", self.path, self.position.max(1))
     }
 
     /// Attaches the current location to a field-level error.
-    pub(super) fn located<T>(&self, result: ParseResult<T>) -> ParseResult<T> {
+    pub(crate) fn located<T>(&self, result: ParseResult<T>) -> ParseResult<T> {
         result.map_err(|message| self.error(message))
     }
 
-    pub(super) fn next(&mut self) -> ParseResult<Vec<&'a str>> {
+    pub(crate) fn next(&mut self) -> ParseResult<Vec<&'a str>> {
         let Some(line) = self.lines.get(self.position).copied() else {
             return Err(self.error("unexpected end of fixture"))
         };
@@ -339,7 +339,7 @@ impl<'a> Lines<'a> {
     }
 
     /// Consumes the next line, which must start with the `expected` record name.
-    pub(super) fn record(&mut self, expected: &str) -> ParseResult<Vec<&'a str>> {
+    pub(crate) fn record(&mut self, expected: &str) -> ParseResult<Vec<&'a str>> {
         let fields = self.next()?;
         if fields[0] != expected {
             let found = fields.join(" ");
@@ -349,7 +349,7 @@ impl<'a> Lines<'a> {
     }
 
     /// Consumes the next line, which must consist of exactly the `expected` fields.
-    pub(super) fn exact(&mut self, expected: &[&str]) -> ParseResult<()> {
+    pub(crate) fn exact(&mut self, expected: &[&str]) -> ParseResult<()> {
         let fields = self.next()?;
         if fields != expected {
             let (expected, found) = (expected.join(" "), fields.join(" "));
@@ -358,7 +358,7 @@ impl<'a> Lines<'a> {
         Ok(())
     }
 
-    pub(super) fn done(&self) -> ParseResult<()> {
+    pub(crate) fn done(&self) -> ParseResult<()> {
         if self.position != self.lines.len() {
             return Err(format!("{}:{}: unexpected trailing records", self.path, self.position + 1))
         }
@@ -371,7 +371,7 @@ fn invalid(what: &str, token: &str) -> String {
 }
 
 /// Parses a canonical decimal number: digits only, with no leading zero unless it is `0`.
-pub(super) fn number<T: FromStr>(token: &str, what: &str) -> ParseResult<T> {
+pub(crate) fn number<T: FromStr>(token: &str, what: &str) -> ParseResult<T> {
     let digits = !token.is_empty() && token.bytes().all(|byte| byte.is_ascii_digit());
     if !digits || (token != "0" && token.starts_with('0')) {
         return Err(format!("non-canonical {what}: {token}"))
@@ -379,7 +379,7 @@ pub(super) fn number<T: FromStr>(token: &str, what: &str) -> ParseResult<T> {
     token.parse().map_err(|_| format!("{what} out of range: {token}"))
 }
 
-pub(super) fn lowercase_hex(raw: &str) -> bool {
+pub(crate) fn lowercase_hex(raw: &str) -> bool {
     raw.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
@@ -390,7 +390,7 @@ fn fixed_hex(token: &str, digits: usize, what: &str) -> ParseResult<()> {
     }
 }
 
-pub(super) fn hash(token: &str) -> ParseResult<B256> {
+pub(crate) fn hash(token: &str) -> ParseResult<B256> {
     fixed_hex(token, 64, "hash")?;
     token.parse().map_err(|_| format!("malformed hash: {token}"))
 }
@@ -401,7 +401,7 @@ fn address(token: &str) -> ParseResult<Address> {
 }
 
 /// Parses a full-length lowercase git revision.
-pub(super) fn git_revision(token: &str, what: &str) -> ParseResult<String> {
+pub(crate) fn git_revision(token: &str, what: &str) -> ParseResult<String> {
     if token.len() != 40 || !lowercase_hex(token) {
         return Err(format!("malformed {what}: {token}"))
     }
@@ -409,7 +409,7 @@ pub(super) fn git_revision(token: &str, what: &str) -> ParseResult<String> {
 }
 
 /// Parses a kebab-case identifier: lowercase ASCII letters, digits, and single interior dashes.
-pub(super) fn identifier(token: &str, what: &str) -> ParseResult<String> {
+pub(crate) fn identifier(token: &str, what: &str) -> ParseResult<String> {
     let alphabet = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-';
     if token.is_empty() ||
         token.starts_with('-') ||
@@ -431,7 +431,7 @@ fn exact_fields(fields: &[&str], count: usize, record: &str) -> ParseResult<()> 
 }
 
 /// Parses `<count> <item>...` starting at `start`, requiring exactly `count` items.
-pub(super) fn counted<T>(
+pub(crate) fn counted<T>(
     fields: &[&str],
     start: usize,
     record: &str,
@@ -465,7 +465,7 @@ fn log_identity(token: &str) -> ParseResult<LogIdentity> {
 }
 
 /// The deterministic hash the generator assigns to every synthetic block.
-pub(super) fn canonical_block_hash(number: u64) -> B256 {
+pub(crate) fn canonical_block_hash(number: u64) -> B256 {
     B256::from_slice(&Sha256::digest(format!("canonical-block-{number}")))
 }
 
@@ -908,7 +908,7 @@ fn parse_query(lines: &mut Lines<'_>) -> ParseResult<Query> {
 }
 
 /// Parses and structurally validates one fixture; `path` only labels error messages.
-pub(super) fn parse_fixture(path: &str, text: &str) -> ParseResult<Fixture> {
+pub(crate) fn parse_fixture(path: &str, text: &str) -> ParseResult<Fixture> {
     let mut lines = Lines::new(path, text)?;
     let generator = parse_provenance(&mut lines)?;
     if generator != GENERATOR_REVISION {
