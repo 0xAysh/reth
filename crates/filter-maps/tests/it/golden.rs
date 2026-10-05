@@ -109,6 +109,16 @@ fn epoch_helpers_match_geth() {
     }
 }
 
+/// The final epoch used to overflow in an intermediate even though its answer is representable.
+/// Check const evaluation as well as the runtime comparisons over Geth's endpoint tables.
+#[test]
+fn final_epoch_is_const_evaluable() {
+    const DEFAULT_LAST: u32 = DEFAULT_PARAMS.last_epoch_map(DEFAULT_PARAMS.map_epoch(u32::MAX));
+    const RANGE_LAST: u32 = RANGE_TEST_PARAMS.last_epoch_map(RANGE_TEST_PARAMS.map_epoch(u32::MAX));
+    assert_eq!(DEFAULT_LAST, vectors::EPOCH_HELPERS_DEFAULT.last().unwrap().3);
+    assert_eq!(RANGE_LAST, vectors::EPOCH_HELPERS_RANGE_TEST.last().unwrap().3);
+}
+
 /// The split of a map index into its base row group and the offset within that group, which is how
 /// base rows are keyed as database entries.
 #[test]
