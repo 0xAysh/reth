@@ -23,6 +23,10 @@
 //! later layer can persist. Every completed renderer output is paired with a validated numerical
 //! resume anchor, but publication must still atomically write rows, restart metadata, and its
 //! valid-range update. Incomplete head and batch state never expands indexed coverage.
+//!
+//! [`FilterMapMatcher`] searches completed logical rows through [`FilterMapMatchSource`]. It
+//! returns possible value-space indices and candidate blocks only; receipt loading and exact log
+//! filtering remain outside this crate.
 
 #![doc(
     html_logo_url = "https://raw.githubusercontent.com/paradigmxyz/reth/main/assets/reth-docs.png",
@@ -36,11 +40,16 @@
 extern crate self as reth_filter_maps;
 
 pub mod coverage;
+mod matcher;
 mod params;
 mod renderer;
 mod stream;
 mod value;
 
+pub use matcher::{
+    CandidateSet, FilterMapMatchSource, FilterMapMatcher, IndexedMatchRange, MatchPattern,
+    MatcherError, PatternError, TopicSelection,
+};
 pub use params::{
     Params, ParamsError, ParamsId, UnknownParamsId, DEFAULT_PARAMS, RANGE_TEST_PARAMS,
 };

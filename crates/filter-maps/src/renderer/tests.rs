@@ -459,7 +459,7 @@ fn fixture_stream(
     }
 }
 
-fn fixture_renderer(
+pub(crate) fn fixture_renderer(
     fixture: &crate::golden_pipeline::parser::Fixture,
 ) -> FilterMapRenderer<std::vec::IntoIter<BlockInput>> {
     use crate::golden_pipeline::parser::Origin;

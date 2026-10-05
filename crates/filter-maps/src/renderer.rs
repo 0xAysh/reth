@@ -669,4 +669,4 @@ const fn slot_index(slot: LogValueSlot) -> u64 {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
