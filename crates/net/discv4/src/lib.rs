@@ -1256,11 +1256,11 @@ impl Discv4Service {
             self.try_ping(record, PingReason::InitialInsert);
         } else if needs_bond {
             self.try_ping(record, PingReason::EstablishBond);
-        } else if is_proven {
+        } else {
             // if node has been proven, this means we've received a pong and verified its endpoint
             // proof. We've also sent a pong above to verify our endpoint proof, so we can now
             // send our find_nodes request if PingReason::Lookup
-            if let Some((_, ctx)) = self.pending_lookup.remove(&record.id) {
+            if is_proven && let Some((_, ctx)) = self.pending_lookup.remove(&record.id) {
                 if self.pending_find_nodes.contains_key(&record.id) {
                     // there's already another pending request, unmark it so the next round can
                     // try to send it
@@ -1271,7 +1271,7 @@ impl Discv4Service {
                     self.find_node(&record, ctx);
                 }
             }
-        } else {
+
             // Request ENR if included in the ping
             match (ping.enr_sq, old_enr) {
                 (Some(new), Some(old)) if new > old => {
@@ -1416,35 +1416,34 @@ impl Discv4Service {
     /// Handler for incoming `EnrResponse` message
     fn on_enr_response(&mut self, msg: EnrResponse, remote_addr: SocketAddr, id: PeerId) {
         trace!(target: "discv4", ?remote_addr, ?msg, "received ENR response");
-        if let Some(resp) = self.pending_enr_requests.remove(&id) {
-            // ensure the ENR's public key matches the expected node id
-            let enr_id = pk2id(&msg.enr.public_key());
-            if id != enr_id {
-                return
-            }
+        let Entry::Occupied(request) = self.pending_enr_requests.entry(id) else { return };
 
-            if resp.echo_hash == msg.request_hash {
-                let key = kad_key(id);
-                let fork_id = msg.eth_fork_id();
-                let (record, old_fork_id) = match self.kbuckets.entry(&key) {
-                    kbucket::Entry::Present(mut entry, _) => {
-                        let id = entry.value_mut().update_with_fork_id(fork_id);
-                        (entry.value().record, id)
-                    }
-                    kbucket::Entry::Pending(mut entry, _) => {
-                        let id = entry.value_mut().update_with_fork_id(fork_id);
-                        (entry.value().record, id)
-                    }
-                    _ => return,
-                };
-                match (fork_id, old_fork_id) {
-                    (Some(new), Some(old)) if new != old => {
-                        self.notify(DiscoveryUpdate::EnrForkId(record, new))
-                    }
-                    (Some(new), None) => self.notify(DiscoveryUpdate::EnrForkId(record, new)),
-                    _ => {}
-                }
+        // A delayed response to an earlier request must not consume its replacement.
+        // Also ensure the ENR's public key matches the expected node id.
+        if request.get().echo_hash != msg.request_hash || id != pk2id(&msg.enr.public_key()) {
+            return
+        }
+        request.remove();
+
+        let key = kad_key(id);
+        let fork_id = msg.eth_fork_id();
+        let (record, old_fork_id) = match self.kbuckets.entry(&key) {
+            kbucket::Entry::Present(mut entry, _) => {
+                let id = entry.value_mut().update_with_fork_id(fork_id);
+                (entry.value().record, id)
             }
+            kbucket::Entry::Pending(mut entry, _) => {
+                let id = entry.value_mut().update_with_fork_id(fork_id);
+                (entry.value().record, id)
+            }
+            _ => return,
+        };
+        match (fork_id, old_fork_id) {
+            (Some(new), Some(old)) if new != old => {
+                self.notify(DiscoveryUpdate::EnrForkId(record, new))
+            }
+            (Some(new), None) => self.notify(DiscoveryUpdate::EnrForkId(record, new)),
+            _ => {}
         }
     }
 
@@ -1630,9 +1629,23 @@ impl Discv4Service {
     }
 
     fn evict_expired_requests(&mut self, now: Instant) {
-        self.pending_enr_requests.retain(|_node_id, enr_request| {
-            now.duration_since(enr_request.sent_at) < self.config.enr_expiration
+        let mut failed_enr_requests = Vec::new();
+        self.pending_enr_requests.retain(|node_id, enr_request| {
+            if now.duration_since(enr_request.sent_at) < self.config.enr_expiration {
+                return true
+            }
+            failed_enr_requests.push(*node_id);
+            false
         });
+
+        // forget the announced enr seq, so the next ping or pong requests the ENR again.
+        for node_id in failed_enr_requests {
+            match self.kbuckets.entry(&kad_key(node_id)) {
+                kbucket::Entry::Present(mut entry, _) => entry.value_mut().last_enr_seq = None,
+                kbucket::Entry::Pending(mut entry, _) => entry.value_mut().last_enr_seq = None,
+                _ => {}
+            }
+        }
 
         let mut failed_pings = Vec::new();
         self.pending_pings.retain(|node_id, ping_request| {
@@ -2086,6 +2099,18 @@ impl IngressHandler {
             return
         }
 
+        // A packet starts with the hash of everything that follows it, and `Message::decode`
+        // rejects any packet whose contents do not hash to it. A repeat of a packet we already
+        // accepted can therefore be recognised from those 32 bytes alone, without decoding.
+        // Decoding runs an ECDSA recovery, so checking here keeps a replayed packet from costing
+        // a signature verification.
+        if data.len() >= MIN_PACKET_SIZE &&
+            self.cache.contains_packet(B256::from_slice(&data[..32]))
+        {
+            trace!(target: "discv4", ?src, "Received duplicate packet.");
+            return
+        }
+
         let event = match Message::decode(data) {
             Ok(packet) => {
                 if packet.node_id == self.local_id {
@@ -2093,10 +2118,9 @@ impl IngressHandler {
                     return
                 }
 
-                if self.cache.contains_packet(packet.hash) {
-                    debug!(target: "discv4", ?src, "Received duplicate packet.");
-                    return
-                }
+                // Only packets that decoded are remembered, so a peer cannot suppress a packet we
+                // have not seen yet by guessing its hash.
+                self.cache.insert_packet(packet.hash);
 
                 IngressEvent::Packet(src, packet)
             }
@@ -2147,9 +2171,16 @@ impl ReceiveCache {
         *ctn
     }
 
-    /// Returns true if we previously received the packet
+    /// Returns true if we previously received the packet.
+    ///
+    /// A hit refreshes the entry so that a packet being replayed repeatedly stays cached.
     fn contains_packet(&mut self, hash: B256) -> bool {
-        !self.unique_packets.insert(hash, ())
+        self.unique_packets.get(&hash).is_some()
+    }
+
+    /// Remembers a packet we accepted.
+    fn insert_packet(&mut self, hash: B256) {
+        self.unique_packets.insert(hash, ());
     }
 }
 
@@ -2571,7 +2602,65 @@ mod tests {
     use rand_08::Rng;
     use reth_ethereum_forks::{EnrForkIdEntry, ForkHash};
     use reth_network_peers::mainnet_nodes;
+    use secp256k1::SECP256K1;
     use std::future::poll_fn;
+
+    #[tokio::test]
+    async fn test_duplicate_packet_rejected_without_decoding() {
+        let secret_key = SecretKey::new(&mut rand_08::thread_rng());
+        let local_id = pk2id(&secret_key.public_key(SECP256K1));
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut handler = IngressHandler::new(tx, local_id);
+
+        let remote_key = SecretKey::new(&mut rand_08::thread_rng());
+        let msg = Message::Ping(Ping {
+            from: rng_endpoint(&mut rand_08::thread_rng()),
+            to: rng_endpoint(&mut rand_08::thread_rng()),
+            expire: u64::MAX,
+            enr_sq: None,
+        });
+        let (packet, hash) = msg.encode(&remote_key);
+        let src = "10.0.0.1:30303".parse().unwrap();
+
+        handler.handle_packet(&packet, src).await;
+        assert!(matches!(rx.try_recv(), Ok(IngressEvent::Packet(_, _))));
+
+        // the replay is dropped on the hash prefix alone
+        handler.handle_packet(&packet, src).await;
+        assert!(rx.try_recv().is_err());
+        assert!(handler.cache.contains_packet(hash));
+    }
+
+    #[tokio::test]
+    async fn test_undecodable_packet_does_not_poison_cache() {
+        let secret_key = SecretKey::new(&mut rand_08::thread_rng());
+        let local_id = pk2id(&secret_key.public_key(SECP256K1));
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut handler = IngressHandler::new(tx, local_id);
+
+        let remote_key = SecretKey::new(&mut rand_08::thread_rng());
+        let msg = Message::Ping(Ping {
+            from: rng_endpoint(&mut rand_08::thread_rng()),
+            to: rng_endpoint(&mut rand_08::thread_rng()),
+            expire: u64::MAX,
+            enr_sq: None,
+        });
+        let (packet, hash) = msg.encode(&remote_key);
+        let src = "10.0.0.1:30303".parse().unwrap();
+
+        // a packet carrying the right hash prefix but a corrupt body must not be remembered,
+        // otherwise it could be used to suppress the real packet
+        let mut forged = packet.to_vec();
+        let last = forged.len() - 1;
+        forged[last] ^= 0xff;
+        handler.handle_packet(&forged, src).await;
+        assert!(matches!(rx.try_recv(), Ok(IngressEvent::BadPacket(..))));
+        assert!(!handler.cache.contains_packet(hash));
+
+        // so the genuine packet still gets through
+        handler.handle_packet(&packet, src).await;
+        assert!(matches!(rx.try_recv(), Ok(IngressEvent::Packet(_, _))));
+    }
 
     #[tokio::test]
     async fn test_configured_enr_forkid_entry() {
@@ -2610,6 +2699,42 @@ mod tests {
         let mut encoded = Vec::with_capacity(expected.len());
         original.encode(&mut encoded);
         assert_eq!(&expected[..], encoded.as_slice());
+    }
+
+    #[tokio::test]
+    async fn test_request_enr_of_proven_node() {
+        reth_tracing::init_test_tracing();
+        let mut rng = rand_08::thread_rng();
+        let (_discv4, mut service) = create_discv4().await;
+
+        let id = PeerId::random();
+        let addr: SocketAddr = (Ipv4Addr::new(10, 0, 0, 1), DEFAULT_DISCOVERY_PORT).into();
+        let mut entry = NodeEntry::new_proven(NodeRecord::new(addr, id));
+        entry.last_enr_seq = Some(1);
+        let _ = service.kbuckets.insert_or_update(
+            &kad_key(id),
+            entry,
+            NodeStatus {
+                direction: ConnectionDirection::Outgoing,
+                state: ConnectionState::Connected,
+            },
+        );
+        let ping = |service: &Discv4Service, rng: &mut rand_08::rngs::ThreadRng| Ping {
+            from: rng_endpoint(rng),
+            to: rng_endpoint(rng),
+            expire: service.ping_expiration(),
+            enr_sq: Some(2),
+        };
+
+        // the node announces a newer record.
+        service.on_ping(ping(&service, &mut rng), addr, id, B256::random());
+        assert!(service.pending_enr_requests.contains_key(&id));
+
+        // the request goes unanswered, so the next ping has to ask again.
+        service.evict_expired_requests(Instant::now() + service.config.enr_expiration * 2);
+        assert!(!service.pending_enr_requests.contains_key(&id));
+        service.on_ping(ping(&service, &mut rng), addr, id, B256::random());
+        assert!(service.pending_enr_requests.contains_key(&id));
     }
 
     #[test]
@@ -3316,5 +3441,71 @@ mod tests {
 
         // flag should be false when lookups are disabled
         assert!(!service.pending_lookup_reset);
+    }
+
+    #[tokio::test]
+    async fn test_enr_response_preserves_pending_request() {
+        let fork_id = ForkId { hash: ForkHash([1, 2, 3, 4]), next: 0 };
+        let mut config = Discv4Config::default();
+        config.add_eip868_pair("eth", EnrForkIdEntry::from(fork_id));
+        let (_remote, mut remote) = create_discv4_with_config(config).await;
+        let (_discv4, mut service) = create_discv4().await;
+        let record = remote.local_node_record;
+        let id = record.id;
+        let addr = record.udp_addr();
+        insert_proven_node(&mut service, record);
+        service.update_on_reping(record, remote.enr_seq());
+        let old_enr = remote.local_eip_868_enr.clone();
+
+        // Model a request sent in the previous second without waiting for the wall clock.
+        let (_, old_hash) =
+            Message::EnrRequest(EnrRequest { expire: service.enr_request_expiration() - 1 })
+                .encode(&service.secret_key);
+        service.pending_enr_requests.get_mut(&id).unwrap().echo_hash = old_hash;
+
+        // A newer sequence replaces the pending request before its response arrives.
+        remote.local_eip_868_enr.set_tcp4(30304, &remote.secret_key).unwrap();
+        service.on_ping(
+            Ping {
+                from: record.into(),
+                to: service.local_node_record.into(),
+                expire: service.ping_expiration(),
+                enr_sq: remote.enr_seq(),
+            },
+            addr,
+            id,
+            B256::random(),
+        );
+        let request_hash = service.pending_enr_requests[&id].echo_hash;
+        assert_ne!(request_hash, old_hash);
+
+        service.on_enr_response(EnrResponse { request_hash: old_hash, enr: old_enr }, addr, id);
+        assert_eq!(service.pending_enr_requests[&id].echo_hash, request_hash);
+        assert_eq!(service.on_entry(id, |entry| entry.fork_id), Some(None));
+
+        // A response with the right hash but a different node identity is also ignored.
+        service.on_enr_response(
+            EnrResponse { request_hash, enr: service.local_eip_868_enr.clone() },
+            addr,
+            id,
+        );
+        assert_eq!(service.pending_enr_requests[&id].echo_hash, request_hash);
+        assert_eq!(service.on_entry(id, |entry| entry.fork_id), Some(None));
+
+        let mut updates = service.update_stream().into_inner();
+        service.on_enr_response(
+            EnrResponse { request_hash, enr: remote.local_eip_868_enr.clone() },
+            addr,
+            id,
+        );
+        assert!(!service.pending_enr_requests.contains_key(&id));
+        assert_eq!(service.on_entry(id, |entry| entry.fork_id), Some(Some(fork_id)));
+        assert_matches::assert_matches!(
+            updates.try_recv().unwrap(),
+            DiscoveryUpdate::EnrForkId(found_record, found_fork_id) => {
+                assert_eq!(found_record, record);
+                assert_eq!(found_fork_id, fork_id);
+            }
+        );
     }
 }
