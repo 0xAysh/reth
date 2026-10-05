@@ -6,14 +6,13 @@
 //! covers everything that needs the actual events.
 
 use alloy_primitives::{Address, B256};
-use reth_filter_maps::{address_value, topic_value, Params, DEFAULT_PARAMS, RANGE_TEST_PARAMS};
 use sha2::{Digest, Sha256};
-use std::{collections::HashSet, fmt, str::FromStr};
+use std::{collections::HashSet, fmt, path::PathBuf, str::FromStr};
 
 /// The go-ethereum revision every fixture must name.
-pub(crate) const GETH_REVISION: &str = "af7c0fd8ee09de71b1034dbe6d1112556b49b59f";
+pub const GETH_REVISION: &str = "af7c0fd8ee09de71b1034dbe6d1112556b49b59f";
 /// The fork revision of the generator every fixture must name.
-pub(crate) const GENERATOR_REVISION: &str = "ce40051a0c308cb01df7005cb25e6481da78616f";
+pub const GENERATOR_REVISION: &str = "ce40051a0c308cb01df7005cb25e6481da78616f";
 /// The `SplitMix64` seed shared by every stress fixture; the ordinal selects the sequence.
 const STRESS_SEED: &str = "0xaf7c0fd8ee09de71";
 const GENERATOR_PREFIX: &str = "https://github.com/0xAysh/reth/blob/";
@@ -21,17 +20,71 @@ const GENERATOR_SUFFIX: &str = "/tools/filtermaps-oracles/pipeline/gen_pipeline_
 /// Ethereum's topic limit, which also bounds a query's positional constraints.
 const MAX_TOPICS: usize = 4;
 
-pub(crate) type ParseResult<T> = Result<T, String>;
+/// Typed failure while parsing or loading a pinned fixture corpus.
+#[derive(Debug, thiserror::Error)]
+pub enum ParseError {
+    /// Fixture or manifest syntax, structure, or semantic validation failed.
+    #[error("{0}")]
+    Format(String),
+    /// A path-aware filesystem operation failed.
+    #[error(transparent)]
+    FileSystem(#[from] reth_fs_util::FsPathError),
+    /// Iterating or inspecting one directory entry failed.
+    #[error("failed to inspect an entry under {path:?}: {source}")]
+    DirectoryEntry {
+        /// Directory being traversed.
+        path: PathBuf,
+        /// Underlying I/O failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// A fixture contains bytes that are not valid UTF-8.
+    #[error("{path:?}: fixture is not UTF-8: {source}")]
+    Utf8 {
+        /// Fixture path.
+        path: PathBuf,
+        /// Underlying UTF-8 failure.
+        #[source]
+        source: std::string::FromUtf8Error,
+    },
+}
+
+impl ParseError {
+    #[cfg(test)]
+    fn contains(&self, fragment: &str) -> bool {
+        self.to_string().contains(fragment)
+    }
+}
+
+impl From<String> for ParseError {
+    fn from(message: String) -> Self {
+        Self::Format(message)
+    }
+}
+
+impl From<&str> for ParseError {
+    fn from(message: &str) -> Self {
+        Self::Format(message.to_owned())
+    }
+}
+
+pub type ParseResult<T> = Result<T, ParseError>;
+
+// Keep the parser's many early-return sites concise while constructing the typed error.
+#[allow(non_snake_case)]
+pub(crate) fn Err<T>(error: impl Into<ParseError>) -> ParseResult<T> {
+    Result::Err(error.into())
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum FixtureClass {
+pub enum FixtureClass {
     Focused,
     EndToEnd,
     Stress,
 }
 
 impl FixtureClass {
-    pub(crate) fn parse(token: &str) -> Option<Self> {
+    pub fn parse(token: &str) -> Option<Self> {
         match token {
             "FOCUSED" => Some(Self::Focused),
             "END_TO_END" => Some(Self::EndToEnd),
@@ -42,13 +95,13 @@ impl FixtureClass {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ParamsName {
+pub enum ParamsName {
     Default,
     Range,
 }
 
 impl ParamsName {
-    pub(crate) fn parse(token: &str) -> Option<Self> {
+    pub fn parse(token: &str) -> Option<Self> {
         match token {
             "DEFAULT" => Some(Self::Default),
             "RANGE" => Some(Self::Range),
@@ -56,24 +109,75 @@ impl ParamsName {
         }
     }
 
-    pub(crate) const fn params(self) -> Params {
+    pub const fn params(self) -> FixtureParams {
         match self {
-            Self::Default => DEFAULT_PARAMS,
-            Self::Range => RANGE_TEST_PARAMS,
+            Self::Default => FixtureParams {
+                log_map_height: 16,
+                log_map_width: 24,
+                log_maps_per_epoch: 10,
+                log_values_per_map: 16,
+            },
+            Self::Range => FixtureParams {
+                log_map_height: 4,
+                log_map_width: 24,
+                log_maps_per_epoch: 0,
+                log_values_per_map: 0,
+            },
         }
     }
 }
 
+/// Minimal parameter geometry needed to validate fixture text without a production-crate
+/// dependency.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FixtureParams {
+    log_map_height: u32,
+    log_map_width: u32,
+    log_maps_per_epoch: u32,
+    log_values_per_map: u32,
+}
+
+impl FixtureParams {
+    /// Returns the number of rows per map.
+    pub const fn map_height(self) -> u32 {
+        1 << self.log_map_height
+    }
+    /// Returns the encoded map width.
+    pub const fn map_width(self) -> u32 {
+        1 << self.log_map_width
+    }
+    /// Returns the values per map.
+    pub const fn values_per_map(self) -> u64 {
+        1 << self.log_values_per_map
+    }
+    /// Returns the map epoch.
+    pub const fn map_epoch(self, map: u32) -> u32 {
+        map >> self.log_maps_per_epoch
+    }
+    /// Returns the logarithm of values per map.
+    pub const fn log_values_per_map(self) -> u32 {
+        self.log_values_per_map
+    }
+}
+
+fn address_value(address: Address) -> B256 {
+    B256::from_slice(&Sha256::digest(address.as_slice()))
+}
+
+fn topic_value(topic: B256) -> B256 {
+    B256::from_slice(&Sha256::digest(topic.as_slice()))
+}
+
 /// A block identity bound to an absolute log value index.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Pointer {
-    pub(crate) block: u64,
-    pub(crate) hash: B256,
-    pub(crate) index: u64,
+pub struct Pointer {
+    pub block: u64,
+    pub hash: B256,
+    pub index: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Origin {
+pub enum Origin {
     Genesis(Pointer),
     Checkpoint(Pointer),
     Continuation { block: u64, hash: B256, cursor: u64, previous: Pointer },
@@ -81,7 +185,7 @@ pub(crate) enum Origin {
 
 impl Origin {
     /// The identity of the first block the fixture feeds to the stream.
-    pub(crate) const fn first_block(&self) -> (u64, B256) {
+    pub const fn first_block(&self) -> (u64, B256) {
         match self {
             Self::Genesis(anchor) | Self::Checkpoint(anchor) => (anchor.block, anchor.hash),
             Self::Continuation { block, hash, .. } => (*block, *hash),
@@ -90,32 +194,32 @@ impl Origin {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Termination {
+pub enum Termination {
     Head,
     Batch { next_block: u64, next_hash: B256 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Log {
-    pub(crate) address: Address,
-    pub(crate) topics: Vec<B256>,
+pub struct Log {
+    pub address: Address,
+    pub topics: Vec<B256>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Receipt {
-    pub(crate) logs: Vec<Log>,
+pub struct Receipt {
+    pub logs: Vec<Log>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Block {
-    pub(crate) number: u64,
-    pub(crate) hash: B256,
-    pub(crate) receipts: Vec<Receipt>,
+pub struct Block {
+    pub number: u64,
+    pub hash: B256,
+    pub receipts: Vec<Receipt>,
 }
 
 /// The kind of slot that completed a map.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BoundaryEnding {
+pub enum BoundaryEnding {
     Value,
     Delimiter,
     Padding,
@@ -133,51 +237,51 @@ impl BoundaryEnding {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct StreamBoundary {
-    pub(crate) map: u32,
-    pub(crate) block: u64,
-    pub(crate) hash: B256,
-    pub(crate) ending: BoundaryEnding,
+pub struct StreamBoundary {
+    pub map: u32,
+    pub block: u64,
+    pub hash: B256,
+    pub ending: BoundaryEnding,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Row {
-    pub(crate) index: u32,
-    pub(crate) columns: Vec<u32>,
+pub struct Row {
+    pub index: u32,
+    pub columns: Vec<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct CompletedMap {
-    pub(crate) index: u32,
-    pub(crate) epoch: u32,
-    pub(crate) last_block: u64,
-    pub(crate) last_hash: B256,
-    pub(crate) pointer_blocks: Vec<u64>,
-    pub(crate) rows: Vec<Row>,
-    pub(crate) mark_count: usize,
-    pub(crate) boundary: Pointer,
+pub struct CompletedMap {
+    pub index: u32,
+    pub epoch: u32,
+    pub last_block: u64,
+    pub last_hash: B256,
+    pub pointer_blocks: Vec<u64>,
+    pub rows: Vec<Row>,
+    pub mark_count: usize,
+    pub boundary: Pointer,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PartialMap {
-    pub(crate) index: u32,
-    pub(crate) epoch: u32,
-    pub(crate) last_block: u64,
-    pub(crate) last_hash: B256,
-    pub(crate) pending_delimiter: u64,
-    pub(crate) rows: Vec<Row>,
-    pub(crate) mark_count: usize,
+pub struct PartialMap {
+    pub index: u32,
+    pub epoch: u32,
+    pub last_block: u64,
+    pub last_hash: B256,
+    pub pending_delimiter: u64,
+    pub rows: Vec<Row>,
+    pub mark_count: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum TopicConstraint {
+pub enum TopicConstraint {
     Any,
     Values(Vec<B256>),
 }
 
 /// Classification of a candidate slot reported by the matcher.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SlotClass {
+pub enum SlotClass {
     Address,
     Topic(u8),
     Delimiter,
@@ -200,23 +304,23 @@ impl SlotClass {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum QueryResult {
+pub enum QueryResult {
     Ok,
     ErrMatchAll,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Planner {
+pub enum Planner {
     Matcher,
     EveryBlock,
 }
 
 /// A log named by block number, receipt ordinal, and ordinal within the receipt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct LogIdentity {
-    pub(crate) block: u64,
-    pub(crate) receipt: usize,
-    pub(crate) log: usize,
+pub struct LogIdentity {
+    pub block: u64,
+    pub receipt: usize,
+    pub log: usize,
 }
 
 impl fmt::Display for LogIdentity {
@@ -226,83 +330,83 @@ impl fmt::Display for LogIdentity {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Query {
-    pub(crate) id: String,
-    pub(crate) first_block: u64,
-    pub(crate) last_block: u64,
-    pub(crate) addresses: Vec<Address>,
-    pub(crate) topics: Vec<TopicConstraint>,
-    pub(crate) index_range: (u64, u64),
-    pub(crate) map_range: (u32, u32),
-    pub(crate) result: QueryResult,
-    pub(crate) potential_indices: Vec<u64>,
-    pub(crate) slot_classes: Vec<SlotClass>,
-    pub(crate) candidate_blocks: Vec<u64>,
-    pub(crate) potential_logs: Vec<LogIdentity>,
-    pub(crate) exact_logs: Vec<LogIdentity>,
-    pub(crate) exact_blocks: Vec<u64>,
-    pub(crate) planner: Planner,
+pub struct Query {
+    pub id: String,
+    pub first_block: u64,
+    pub last_block: u64,
+    pub addresses: Vec<Address>,
+    pub topics: Vec<TopicConstraint>,
+    pub index_range: (u64, u64),
+    pub map_range: (u32, u32),
+    pub result: QueryResult,
+    pub potential_indices: Vec<u64>,
+    pub slot_classes: Vec<SlotClass>,
+    pub candidate_blocks: Vec<u64>,
+    pub potential_logs: Vec<LogIdentity>,
+    pub exact_logs: Vec<LogIdentity>,
+    pub exact_blocks: Vec<u64>,
+    pub planner: Planner,
 }
 
 impl Query {
     /// Whether Geth normalizes this query to `ErrMatchAll`: no searchable address or topic value.
-    pub(crate) fn is_match_all(&self) -> bool {
+    pub fn is_match_all(&self) -> bool {
         self.addresses.is_empty() &&
             self.topics.iter().all(|topic| matches!(topic, TopicConstraint::Any))
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Fixture {
-    pub(crate) scenario: String,
-    pub(crate) class: FixtureClass,
-    pub(crate) params_name: ParamsName,
-    pub(crate) stress_ordinal: Option<u64>,
-    pub(crate) origin: Origin,
-    pub(crate) termination: Termination,
-    pub(crate) blocks: Vec<Block>,
-    pub(crate) successor: Option<Block>,
-    pub(crate) boundaries: Vec<StreamBoundary>,
-    pub(crate) pointers: Vec<Pointer>,
-    pub(crate) completed_maps: Vec<CompletedMap>,
-    pub(crate) partial_maps: Vec<PartialMap>,
-    pub(crate) queries: Vec<Query>,
+pub struct Fixture {
+    pub scenario: String,
+    pub class: FixtureClass,
+    pub params_name: ParamsName,
+    pub stress_ordinal: Option<u64>,
+    pub origin: Origin,
+    pub termination: Termination,
+    pub blocks: Vec<Block>,
+    pub successor: Option<Block>,
+    pub boundaries: Vec<StreamBoundary>,
+    pub pointers: Vec<Pointer>,
+    pub completed_maps: Vec<CompletedMap>,
+    pub partial_maps: Vec<PartialMap>,
+    pub queries: Vec<Query>,
 }
 
 impl Fixture {
-    pub(crate) fn row_count(&self) -> usize {
+    pub fn row_count(&self) -> usize {
         self.completed_maps.iter().map(|map| map.rows.len()).sum::<usize>() +
             self.partial_maps.iter().map(|map| map.rows.len()).sum::<usize>()
     }
 
-    pub(crate) fn mark_count(&self) -> usize {
+    pub fn mark_count(&self) -> usize {
         self.completed_maps.iter().map(|map| map.mark_count).sum::<usize>() +
             self.partial_maps.iter().map(|map| map.mark_count).sum::<usize>()
     }
 
-    pub(crate) fn potential_count(&self) -> usize {
+    pub fn potential_count(&self) -> usize {
         self.queries.iter().map(|query| query.potential_indices.len()).sum()
     }
 
-    pub(crate) fn pointer(&self, block: u64) -> Option<&Pointer> {
+    pub fn pointer(&self, block: u64) -> Option<&Pointer> {
         self.pointers.iter().find(|pointer| pointer.block == block)
     }
 
-    pub(crate) fn log(&self, identity: LogIdentity) -> Option<&Log> {
+    pub fn log(&self, identity: LogIdentity) -> Option<&Log> {
         let block = self.blocks.iter().find(|block| block.number == identity.block)?;
         block.receipts.get(identity.receipt)?.logs.get(identity.log)
     }
 }
 
 /// Line cursor over fixture text that enforces the canonical single-space layout.
-pub(crate) struct Lines<'a> {
+pub struct Lines<'a> {
     path: &'a str,
     lines: Vec<&'a str>,
     position: usize,
 }
 
 impl<'a> Lines<'a> {
-    pub(crate) fn new(path: &'a str, text: &'a str) -> ParseResult<Self> {
+    pub fn new(path: &'a str, text: &'a str) -> ParseResult<Self> {
         let Some(body) = text.strip_suffix('\n') else {
             return Err(format!("{path}: missing final newline"))
         };
@@ -322,16 +426,16 @@ impl<'a> Lines<'a> {
     }
 
     /// Prefixes a message with the location of the most recently consumed line.
-    pub(crate) fn error(&self, message: impl fmt::Display) -> String {
-        format!("{}:{}: {message}", self.path, self.position.max(1))
+    pub fn error(&self, message: impl fmt::Display) -> ParseError {
+        ParseError::Format(format!("{}:{}: {message}", self.path, self.position.max(1)))
     }
 
     /// Attaches the current location to a field-level error.
-    pub(crate) fn located<T>(&self, result: ParseResult<T>) -> ParseResult<T> {
+    pub fn located<T>(&self, result: ParseResult<T>) -> ParseResult<T> {
         result.map_err(|message| self.error(message))
     }
 
-    pub(crate) fn next(&mut self) -> ParseResult<Vec<&'a str>> {
+    pub fn next(&mut self) -> ParseResult<Vec<&'a str>> {
         let Some(line) = self.lines.get(self.position).copied() else {
             return Err(self.error("unexpected end of fixture"))
         };
@@ -340,7 +444,7 @@ impl<'a> Lines<'a> {
     }
 
     /// Consumes the next line, which must start with the `expected` record name.
-    pub(crate) fn record(&mut self, expected: &str) -> ParseResult<Vec<&'a str>> {
+    pub fn record(&mut self, expected: &str) -> ParseResult<Vec<&'a str>> {
         let fields = self.next()?;
         if fields[0] != expected {
             let found = fields.join(" ");
@@ -350,7 +454,7 @@ impl<'a> Lines<'a> {
     }
 
     /// Consumes the next line, which must consist of exactly the `expected` fields.
-    pub(crate) fn exact(&mut self, expected: &[&str]) -> ParseResult<()> {
+    pub fn exact(&mut self, expected: &[&str]) -> ParseResult<()> {
         let fields = self.next()?;
         if fields != expected {
             let (expected, found) = (expected.join(" "), fields.join(" "));
@@ -359,7 +463,7 @@ impl<'a> Lines<'a> {
         Ok(())
     }
 
-    pub(crate) fn done(&self) -> ParseResult<()> {
+    pub fn done(&self) -> ParseResult<()> {
         if self.position != self.lines.len() {
             return Err(format!("{}:{}: unexpected trailing records", self.path, self.position + 1))
         }
@@ -372,15 +476,15 @@ fn invalid(what: &str, token: &str) -> String {
 }
 
 /// Parses a canonical decimal number: digits only, with no leading zero unless it is `0`.
-pub(crate) fn number<T: FromStr>(token: &str, what: &str) -> ParseResult<T> {
+pub fn number<T: FromStr>(token: &str, what: &str) -> ParseResult<T> {
     let digits = !token.is_empty() && token.bytes().all(|byte| byte.is_ascii_digit());
     if !digits || (token != "0" && token.starts_with('0')) {
         return Err(format!("non-canonical {what}: {token}"))
     }
-    token.parse().map_err(|_| format!("{what} out of range: {token}"))
+    Ok(token.parse().map_err(|_| format!("{what} out of range: {token}"))?)
 }
 
-pub(crate) fn lowercase_hex(raw: &str) -> bool {
+pub fn lowercase_hex(raw: &str) -> bool {
     raw.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
@@ -391,18 +495,18 @@ fn fixed_hex(token: &str, digits: usize, what: &str) -> ParseResult<()> {
     }
 }
 
-pub(crate) fn hash(token: &str) -> ParseResult<B256> {
+pub fn hash(token: &str) -> ParseResult<B256> {
     fixed_hex(token, 64, "hash")?;
-    token.parse().map_err(|_| format!("malformed hash: {token}"))
+    Ok(token.parse().map_err(|_| format!("malformed hash: {token}"))?)
 }
 
 fn address(token: &str) -> ParseResult<Address> {
     fixed_hex(token, 40, "address")?;
-    token.parse().map_err(|_| format!("malformed address: {token}"))
+    Ok(token.parse().map_err(|_| format!("malformed address: {token}"))?)
 }
 
 /// Parses a full-length lowercase git revision.
-pub(crate) fn git_revision(token: &str, what: &str) -> ParseResult<String> {
+pub fn git_revision(token: &str, what: &str) -> ParseResult<String> {
     if token.len() != 40 || !lowercase_hex(token) {
         return Err(format!("malformed {what}: {token}"))
     }
@@ -410,7 +514,7 @@ pub(crate) fn git_revision(token: &str, what: &str) -> ParseResult<String> {
 }
 
 /// Parses a kebab-case identifier: lowercase ASCII letters, digits, and single interior dashes.
-pub(crate) fn identifier(token: &str, what: &str) -> ParseResult<String> {
+pub fn identifier(token: &str, what: &str) -> ParseResult<String> {
     let alphabet = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-';
     if token.is_empty() ||
         token.starts_with('-') ||
@@ -432,7 +536,7 @@ fn exact_fields(fields: &[&str], count: usize, record: &str) -> ParseResult<()> 
 }
 
 /// Parses `<count> <item>...` starting at `start`, requiring exactly `count` items.
-pub(crate) fn counted<T>(
+pub fn counted<T>(
     fields: &[&str],
     start: usize,
     record: &str,
@@ -466,7 +570,7 @@ fn log_identity(token: &str) -> ParseResult<LogIdentity> {
 }
 
 /// The deterministic hash the generator assigns to every synthetic block.
-pub(crate) fn canonical_block_hash(number: u64) -> B256 {
+pub fn canonical_block_hash(number: u64) -> B256 {
     B256::from_slice(&Sha256::digest(format!("canonical-block-{number}")))
 }
 
@@ -697,7 +801,7 @@ fn map_header_from(fields: &[&str], record: &str) -> ParseResult<MapHeader> {
     })
 }
 
-fn row_from(fields: &[&str], params: Params) -> ParseResult<Row> {
+fn row_from(fields: &[&str], params: FixtureParams) -> ParseResult<Row> {
     if fields[0] != "ROW" {
         return Err(format!("expected ROW or the map terminator, found {}", fields.join(" ")))
     }
@@ -721,7 +825,7 @@ fn parse_rows<'a>(
     lines: &mut Lines<'a>,
     end: &str,
     header: &MapHeader,
-    params: Params,
+    params: FixtureParams,
 ) -> ParseResult<(Vec<Row>, Vec<&'a str>)> {
     let mut rows: Vec<Row> = Vec::new();
     let mut marks = 0;
@@ -744,7 +848,7 @@ fn parse_rows<'a>(
     }
 }
 
-fn parse_completed_map(lines: &mut Lines<'_>, params: Params) -> ParseResult<CompletedMap> {
+fn parse_completed_map(lines: &mut Lines<'_>, params: FixtureParams) -> ParseResult<CompletedMap> {
     let fields = lines.record("MAP")?;
     let header = lines.located(map_header_from(&fields[1..], "MAP"))?;
     let fields = lines.record("MAP_POINTER_BLOCKS")?;
@@ -769,7 +873,7 @@ fn parse_completed_map(lines: &mut Lines<'_>, params: Params) -> ParseResult<Com
     })
 }
 
-fn parse_partial_map(lines: &mut Lines<'_>, params: Params) -> ParseResult<PartialMap> {
+fn parse_partial_map(lines: &mut Lines<'_>, params: FixtureParams) -> ParseResult<PartialMap> {
     let fields = lines.record("PRIVATE_PARTIAL")?;
     lines.located(exact_fields(&fields, 8, "PRIVATE_PARTIAL"))?;
     let pending_delimiter = lines.located(number(fields[5], "pending delimiter"))?;
@@ -872,7 +976,7 @@ fn parse_query(lines: &mut Lines<'_>) -> ParseResult<Query> {
     let potential_indices = lines.located(numbers(&fields, "POTENTIAL_INDICES"))?;
     let fields = lines.record("POTENTIAL_SLOT_CLASSES")?;
     let slot_classes = lines.located(counted(&fields, 1, "POTENTIAL_SLOT_CLASSES", |token| {
-        SlotClass::parse(token).ok_or_else(|| invalid("slot class", token))
+        Ok(SlotClass::parse(token).ok_or_else(|| invalid("slot class", token))?)
     }))?;
     let fields = lines.record("CANDIDATE_BLOCKS")?;
     let candidate_blocks = lines.located(numbers(&fields, "CANDIDATE_BLOCKS"))?;
@@ -909,7 +1013,7 @@ fn parse_query(lines: &mut Lines<'_>) -> ParseResult<Query> {
 }
 
 /// Parses and structurally validates one fixture; `path` only labels error messages.
-pub(crate) fn parse_fixture(path: &str, text: &str) -> ParseResult<Fixture> {
+pub fn parse_fixture(path: &str, text: &str) -> ParseResult<Fixture> {
     let mut lines = Lines::new(path, text)?;
     let generator = parse_provenance(&mut lines)?;
     if generator != GENERATOR_REVISION {
@@ -1233,7 +1337,7 @@ fn validate_fixture(path: &str, fixture: &Fixture) -> ParseResult<()> {
 mod tests {
     use super::*;
 
-    const VALID: &str = include_str!("fixtures/curated/focused/boundary-by-delimiter.txt");
+    const VALID: &str = include_str!("../../../crates/filter-maps/tests/it/golden_pipeline/fixtures/curated/focused/boundary-by-delimiter.txt");
     const PATH: &str = "boundary-by-delimiter.txt";
 
     fn parse(text: &str) -> ParseResult<Fixture> {
@@ -1243,7 +1347,9 @@ mod tests {
     fn rejects(text: &str, fragment: &str) {
         match parse(text) {
             Ok(_) => panic!("accepted a fixture that should fail with {fragment:?}"),
-            Err(error) => assert!(error.contains(fragment), "{error:?} lacks {fragment:?}"),
+            std::result::Result::Err(error) => {
+                assert!(error.contains(fragment), "{error:?} lacks {fragment:?}")
+            }
         }
     }
 
@@ -1379,11 +1485,11 @@ mod tests {
     #[test]
     fn errors_name_the_offending_line() {
         let error = parse(&replace(VALID, "FORMAT", "FORMAT 1")).unwrap_err();
-        assert!(error.starts_with("boundary-by-delimiter.txt:3: "), "{error}");
+        assert!(error.to_string().starts_with("boundary-by-delimiter.txt:3: "), "{error}");
         let error = parse(&replace(VALID, "ROW 13150", "ROW 13150 0")).unwrap_err();
-        assert!(error.starts_with("boundary-by-delimiter.txt:38: "), "{error}");
+        assert!(error.to_string().starts_with("boundary-by-delimiter.txt:38: "), "{error}");
         let error = parse(&swap(VALID, "BLOCK 41", "BLOCK 41", "BLOCK 42")).unwrap_err();
-        assert!(error.starts_with("boundary-by-delimiter.txt: "), "{error}");
+        assert!(error.to_string().starts_with("boundary-by-delimiter.txt: "), "{error}");
     }
 
     #[test]
@@ -1663,19 +1769,19 @@ mod tests {
 
     #[test]
     fn token_parsers_are_strict() {
-        assert_eq!(number::<u64>("0", "n"), Ok(0));
-        assert_eq!(number::<u64>("18446744073709551615", "n"), Ok(u64::MAX));
+        assert_eq!(number::<u64>("0", "n").unwrap(), 0);
+        assert_eq!(number::<u64>("18446744073709551615", "n").unwrap(), u64::MAX);
         assert!(number::<u64>("18446744073709551616", "n").unwrap_err().contains("out of range"));
         for token in ["", "00", "01", "+1", "-1", "1e3", "0x10", " 1", "1_000"] {
             assert!(number::<u64>(token, "n").unwrap_err().contains("non-canonical"), "{token:?}");
         }
         let hex = "0".repeat(64);
-        assert_eq!(hash(&format!("0x{hex}")), Ok(B256::ZERO));
+        assert_eq!(hash(&format!("0x{hex}")).unwrap(), B256::ZERO);
         assert!(hash(&hex).is_err(), "prefix is required");
         assert!(hash(&format!("0x{}", "0".repeat(63))).is_err());
         assert!(hash(&format!("0X{hex}")).is_err(), "prefix must be lowercase");
         assert!(hash(&format!("0x{}", "A".repeat(64))).is_err(), "digits must be lowercase");
-        assert_eq!(address(&format!("0x{}", "0".repeat(40))), Ok(Address::ZERO));
+        assert_eq!(address(&format!("0x{}", "0".repeat(40))).unwrap(), Address::ZERO);
         assert!(address(&format!("0x{hex}")).is_err());
         assert!(git_revision(GETH_REVISION, "r").is_ok());
         assert!(git_revision(&GETH_REVISION[1..], "r").is_err());

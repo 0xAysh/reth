@@ -3,17 +3,17 @@
 //! The renderer marks every typed searchable value and treats delimiters and padding only as
 //! absolute-index consumers. Completed maps remain private until the immediately following
 //! boundary is validated and paired with the matching numerical block pointer. Rows are sparse,
-//! deterministic logical output; physical encoding and publication belong to later layers.
+//! deterministic logical output; `reth-filter-maps-storage` owns physical encoding and atomic
+//! publication.
 
 mod error;
 mod map;
 mod rows;
 
 use crate::{
-    coverage::MapResumeAnchor, stream::StreamStart, BatchContinuation, BlockInput, BlockPointer,
-    LogValueSlot, LogValueStream, LogValueStreamCompletion, LogValueStreamEvent,
-    LogValueStreamItem, LogValueStreamTermination, MapBoundary, Params, ParamsId, PendingDelimiter,
-    GETH_V1,
+    stream::StreamStart, BatchContinuation, BlockInput, BlockPointer, LogValueSlot, LogValueStream,
+    LogValueStreamCompletion, LogValueStreamEvent, LogValueStreamItem, LogValueStreamTermination,
+    MapBoundary, MapResumeAnchor, Params, ParamsId, PendingDelimiter, GETH_V1,
 };
 use alloy_eips::BlockNumHash;
 use rows::ActiveRows;
@@ -80,7 +80,7 @@ where
                 return Err(RendererError::ResumeFromContinuation { actual })
             }
         };
-        let expected = anchor.resume_anchor();
+        let expected = anchor.pointer;
         if actual != expected {
             return Err(RendererError::StartAnchorMismatch { expected, actual })
         }
@@ -101,6 +101,57 @@ where
             last_pointer: None,
             latest_pointer: None,
             next_output_map_index,
+        })
+    }
+
+    /// Constructs a renderer at the start state of Geth's `FORMAT 2` pipeline oracle.
+    ///
+    /// Production renderers start only at genesis or immediately after a published map, so they
+    /// never render a map from its middle. The oracle does: a checkpoint or batch-continuation
+    /// origin may place the first streamed slot anywhere inside a map, and that map then holds only
+    /// marks from the first streamed slot onward. This constructor reproduces that state so parity
+    /// tests can compare rendered maps with the oracle's without reaching into renderer internals.
+    ///
+    /// A stream starting at an anchor must pass no `previous` pointer. Unless the anchor is at
+    /// absolute index zero, the anchor block's pointer belongs to the already indexed prefix, so
+    /// it is not associated with the first rendered map. A stream continuing a batch must pass the
+    /// last pointer of the previous batch, which orders the stream's first pointer. Any other
+    /// pairing is [`RendererError::OracleStartMismatch`].
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn from_geth_oracle_start(
+        stream: LogValueStream<I>,
+        previous: Option<BlockPointer>,
+    ) -> Result<Self, RendererError> {
+        let (params_id, params) = Self::recognized_params(&stream)?;
+        let start_index = stream.initial_cursor();
+        let map_index = u32::try_from(start_index / params.values_per_map())
+            .map_err(|_| RendererError::ArithmeticOverflow)?;
+        let phase = match (stream.start(), previous) {
+            (StreamStart::Anchor(anchor), None) if anchor.first_log_value_index == 0 => {
+                Phase::Active
+            }
+            // An empty replay window consumes the anchor block's pointer without associating it,
+            // then activates the map at the first streamed slot.
+            (StreamStart::Anchor(_), None) => {
+                Phase::Replaying { first_unpublished_index: start_index }
+            }
+            (StreamStart::Continuation(_), Some(_)) => Phase::Active,
+            (StreamStart::Anchor(_), Some(_)) | (StreamStart::Continuation(_), None) => {
+                return Err(RendererError::OracleStartMismatch { previous })
+            }
+        };
+        Ok(Self {
+            params_id,
+            params,
+            expected_slot_index: start_index,
+            stream,
+            phase,
+            active: (phase == Phase::Active).then(|| ActiveMap::new(map_index)),
+            pending: None,
+            pending_replay_boundary: None,
+            last_pointer: previous,
+            latest_pointer: previous,
+            next_output_map_index: map_index,
         })
     }
 

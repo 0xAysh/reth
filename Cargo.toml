@@ -103,6 +103,7 @@ members = [
     "crates/storage/db-models/",
     "crates/storage/db/",
     "crates/storage/errors/",
+    "crates/storage/filter-maps/",
     "crates/storage/libmdbx-rs/",
     "crates/storage/libmdbx-rs/mdbx-sys/",
     "crates/storage/nippy-jar/",
@@ -150,6 +151,7 @@ members = [
     "testing/ef-tests/",
     "testing/testing-utils",
     "testing/runner",
+    "testing/filter-maps-test-utils",
     "crates/tracing-otlp",
 ]
 default-members = ["bin/reth"]
@@ -366,6 +368,8 @@ reth-execution-types = { path = "crates/evm/execution-types", default-features =
 reth-exex = { path = "crates/exex/exex" }
 reth-exex-types = { path = "crates/exex/types" }
 reth-filter-maps = { path = "crates/filter-maps" }
+reth-filter-maps-storage = { path = "crates/storage/filter-maps" }
+reth-filter-maps-test-utils = { path = "testing/filter-maps-test-utils" }
 reth-fs-util = { path = "crates/fs-util" }
 reth-invalid-block-hooks = { path = "crates/engine/invalid-block-hooks" }
 reth-ipc = { path = "crates/rpc/ipc" }

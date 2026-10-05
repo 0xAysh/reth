@@ -1,7 +1,6 @@
 use super::*;
 use crate::{
-    coverage::MapResumeAnchor, LogInput, LogValueKind, RendererError, ValueSpaceAnchor,
-    DEFAULT_PARAMS, RANGE_TEST_PARAMS,
+    BlockPointer, LogInput, LogValueKind, RendererError, DEFAULT_PARAMS, RANGE_TEST_PARAMS,
 };
 use alloy_eips::BlockNumHash;
 use alloy_primitives::{Address, B256};
@@ -25,7 +24,7 @@ fn genesis_stream(
     let genesis_hash = blocks[0].hash;
     LogValueStream::new(
         RANGE_TEST_PARAMS,
-        ValueSpaceAnchor::new(0, genesis_hash, 0),
+        BlockPointer::new(0, genesis_hash, 0),
         blocks,
         termination,
     )
@@ -67,7 +66,7 @@ fn completed_maps_are_anchored_and_returned_one_per_pull() {
         second.map().block_pointers().iter().map(|p| p.block_number).collect::<Vec<_>>(),
         [1]
     );
-    assert_eq!(second.resume_anchor().resume_anchor(), ValueSpaceAnchor::new(1, hash(1), 2));
+    assert_eq!(second.resume_anchor().pointer, BlockPointer::new(1, hash(1), 2));
 
     assert!(matches!(
         renderer.render_next(),
@@ -81,7 +80,7 @@ fn every_typed_value_is_marked_regardless_of_kind_or_zero_bytes() {
     let input = block(0, []);
     let stream = LogValueStream::new(
         DEFAULT_PARAMS,
-        ValueSpaceAnchor::new(0, input.hash, 0),
+        BlockPointer::new(0, input.hash, 0),
         vec![input],
         LogValueStreamTermination::ReachedHead,
     );
@@ -116,7 +115,7 @@ fn durable_resume_suppresses_the_published_prefix() {
     .unwrap();
     let stream = LogValueStream::new(
         RANGE_TEST_PARAMS,
-        anchor.resume_anchor(),
+        anchor.pointer,
         vec![genesis, child],
         LogValueStreamTermination::ReachedHead,
     );
@@ -133,7 +132,7 @@ fn durable_resume_rejects_mismatched_starts_and_replay_jumps() {
     let anchor = MapResumeAnchor::new(MapBoundary::new(0, 0, hash(0)), pointer).unwrap();
     let stream = LogValueStream::new(
         RANGE_TEST_PARAMS,
-        ValueSpaceAnchor::new(0, hash(0), 1),
+        BlockPointer::new(0, hash(0), 1),
         vec![block(0, [])],
         LogValueStreamTermination::ReachedHead,
     );
@@ -147,7 +146,7 @@ fn durable_resume_rejects_mismatched_starts_and_replay_jumps() {
         MapResumeAnchor::new(MapBoundary::new(0, 0, hash(0)), jumped_pointer).unwrap();
     let stream = LogValueStream::new(
         RANGE_TEST_PARAMS,
-        jumped_anchor.resume_anchor(),
+        jumped_anchor.pointer,
         vec![block(0, [log(1, [])])],
         LogValueStreamTermination::ReachedHead,
     );
@@ -390,7 +389,7 @@ fn malformed_event_errors_follow_protocol_precedence() {
 
 #[test]
 fn constructors_reject_invalid_starts_without_advancing_input() {
-    let actual = ValueSpaceAnchor::new(1, hash(1), 0);
+    let actual = BlockPointer::new(1, hash(1), 0);
     let stream = LogValueStream::new(
         RANGE_TEST_PARAMS,
         actual,
@@ -413,206 +412,26 @@ fn constructors_reject_invalid_starts_without_advancing_input() {
         FilterMapRenderer::from_genesis(stream),
         Err(RendererError::GenesisFromContinuation { actual }) if actual == continuation
     ));
-}
 
-fn fixture_blocks(fixture: &crate::golden_pipeline::parser::Fixture) -> Vec<BlockInput> {
-    fixture
-        .blocks
-        .iter()
-        .map(|block| {
-            let logs = block
-                .receipts
-                .iter()
-                .flat_map(|receipt| &receipt.logs)
-                .map(|log| LogInput::new(log.address, log.topics.iter().copied()));
-            BlockInput::new(block.number, block.hash, logs)
-        })
-        .collect()
-}
-
-fn fixture_stream(
-    fixture: &crate::golden_pipeline::parser::Fixture,
-) -> LogValueStream<std::vec::IntoIter<BlockInput>> {
-    use crate::golden_pipeline::parser::{Origin, Termination};
-
-    let params = fixture.params_name.params();
-    let blocks = fixture_blocks(fixture);
-    let termination = match fixture.termination {
-        Termination::Head => LogValueStreamTermination::ReachedHead,
-        Termination::Batch { next_block, next_hash } => LogValueStreamTermination::BatchExhausted {
-            next_block: BlockNumHash::new(next_block, next_hash),
-        },
-    };
-    match fixture.origin {
-        Origin::Genesis(origin) | Origin::Checkpoint(origin) => LogValueStream::new(
-            params,
-            ValueSpaceAnchor::new(origin.block, origin.hash, origin.index),
-            blocks,
-            termination,
-        ),
-        Origin::Continuation { block, hash, cursor, .. } => LogValueStream::continue_from(
-            params,
-            BatchContinuation::new(BlockNumHash::new(block, hash), cursor),
-            blocks,
-            termination,
-        ),
-    }
-}
-
-pub(crate) fn fixture_renderer(
-    fixture: &crate::golden_pipeline::parser::Fixture,
-) -> FilterMapRenderer<std::vec::IntoIter<BlockInput>> {
-    use crate::golden_pipeline::parser::Origin;
-
-    let stream = fixture_stream(fixture);
-    let params = stream.params();
-    let expected_slot_index = stream.initial_cursor();
-    let map_index = u32::try_from(expected_slot_index / params.values_per_map()).unwrap();
-    let previous = match fixture.origin {
-        Origin::Continuation { previous, .. } => {
-            Some(BlockPointer::new(previous.block, previous.hash, previous.index))
-        }
-        _ => None,
-    };
-    FilterMapRenderer {
-        params_id: ParamsId::of(&params).unwrap(),
-        params,
-        stream,
-        expected_slot_index,
-        phase: Phase::Active,
-        active: Some(ActiveMap::new(map_index)),
-        pending: None,
-        pending_replay_boundary: None,
-        last_pointer: previous,
-        latest_pointer: previous,
-        next_output_map_index: map_index,
-    }
-}
-
-#[test]
-fn every_format_two_fixture_matches_the_production_event_machine() {
-    use crate::golden_pipeline::parser::{Origin, Termination};
-
-    for (entry, fixture) in crate::golden_pipeline::manifest::load_and_validate_corpus().unwrap() {
-        let mut renderer = fixture_renderer(&fixture);
-        let mut maps = Vec::new();
-        let mut first_pointer = true;
-        let completion = loop {
-            let item = renderer.stream.next().expect("fixture stream completion").unwrap();
-            match item {
-                LogValueStreamItem::Event(event) => {
-                    let suppress_checkpoint_pointer = first_pointer &&
-                        matches!(fixture.origin, Origin::Checkpoint(origin) if origin.index != 0);
-                    let output = if suppress_checkpoint_pointer {
-                        let LogValueStreamEvent::BlockPointer(pointer) = event else {
-                            panic!("{}: checkpoint stream did not begin with a pointer", entry.path)
-                        };
-                        first_pointer = false;
-                        renderer.accept_pointer(pointer, false).unwrap()
-                    } else {
-                        if matches!(event, LogValueStreamEvent::BlockPointer(_)) {
-                            first_pointer = false;
-                        }
-                        renderer.process_event(event).unwrap()
-                    };
-                    if let Some((map, anchor)) = output {
-                        maps.push((map, anchor));
-                    }
-                }
-                LogValueStreamItem::Complete(completion) => break completion,
-            }
-        };
-
-        assert_eq!(maps.len(), fixture.completed_maps.len(), "{}", entry.path);
-        for ((actual, anchor), expected) in maps.iter().zip(&fixture.completed_maps) {
-            assert_eq!(
-                actual.params_id(),
-                ParamsId::of(&fixture.params_name.params()).unwrap(),
-                "{}",
-                entry.path
-            );
-            assert_eq!(actual.map_index(), expected.index, "{}", entry.path);
-            assert_eq!(actual.epoch(), expected.epoch, "{}", entry.path);
-            assert_eq!(actual.mark_count(), expected.mark_count, "{}", entry.path);
-            assert_eq!(
-                actual.last_block(),
-                BlockNumHash::new(expected.last_block, expected.last_hash),
-                "{}",
-                entry.path
-            );
-            assert_eq!(actual.boundary().completed_map_index, expected.index, "{}", entry.path);
-            assert_eq!(
-                actual
-                    .block_pointers()
-                    .iter()
-                    .map(|pointer| pointer.block_number)
-                    .collect::<Vec<_>>(),
-                expected.pointer_blocks,
-                "{}",
-                entry.path,
-            );
-            assert_eq!(anchor.pointer.block_number, expected.boundary.block, "{}", entry.path);
-            assert_eq!(anchor.pointer.block_hash, expected.boundary.hash, "{}", entry.path);
-            assert_eq!(
-                anchor.pointer.first_log_value_index, expected.boundary.index,
-                "{}",
-                entry.path
-            );
-            assert_eq!(actual.rows().len(), expected.rows.len(), "{}", entry.path);
-            for (actual, expected) in actual.rows().iter().zip(&expected.rows) {
-                assert_eq!(actual.row_index(), expected.index, "{}", entry.path);
-                assert_eq!(actual.columns(), expected.columns, "{}", entry.path);
-            }
-        }
-
-        match fixture.partial_maps.as_slice() {
-            [] => assert!(
-                renderer.expected_slot_index.is_multiple_of(renderer.params.values_per_map()),
-                "{}",
-                entry.path
-            ),
-            [expected] => {
-                let active = renderer.active.as_mut().expect("fixture partial active map");
-                assert_eq!(active.map_index, expected.index, "{}", entry.path);
-                let rows = std::mem::replace(&mut active.rows, ActiveRows::new()).finish();
-                assert_eq!(
-                    rows.iter().map(|row| row.columns().len()).sum::<usize>(),
-                    expected.mark_count,
-                    "{}",
-                    entry.path
-                );
-                assert_eq!(rows.len(), expected.rows.len(), "{}", entry.path);
-                for (actual, expected) in rows.iter().zip(&expected.rows) {
-                    assert_eq!(actual.row_index(), expected.index, "{}", entry.path);
-                    assert_eq!(actual.columns(), expected.columns, "{}", entry.path);
-                }
-                let (last_block, last_hash, cursor) = match completion {
-                    LogValueStreamCompletion::ReachedHead { head, pending_delimiter } => {
-                        (head.block_number, head.block_hash, pending_delimiter.index)
-                    }
-                    LogValueStreamCompletion::BatchExhausted { last_block, continuation } => (
-                        last_block.block_number,
-                        last_block.block_hash,
-                        continuation.next_log_value_index,
-                    ),
-                };
-                assert_eq!(
-                    (last_block, last_hash, cursor),
-                    (expected.last_block, expected.last_hash, expected.pending_delimiter),
-                    "{}",
-                    entry.path
-                );
-            }
-            _ => panic!("{}: several private partial maps", entry.path),
-        }
-
-        // Exercise terminal validation after observing private state. Partial rows were moved only
-        // for test comparison; terminal handling never publishes them.
-        if fixture.partial_maps.is_empty() {
-            let result = renderer.process_completion(completion);
-            assert!(result.is_ok(), "{}: {result:?}", entry.path);
-        } else {
-            assert!(matches!(fixture.termination, Termination::Head | Termination::Batch { .. }));
-        }
-    }
+    let anchored = LogValueStream::new(
+        RANGE_TEST_PARAMS,
+        actual,
+        vec![block(1, [])],
+        LogValueStreamTermination::ReachedHead,
+    );
+    let previous = Some(BlockPointer::new(0, hash(0), 0));
+    assert!(matches!(
+        FilterMapRenderer::from_geth_oracle_start(anchored, previous),
+        Err(RendererError::OracleStartMismatch { previous: found }) if found == previous
+    ));
+    let continued = LogValueStream::continue_from(
+        RANGE_TEST_PARAMS,
+        continuation,
+        vec![block(1, [])],
+        LogValueStreamTermination::ReachedHead,
+    );
+    assert!(matches!(
+        FilterMapRenderer::from_geth_oracle_start(continued, None),
+        Err(RendererError::OracleStartMismatch { previous: None })
+    ));
 }

@@ -10,8 +10,8 @@ use alloy_primitives::B256;
 use reth_filter_maps::{
     BatchContinuation, BlockInput, BlockPointer, LogInput, LogValueKind, LogValueSlot,
     LogValueStream, LogValueStreamCompletion, LogValueStreamEvent, LogValueStreamItem,
-    LogValueStreamTermination, MapBoundary, Params, PendingDelimiter, ValueSpaceAnchor,
-    DEFAULT_PARAMS, RANGE_TEST_PARAMS,
+    LogValueStreamTermination, MapBoundary, Params, PendingDelimiter, DEFAULT_PARAMS,
+    RANGE_TEST_PARAMS,
 };
 
 const GETH_HEADER: &str = "# Geth af7c0fd8ee09de71b1034dbe6d1112556b49b59f";
@@ -172,7 +172,7 @@ fn check(text: &str) {
     } else {
         LogValueStream::new(
             fixture.params,
-            ValueSpaceAnchor::new(first.number, first.hash, fixture.start),
+            BlockPointer::new(first.number, first.hash, fixture.start),
             fixture.blocks,
             fixture.termination,
         )
@@ -218,7 +218,7 @@ fn actual_batch_completion_drives_continuation_fixture() {
     let block = &first.blocks[0];
     let completion = LogValueStream::new(
         first.params,
-        ValueSpaceAnchor::new(block.number, block.hash, first.start),
+        BlockPointer::new(block.number, block.hash, first.start),
         first.blocks,
         first.termination,
     )

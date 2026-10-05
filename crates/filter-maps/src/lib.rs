@@ -17,16 +17,18 @@
 //! The math is a port of go-ethereum's `core/filtermaps` package. Behavioral equivalence with Geth
 //! is the contract: the index is only interoperable with Geth-compatible tooling, and Geth is only
 //! usable as a correctness oracle, if these functions agree bit for bit. The port is pinned by
-//! golden vectors generated from Geth (see `tests/golden`).
+//! golden vectors generated from Geth (see `tests/it/golden` and
+//! `tests/it/golden_pipeline`).
 //!
-//! Nothing here touches storage: the stream and renderer produce immutable logical maps that a
-//! later layer can persist. Every completed renderer output is paired with a validated numerical
-//! resume anchor, but publication must still atomically write rows, restart metadata, and its
-//! valid-range update. Incomplete head and batch state never expands indexed coverage.
+//! This crate is the storage-independent domain layer. The stream and renderer produce immutable
+//! anchored maps; `reth-filter-maps-storage` persists them by atomically writing rows, pointers,
+//! anchors, identity metadata, and coverage. Incomplete head and batch state never expands indexed
+//! coverage.
 //!
-//! [`FilterMapMatcher`] searches completed logical rows through [`FilterMapMatchSource`]. It
-//! returns possible value-space indices and candidate blocks only; receipt loading and exact log
-//! filtering remain outside this crate.
+//! [`FilterMapMatcher`] searches completed logical rows through [`FilterMapMatchSource`]. The MDBX
+//! storage crate implements that seam for one canonically activated coverage segment. Matching
+//! returns possible value-space indices and candidate blocks only; receipt acquisition, exact log
+//! filtering, lifecycle scheduling, bloom fallback, and RPC integration remain outside this crate.
 
 #![doc(
     html_logo_url = "https://raw.githubusercontent.com/paradigmxyz/reth/main/assets/reth-docs.png",
@@ -36,16 +38,17 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
-#[cfg(test)]
-extern crate self as reth_filter_maps;
-
+mod anchor;
 pub mod coverage;
 mod matcher;
 mod params;
 mod renderer;
 mod stream;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_utils;
 mod value;
 
+pub use anchor::{MapResumeAnchor, ResumeAnchorMismatch};
 pub use matcher::{
     CandidateSet, FilterMapMatchSource, FilterMapMatcher, IndexedMatchRange, MatchPattern,
     MatcherError, PatternError, TopicSelection,
@@ -61,12 +64,6 @@ pub use stream::{
     BatchContinuation, BlockInput, BlockPointer, LogInput, LogValueKind, LogValueSlot,
     LogValueStream, LogValueStreamCompletion, LogValueStreamError, LogValueStreamEvent,
     LogValueStreamItem, LogValueStreamTermination, MapBoundary, PendingDelimiter,
-    UnknownValueSpaceVersion, ValueSpaceAnchor, ValueSpaceVersion, GETH_V1,
+    UnknownValueSpaceVersion, ValueSpaceVersion, GETH_V1,
 };
 pub use value::{address_value, topic_value};
-
-// The FORMAT 2 parser is also compiled into crate tests so private renderer state can be checked
-// without exposing a production test adapter.
-#[cfg(test)]
-#[path = "../tests/it/golden_pipeline.rs"]
-mod golden_pipeline;

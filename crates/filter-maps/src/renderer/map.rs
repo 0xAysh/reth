@@ -1,4 +1,4 @@
-use crate::{coverage::MapResumeAnchor, BlockPointer, MapBoundary, ParamsId};
+use crate::{BlockPointer, MapBoundary, MapResumeAnchor, ParamsId};
 use alloy_eips::BlockNumHash;
 
 /// One nonempty logical row in a completed filter map.
@@ -94,5 +94,15 @@ impl AnchoredCompletedMap {
     /// Returns the map's validated resume anchor.
     pub const fn resume_anchor(&self) -> MapResumeAnchor {
         self.resume_anchor
+    }
+
+    /// Returns every block pointer publishing this map establishes: the map's block pointers in
+    /// stream order, then its resume anchor's pointer.
+    ///
+    /// The resume block may also begin inside the map, so the last pointer can repeat an earlier
+    /// one; across a batch, consecutive maps likewise share pointers.
+    pub fn established_pointers(&self) -> impl Iterator<Item = BlockPointer> + '_ {
+        let map = self.map.block_pointers().iter().copied();
+        map.chain(std::iter::once(self.resume_anchor.pointer))
     }
 }

@@ -5,8 +5,6 @@
 //! subrange, and resolves them to blocks through explicit block-pointer lookups. Results are
 //! candidates only: receipt loading and exact log filtering remain authoritative.
 
-#[cfg(test)]
-use crate::AnchoredCompletedMap;
 use crate::{address_value, topic_value, Params, ParamsId};
 use alloy_primitives::{Address, B256};
 use std::{collections::BTreeMap, error::Error, ops::RangeInclusive};
@@ -16,153 +14,6 @@ use std::{collections::BTreeMap, error::Error, ops::RangeInclusive};
 pub struct FilterMapMatcher<S> {
     source: S,
     pinned_params_id: ParamsId,
-}
-
-/// One declared topic position in an Ethereum log filter.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TopicSelection {
-    /// The position is unconstrained, while retaining its positional offset.
-    Any,
-    /// The topic may equal any one of these values.
-    OneOf(Vec<B256>),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum CompiledSelection {
-    Any,
-    Values(Vec<B256>),
-}
-
-/// An immutable, compiled Ethereum-shaped filter pattern.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MatchPattern {
-    addresses: Vec<B256>,
-    topics: Vec<CompiledSelection>,
-}
-
-impl MatchPattern {
-    /// Compiles addresses and up to four declared topic positions for repeated matching.
-    pub fn new(addresses: Vec<Address>, topics: Vec<TopicSelection>) -> Result<Self, PatternError> {
-        if topics.len() > 4 {
-            return Err(PatternError::TooManyTopicPositions { actual: topics.len() })
-        }
-        let mut addresses = addresses.into_iter().map(address_value).collect::<Vec<_>>();
-        addresses.sort_unstable();
-        addresses.dedup();
-        let topics = topics
-            .into_iter()
-            .enumerate()
-            .map(|(position, selection)| match selection {
-                TopicSelection::Any => Ok(CompiledSelection::Any),
-                TopicSelection::OneOf(values) if values.is_empty() => {
-                    Err(PatternError::EmptyTopicAlternatives { position })
-                }
-                TopicSelection::OneOf(values) => {
-                    let mut values = values.into_iter().map(topic_value).collect::<Vec<_>>();
-                    values.sort_unstable();
-                    values.dedup();
-                    Ok(CompiledSelection::Values(values))
-                }
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { addresses, topics })
-    }
-
-    /// Returns whether at least one address or topic value can be looked up in filter-map rows.
-    pub fn has_searchable_values(&self) -> bool {
-        !self.addresses.is_empty() ||
-            self.topics.iter().any(|topic| matches!(topic, CompiledSelection::Values(_)))
-    }
-}
-
-/// Invalid Ethereum filter shape.
-#[allow(missing_docs)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum PatternError {
-    /// Ethereum logs have at most four topics.
-    #[error("filter has {actual} topic positions; at most four are supported")]
-    TooManyTopicPositions { actual: usize },
-    /// An OR-list must contain at least one topic.
-    #[error("topic position {position} has no alternatives")]
-    EmptyTopicAlternatives { position: usize },
-}
-
-/// One planner-normalized indexed subrange and the maps that support its validated segment.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct IndexedMatchRange {
-    blocks: RangeInclusive<u64>,
-    supporting_maps: RangeInclusive<u32>,
-    params_id: ParamsId,
-}
-
-impl IndexedMatchRange {
-    /// Creates a matcher input. Semantic range validation occurs in `match_subrange`.
-    pub const fn new(
-        blocks: RangeInclusive<u64>,
-        supporting_maps: RangeInclusive<u32>,
-        params_id: ParamsId,
-    ) -> Self {
-        Self { blocks, supporting_maps, params_id }
-    }
-
-    /// Returns the exact block interval to search.
-    pub const fn blocks(&self) -> &RangeInclusive<u64> {
-        &self.blocks
-    }
-
-    /// Returns the validated segment maps that may support this interval.
-    pub const fn supporting_maps(&self) -> &RangeInclusive<u32> {
-        &self.supporting_maps
-    }
-
-    /// Returns the planned parameter-set identity.
-    pub const fn params_id(&self) -> ParamsId {
-        self.params_id
-    }
-}
-
-/// Logical reads required by the pure matcher.
-pub trait FilterMapMatchSource {
-    /// Typed source failure.
-    type Error: Error + 'static;
-
-    /// Returns the recognized identity under which all source data is interpreted.
-    fn params_id(&self) -> ParamsId;
-
-    /// Reads one capped logical-row prefix for every requested map, preserving request order.
-    fn read_row_prefixes(
-        &mut self,
-        map_indices: &[u32],
-        row_index: u32,
-        max_columns: u32,
-    ) -> Result<Vec<Vec<u32>>, Self::Error>;
-
-    /// Returns the absolute first non-padding value-space index for `block_number`.
-    fn block_pointer(&mut self, block_number: u64) -> Result<u64, Self::Error>;
-}
-
-/// Ordered, unique potential log starts and their candidate blocks.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CandidateSet {
-    potential_indices: Vec<u64>,
-    candidate_blocks: Vec<u64>,
-}
-
-impl CandidateSet {
-    /// Returns possible absolute address/start indices.
-    pub fn potential_indices(&self) -> &[u64] {
-        &self.potential_indices
-    }
-
-    /// Returns blocks that may contain an exact match.
-    pub fn candidate_blocks(&self) -> &[u64] {
-        &self.candidate_blocks
-    }
-
-    /// Consumes the result and returns its candidate blocks.
-    pub fn into_candidate_blocks(self) -> Vec<u64> {
-        self.candidate_blocks
-    }
 }
 
 impl<S: FilterMapMatchSource> FilterMapMatcher<S> {
@@ -329,8 +180,13 @@ impl<S: FilterMapMatchSource> FilterMapMatcher<S> {
         let mut output = Vec::new();
         let mut active = maps.to_vec();
         let mut layer = 0u32;
+        let mut cumulative_capacity = 0u64;
+        let mut capacity_exhausted = false;
         while !active.is_empty() {
             let limit = params.max_row_length(layer);
+            cumulative_capacity = cumulative_capacity
+                .checked_add(u64::from(limit))
+                .ok_or(MatcherError::LayerIndexExhausted { map: active[0], value })?;
             let mut groups = BTreeMap::<u32, Vec<u32>>::new();
             for &map in &active {
                 groups.entry(params.row_index(map, layer, value)).or_default().push(map);
@@ -380,6 +236,13 @@ impl<S: FilterMapMatchSource> FilterMapMatcher<S> {
                 break
             }
             active = next;
+            // One map cannot contain more searchable marks than value-space slots. Read one
+            // additional layer after reaching that capacity so a capped full prefix can be
+            // distinguished from a truly saturated row; another full row is then impossible.
+            if capacity_exhausted {
+                return Err(MatcherError::LayerIndexExhausted { map: active[0], value })
+            }
+            capacity_exhausted = cumulative_capacity >= params.values_per_map();
             layer = layer
                 .checked_add(1)
                 .ok_or(MatcherError::LayerIndexExhausted { map: active[0], value })?;
@@ -466,6 +329,322 @@ impl<S: FilterMapMatchSource> FilterMapMatcher<S> {
     }
 }
 
+/// One declared topic position in an Ethereum log filter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TopicSelection {
+    /// The position is unconstrained, while retaining its positional offset.
+    Any,
+    /// The topic may equal any one of these values.
+    OneOf(Vec<B256>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CompiledSelection {
+    Any,
+    Values(Vec<B256>),
+}
+
+/// An immutable, compiled Ethereum-shaped filter pattern.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MatchPattern {
+    addresses: Vec<B256>,
+    topics: Vec<CompiledSelection>,
+}
+
+impl MatchPattern {
+    /// Compiles addresses and up to four declared topic positions for repeated matching.
+    pub fn new(addresses: Vec<Address>, topics: Vec<TopicSelection>) -> Result<Self, PatternError> {
+        if topics.len() > 4 {
+            return Err(PatternError::TooManyTopicPositions { actual: topics.len() })
+        }
+        let mut addresses = addresses.into_iter().map(address_value).collect::<Vec<_>>();
+        addresses.sort_unstable();
+        addresses.dedup();
+        let topics = topics
+            .into_iter()
+            .enumerate()
+            .map(|(position, selection)| match selection {
+                TopicSelection::Any => Ok(CompiledSelection::Any),
+                TopicSelection::OneOf(values) if values.is_empty() => {
+                    Err(PatternError::EmptyTopicAlternatives { position })
+                }
+                TopicSelection::OneOf(values) => {
+                    let mut values = values.into_iter().map(topic_value).collect::<Vec<_>>();
+                    values.sort_unstable();
+                    values.dedup();
+                    Ok(CompiledSelection::Values(values))
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { addresses, topics })
+    }
+
+    /// Returns whether at least one address or topic value can be looked up in filter-map rows.
+    pub fn has_searchable_values(&self) -> bool {
+        !self.addresses.is_empty() ||
+            self.topics.iter().any(|topic| matches!(topic, CompiledSelection::Values(_)))
+    }
+}
+
+/// Invalid Ethereum filter shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum PatternError {
+    /// Ethereum logs have at most four topics.
+    #[error("filter has {actual} topic positions; at most four are supported")]
+    TooManyTopicPositions {
+        /// Number of supplied topic positions.
+        actual: usize,
+    },
+    /// An OR-list must contain at least one topic.
+    #[error("topic position {position} has no alternatives")]
+    EmptyTopicAlternatives {
+        /// Zero-based topic position whose alternatives are empty.
+        position: usize,
+    },
+}
+
+/// One planner-normalized indexed subrange and the maps that support its validated segment.
+///
+/// [`QueryPlan`](crate::coverage::QueryPlan) emits these for the parts of a query that queryable
+/// coverage supports.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexedMatchRange {
+    blocks: RangeInclusive<u64>,
+    supporting_maps: RangeInclusive<u32>,
+    params_id: ParamsId,
+}
+
+impl IndexedMatchRange {
+    /// Creates a matcher input. Semantic range validation occurs in `match_subrange`.
+    pub const fn new(
+        blocks: RangeInclusive<u64>,
+        supporting_maps: RangeInclusive<u32>,
+        params_id: ParamsId,
+    ) -> Self {
+        Self { blocks, supporting_maps, params_id }
+    }
+
+    /// Returns the exact block interval to search.
+    pub const fn blocks(&self) -> &RangeInclusive<u64> {
+        &self.blocks
+    }
+
+    /// Returns the validated segment maps that may support this interval.
+    pub const fn supporting_maps(&self) -> &RangeInclusive<u32> {
+        &self.supporting_maps
+    }
+
+    /// Returns the planned parameter-set identity.
+    pub const fn params_id(&self) -> ParamsId {
+        self.params_id
+    }
+}
+
+/// Logical reads required by the pure matcher.
+pub trait FilterMapMatchSource {
+    /// Typed source failure.
+    type Error: Error + 'static;
+
+    /// Returns the recognized identity under which all source data is interpreted.
+    fn params_id(&self) -> ParamsId;
+
+    /// Reads one capped logical-row prefix for every requested map, preserving request order.
+    fn read_row_prefixes(
+        &mut self,
+        map_indices: &[u32],
+        row_index: u32,
+        max_columns: u32,
+    ) -> Result<Vec<Vec<u32>>, Self::Error>;
+
+    /// Returns the absolute first non-padding value-space index for `block_number`.
+    fn block_pointer(&mut self, block_number: u64) -> Result<u64, Self::Error>;
+}
+
+/// Ordered, unique potential log starts and their candidate blocks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CandidateSet {
+    potential_indices: Vec<u64>,
+    candidate_blocks: Vec<u64>,
+}
+
+impl CandidateSet {
+    /// Returns possible absolute address/start indices.
+    pub fn potential_indices(&self) -> &[u64] {
+        &self.potential_indices
+    }
+
+    /// Returns blocks that may contain an exact match.
+    pub fn candidate_blocks(&self) -> &[u64] {
+        &self.candidate_blocks
+    }
+
+    /// Consumes the result and returns its candidate blocks.
+    pub fn into_candidate_blocks(self) -> Vec<u64> {
+        self.candidate_blocks
+    }
+}
+
+/// Typed matcher failure; malformed or unavailable source data never becomes an empty result.
+#[derive(Debug, thiserror::Error)]
+pub enum MatcherError<E> {
+    /// The filter has no address or topic constraint suitable for map lookup.
+    #[error("filter has no searchable address or topic value")]
+    NoSearchableValues,
+    /// The planner and source use different recognized parameter sets.
+    #[error("planned parameter identity {planned:?} differs from source {source_params:?}")]
+    ParamsMismatch {
+        /// Parameter set used by the plan.
+        planned: ParamsId,
+        /// Parameter set exposed by the source.
+        source_params: ParamsId,
+    },
+    /// The source changed parameter identity after the matcher pinned it.
+    #[error("source parameter identity changed from {pinned:?} to {actual:?}")]
+    SourceParamsChanged {
+        /// Parameter identity pinned at construction.
+        pinned: ParamsId,
+        /// Parameter identity returned during matching.
+        actual: ParamsId,
+    },
+    /// The requested block interval is reversed.
+    #[error("block range {first}..={last} is reversed")]
+    ReversedBlockRange {
+        /// First requested block.
+        first: u64,
+        /// Last requested block.
+        last: u64,
+    },
+    /// The supporting-map interval is reversed.
+    #[error("supporting map range {first}..={last} is reversed")]
+    ReversedSupportingMapRange {
+        /// First supporting map.
+        first: u32,
+        /// Last supporting map.
+        last: u32,
+    },
+    /// The inclusive block range has no representable exclusive end.
+    #[error("block {last} has no representable successor")]
+    BlockSuccessorOverflow {
+        /// Last requested block.
+        last: u64,
+    },
+    /// The range endpoint pointers do not enclose any value-space index.
+    #[error("invalid pointer range {first_block}:{first} through {after_block}:{after}")]
+    InvalidPointerRange {
+        /// First requested block.
+        first_block: u64,
+        /// First block pointer.
+        first: u64,
+        /// Block after the requested range.
+        after_block: u64,
+        /// Pointer of the block after the range.
+        after: u64,
+    },
+    /// A required absolute map index does not fit the persisted map domain.
+    #[error("absolute map index {index} does not fit u32")]
+    MapIndexOverflow {
+        /// Unrepresentable absolute map index.
+        index: u64,
+    },
+    /// Required maps lie outside the planner-authorized segment maps.
+    #[error("required maps {required_first}..={required_last} are outside {available_first}..={available_last}")]
+    MapsOutsideCoverage {
+        /// First map implied by block pointers.
+        required_first: u32,
+        /// Last map implied by block pointers.
+        required_last: u32,
+        /// First planner-authorized map.
+        available_first: u32,
+        /// Last planner-authorized map.
+        available_last: u32,
+    },
+    /// The logical source failed.
+    #[error("filter-map source failed")]
+    Source(#[source] E),
+    /// The source returned a different number of rows than requested maps.
+    #[error("source returned {actual} rows for {requested} requested maps")]
+    RowCountMismatch {
+        /// Number of requested maps.
+        requested: usize,
+        /// Number of returned row prefixes.
+        actual: usize,
+    },
+    /// A source row exceeds the requested capped prefix.
+    #[error("map {map} row {row} returned {actual} columns beyond prefix limit {limit}")]
+    RowPrefixTooLong {
+        /// Map containing the malformed row.
+        map: u32,
+        /// Row index.
+        row: u32,
+        /// Requested maximum number of columns.
+        limit: u32,
+        /// Number of returned columns.
+        actual: usize,
+    },
+    /// A source row contains a column outside the map width.
+    #[error("map {map} row {row} contains out-of-range column {column}")]
+    MalformedColumn {
+        /// Map containing the malformed row.
+        map: u32,
+        /// Row index.
+        row: u32,
+        /// Invalid column.
+        column: u32,
+    },
+    /// Mapping-layer iteration overflowed before the row became unsaturated.
+    #[error("mapping layers exhausted for map {map} and value {value}")]
+    LayerIndexExhausted {
+        /// Map whose row remained saturated.
+        map: u32,
+        /// Searched log value.
+        value: B256,
+    },
+    /// Converting a local column to an absolute value index overflowed.
+    #[error("candidate arithmetic overflow in map {map} at column {column}")]
+    CandidateArithmeticOverflow {
+        /// Candidate map.
+        map: u32,
+        /// Candidate encoded column.
+        column: u32,
+    },
+    /// A candidate resolved outside the requested block interval.
+    #[error("candidate index {index} resolves outside block range {first}..={last}")]
+    CandidateOutsideBlockRange {
+        /// Candidate value index.
+        index: u64,
+        /// First requested block.
+        first: u64,
+        /// Last requested block.
+        last: u64,
+    },
+    /// Block pointers are not strictly increasing.
+    #[error(
+        "pointer order is not strict: {lower_block}:{lower_pointer}, {upper_block}:{upper_pointer}"
+    )]
+    PointerOrderMismatch {
+        /// Lower block number.
+        lower_block: u64,
+        /// Lower block pointer.
+        lower_pointer: u64,
+        /// Upper block number.
+        upper_block: u64,
+        /// Upper block pointer.
+        upper_pointer: u64,
+    },
+    /// Adjacent pointers do not bracket a candidate assigned to their block.
+    #[error("candidate {index} is not bracketed by block {block} pointers {pointer}..{successor_pointer}")]
+    PointerBracketMismatch {
+        /// Candidate value index.
+        index: u64,
+        /// Candidate block.
+        block: u64,
+        /// Candidate block pointer.
+        pointer: u64,
+        /// Successor block pointer.
+        successor_pointer: u64,
+    },
+}
+
 #[derive(Debug)]
 enum PotentialSet {
     Any,
@@ -499,179 +678,6 @@ fn combine(base: PotentialSet, next: Vec<u64>, offset: u64, values_per_map: u64)
             PotentialSet::Some(intersection)
         }
     }
-}
-
-#[cfg(test)]
-#[derive(Debug)]
-pub(crate) struct InMemoryMatchSource {
-    params_id: ParamsId,
-    maps: Vec<AnchoredCompletedMap>,
-    pointers: Vec<(u64, u64)>,
-}
-
-#[cfg(test)]
-impl InMemoryMatchSource {
-    pub(crate) fn new(
-        maps: Vec<AnchoredCompletedMap>,
-        pointers: Vec<(u64, u64)>,
-    ) -> Result<Self, InMemorySourceError> {
-        let params_id = maps.first().ok_or(InMemorySourceError::NoMaps)?.map().params_id();
-        let mut previous_map = None;
-        for anchored in &maps {
-            let map = anchored.map();
-            if map.params_id() != params_id {
-                return Err(InMemorySourceError::MixedParams {
-                    expected: params_id,
-                    actual: map.params_id(),
-                })
-            }
-            if previous_map.is_some_and(|previous| previous >= map.map_index()) {
-                return Err(InMemorySourceError::MapOrder {
-                    previous: previous_map.unwrap(),
-                    actual: map.map_index(),
-                })
-            }
-            previous_map = Some(map.map_index());
-        }
-        let mut previous: Option<(u64, u64)> = None;
-        for &(block, index) in &pointers {
-            if let Some((previous_block, previous_index)) = previous {
-                if previous_block.checked_add(1) != Some(block) {
-                    return Err(InMemorySourceError::PointerBlockOrder {
-                        previous: previous_block,
-                        actual: block,
-                    })
-                }
-                if previous_index >= index {
-                    return Err(InMemorySourceError::PointerIndexOrder {
-                        previous: previous_index,
-                        actual: index,
-                    })
-                }
-            }
-            previous = Some((block, index));
-        }
-        if pointers.is_empty() {
-            return Err(InMemorySourceError::NoPointers)
-        }
-        Ok(Self { params_id, maps, pointers })
-    }
-}
-
-#[cfg(test)]
-impl FilterMapMatchSource for InMemoryMatchSource {
-    type Error = InMemorySourceError;
-
-    fn params_id(&self) -> ParamsId {
-        self.params_id
-    }
-
-    fn read_row_prefixes(
-        &mut self,
-        map_indices: &[u32],
-        row_index: u32,
-        max_columns: u32,
-    ) -> Result<Vec<Vec<u32>>, Self::Error> {
-        map_indices
-            .iter()
-            .map(|&map_index| {
-                let map = self
-                    .maps
-                    .binary_search_by_key(&map_index, |map| map.map().map_index())
-                    .map_err(|_| InMemorySourceError::UnknownMap { map: map_index })?;
-                let rows = self.maps[map].map().rows();
-                let columns = rows
-                    .binary_search_by_key(&row_index, |row| row.row_index())
-                    .ok()
-                    .map(|row| rows[row].columns())
-                    .unwrap_or_default();
-                Ok(columns.iter().copied().take(max_columns as usize).collect())
-            })
-            .collect()
-    }
-
-    fn block_pointer(&mut self, block_number: u64) -> Result<u64, Self::Error> {
-        self.pointers
-            .binary_search_by_key(&block_number, |&(block, _)| block)
-            .map(|index| self.pointers[index].1)
-            .map_err(|_| InMemorySourceError::UnknownPointer { block: block_number })
-    }
-}
-
-#[cfg(test)]
-#[allow(missing_docs)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum InMemorySourceError {
-    #[error("at least one completed map is required")]
-    NoMaps,
-    #[error("at least one block pointer is required")]
-    NoPointers,
-    #[error("completed maps mix parameter identities {expected:?} and {actual:?}")]
-    MixedParams { expected: ParamsId, actual: ParamsId },
-    #[error("completed map {actual} does not strictly follow {previous}")]
-    MapOrder { previous: u32, actual: u32 },
-    #[error("pointer block {actual} does not immediately follow {previous}")]
-    PointerBlockOrder { previous: u64, actual: u64 },
-    #[error("pointer index {actual} does not strictly follow {previous}")]
-    PointerIndexOrder { previous: u64, actual: u64 },
-    #[error("completed map {map} is unavailable")]
-    UnknownMap { map: u32 },
-    #[error("block pointer {block} is unavailable")]
-    UnknownPointer { block: u64 },
-}
-
-/// Typed matcher failure; malformed or unavailable source data never becomes an empty result.
-#[allow(missing_docs)]
-#[derive(Debug, thiserror::Error)]
-pub enum MatcherError<E> {
-    #[error("filter has no searchable address or topic value")]
-    NoSearchableValues,
-    #[error("planned parameter identity {planned:?} differs from source {source_params:?}")]
-    ParamsMismatch { planned: ParamsId, source_params: ParamsId },
-    #[error("source parameter identity changed from {pinned:?} to {actual:?}")]
-    SourceParamsChanged { pinned: ParamsId, actual: ParamsId },
-    #[error("block range {first}..={last} is reversed")]
-    ReversedBlockRange { first: u64, last: u64 },
-    #[error("supporting map range {first}..={last} is reversed")]
-    ReversedSupportingMapRange { first: u32, last: u32 },
-    #[error("block {last} has no representable successor")]
-    BlockSuccessorOverflow { last: u64 },
-    #[error("invalid pointer range {first_block}:{first} through {after_block}:{after}")]
-    InvalidPointerRange { first_block: u64, first: u64, after_block: u64, after: u64 },
-    #[error("absolute map index {index} does not fit u32")]
-    MapIndexOverflow { index: u64 },
-    #[error("required maps {required_first}..={required_last} are outside {available_first}..={available_last}")]
-    MapsOutsideCoverage {
-        required_first: u32,
-        required_last: u32,
-        available_first: u32,
-        available_last: u32,
-    },
-    #[error("filter-map source failed")]
-    Source(#[source] E),
-    #[error("source returned {actual} rows for {requested} requested maps")]
-    RowCountMismatch { requested: usize, actual: usize },
-    #[error("map {map} row {row} returned {actual} columns beyond prefix limit {limit}")]
-    RowPrefixTooLong { map: u32, row: u32, limit: u32, actual: usize },
-    #[error("map {map} row {row} contains out-of-range column {column}")]
-    MalformedColumn { map: u32, row: u32, column: u32 },
-    #[error("mapping layers exhausted for map {map} and value {value}")]
-    LayerIndexExhausted { map: u32, value: B256 },
-    #[error("candidate arithmetic overflow in map {map} at column {column}")]
-    CandidateArithmeticOverflow { map: u32, column: u32 },
-    #[error("candidate index {index} resolves outside block range {first}..={last}")]
-    CandidateOutsideBlockRange { index: u64, first: u64, last: u64 },
-    #[error(
-        "pointer order is not strict: {lower_block}:{lower_pointer}, {upper_block}:{upper_pointer}"
-    )]
-    PointerOrderMismatch {
-        lower_block: u64,
-        lower_pointer: u64,
-        upper_block: u64,
-        upper_pointer: u64,
-    },
-    #[error("candidate {index} is not bracketed by block {block} pointers {pointer}..{successor_pointer}")]
-    PointerBracketMismatch { index: u64, block: u64, pointer: u64, successor_pointer: u64 },
 }
 
 #[cfg(test)]

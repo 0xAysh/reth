@@ -147,21 +147,11 @@ pub enum IdentityMismatch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::GETH_V1;
-
-    const fn identity() -> IndexIdentity {
-        IndexIdentity::new(
-            STORAGE_FORMAT_V1,
-            1,
-            B256::repeat_byte(0xd4),
-            GETH_V1,
-            ParamsId::Default,
-        )
-    }
+    use crate::coverage::test_utils::{identity, PARAMS};
 
     #[test]
     fn identical_identities_are_compatible() {
-        assert_eq!(identity().check_compatible(&identity()), Ok(()));
+        assert_eq!(identity(PARAMS).check_compatible(&identity(PARAMS)), Ok(()));
     }
 
     #[test]
@@ -172,7 +162,7 @@ mod tests {
 
     #[test]
     fn any_differing_field_is_incompatible() {
-        let running = identity();
+        let running = identity(PARAMS);
 
         let mut stored = running;
         stored.storage_format_version = StorageFormatVersion(2);
@@ -192,10 +182,14 @@ mod tests {
         );
 
         let mut stored = running;
-        stored.genesis_hash = B256::ZERO;
+        let other_genesis = B256::repeat_byte(0xd4);
+        stored.genesis_hash = other_genesis;
         assert_eq!(
             running.check_compatible(&stored),
-            Err(IdentityMismatch::Genesis { expected: running.genesis_hash, stored: B256::ZERO })
+            Err(IdentityMismatch::Genesis {
+                expected: running.genesis_hash,
+                stored: other_genesis
+            })
         );
 
         let mut stored = running;

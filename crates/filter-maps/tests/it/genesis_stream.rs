@@ -5,8 +5,8 @@ use alloy_primitives::B256;
 use reth_filter_maps::{
     BatchContinuation, BlockInput, BlockPointer, LogValueSlot, LogValueStream,
     LogValueStreamCompletion, LogValueStreamError, LogValueStreamEvent, LogValueStreamItem,
-    LogValueStreamTermination, PendingDelimiter, UnknownValueSpaceVersion, ValueSpaceAnchor,
-    ValueSpaceVersion, DEFAULT_PARAMS, GETH_V1,
+    LogValueStreamTermination, PendingDelimiter, UnknownValueSpaceVersion, ValueSpaceVersion,
+    DEFAULT_PARAMS, GETH_V1,
 };
 
 fn empty_block(number: u64, hash_byte: u8) -> BlockInput {
@@ -31,7 +31,7 @@ const fn delimiter(number: u64, hash_byte: u8, index: u64) -> LogValueStreamItem
 
 #[test]
 fn nonzero_anchor_reaches_head_across_contiguous_empty_blocks() {
-    let anchor = ValueSpaceAnchor::new(100, B256::repeat_byte(0x64), 42);
+    let anchor = BlockPointer::new(100, B256::repeat_byte(0x64), 42);
     let mut stream = LogValueStream::new(
         DEFAULT_PARAMS,
         anchor,
@@ -59,7 +59,7 @@ fn nonzero_anchor_reaches_head_across_contiguous_empty_blocks() {
 
 #[test]
 fn nonzero_anchor_exhausts_batch_across_contiguous_empty_blocks() {
-    let anchor = ValueSpaceAnchor::new(100, B256::repeat_byte(0x64), 42);
+    let anchor = BlockPointer::new(100, B256::repeat_byte(0x64), 42);
     let mut stream = LogValueStream::new(
         DEFAULT_PARAMS,
         anchor,
@@ -94,7 +94,7 @@ fn nonzero_anchor_exhausts_batch_across_contiguous_empty_blocks() {
 #[test]
 fn single_non_genesis_head_leaves_its_delimiter_pending() {
     let block_hash = B256::repeat_byte(0x64);
-    let anchor = ValueSpaceAnchor::new(100, block_hash, 42);
+    let anchor = BlockPointer::new(100, block_hash, 42);
     let mut stream = LogValueStream::new(
         DEFAULT_PARAMS,
         anchor,
@@ -117,7 +117,7 @@ fn single_non_genesis_head_leaves_its_delimiter_pending() {
 #[test]
 fn genesis_with_no_logs_leaves_its_delimiter_pending() {
     let genesis_hash = B256::repeat_byte(0x11);
-    let anchor = ValueSpaceAnchor::new(0, genesis_hash, 0);
+    let anchor = BlockPointer::new(0, genesis_hash, 0);
     let genesis = BlockInput::new(0, genesis_hash, []);
     let mut stream = LogValueStream::new(
         DEFAULT_PARAMS,
@@ -150,7 +150,7 @@ fn genesis_with_no_logs_leaves_its_delimiter_pending() {
 #[test]
 fn batch_exhaustion_materializes_the_last_delimiter_and_returns_continuation() {
     let genesis_hash = B256::repeat_byte(0x11);
-    let anchor = ValueSpaceAnchor::new(0, genesis_hash, 0);
+    let anchor = BlockPointer::new(0, genesis_hash, 0);
     let genesis = BlockInput::new(0, genesis_hash, []);
     let mut stream = LogValueStream::new(
         DEFAULT_PARAMS,
@@ -201,7 +201,7 @@ fn descending_block_errors_once_then_fuses() {
 }
 
 fn assert_non_contiguous_error(blocks: [BlockInput; 2], actual: u64) {
-    let anchor = ValueSpaceAnchor::new(100, B256::repeat_byte(0x64), 42);
+    let anchor = BlockPointer::new(100, B256::repeat_byte(0x64), 42);
     let mut stream =
         LogValueStream::new(DEFAULT_PARAMS, anchor, blocks, LogValueStreamTermination::ReachedHead);
 
@@ -217,7 +217,7 @@ fn assert_non_contiguous_error(blocks: [BlockInput; 2], actual: u64) {
 
 #[test]
 fn empty_input_errors_once_then_fuses() {
-    let anchor = ValueSpaceAnchor::new(100, B256::repeat_byte(0x64), 42);
+    let anchor = BlockPointer::new(100, B256::repeat_byte(0x64), 42);
     let mut stream =
         LogValueStream::new(DEFAULT_PARAMS, anchor, [], LogValueStreamTermination::ReachedHead);
 
@@ -228,7 +228,7 @@ fn empty_input_errors_once_then_fuses() {
 
 #[test]
 fn delimiter_index_overflow_discards_the_failed_blocks_events() {
-    let anchor = ValueSpaceAnchor::new(100, B256::repeat_byte(0x64), u64::MAX);
+    let anchor = BlockPointer::new(100, B256::repeat_byte(0x64), u64::MAX);
     let mut stream = LogValueStream::new(
         DEFAULT_PARAMS,
         anchor,
@@ -246,7 +246,7 @@ fn delimiter_index_overflow_discards_the_failed_blocks_events() {
 #[test]
 fn maximum_block_number_is_valid_at_canonical_head() {
     let block_hash = B256::repeat_byte(0xff);
-    let anchor = ValueSpaceAnchor::new(u64::MAX, block_hash, 42);
+    let anchor = BlockPointer::new(u64::MAX, block_hash, 42);
     let mut stream = LogValueStream::new(
         DEFAULT_PARAMS,
         anchor,
@@ -270,7 +270,7 @@ fn maximum_block_number_is_valid_at_canonical_head() {
 #[test]
 fn maximum_block_number_at_batch_boundary_errors_once_then_fuses() {
     let block_hash = B256::repeat_byte(0xff);
-    let anchor = ValueSpaceAnchor::new(u64::MAX, block_hash, 42);
+    let anchor = BlockPointer::new(u64::MAX, block_hash, 42);
     let mut stream = LogValueStream::new(
         DEFAULT_PARAMS,
         anchor,
@@ -298,7 +298,7 @@ fn value_space_version_has_a_stable_rejecting_encoding() {
 
 #[test]
 fn an_anchor_block_number_mismatch_errors_once_then_fuses() {
-    let anchor = ValueSpaceAnchor::new(100, B256::repeat_byte(0x64), 42);
+    let anchor = BlockPointer::new(100, B256::repeat_byte(0x64), 42);
     let mut stream = LogValueStream::new(
         DEFAULT_PARAMS,
         anchor,
@@ -316,7 +316,7 @@ fn an_anchor_block_number_mismatch_errors_once_then_fuses() {
 
 #[test]
 fn an_anchor_hash_mismatch_errors_once_then_fuses() {
-    let anchor = ValueSpaceAnchor::new(0, B256::repeat_byte(0x22), 0);
+    let anchor = BlockPointer::new(0, B256::repeat_byte(0x22), 0);
     let genesis = BlockInput::new(0, B256::repeat_byte(0x33), []);
     let mut stream = LogValueStream::new(
         DEFAULT_PARAMS,
@@ -341,7 +341,7 @@ fn batch_lookahead_is_validated_before_the_final_blocks_events() {
     let block_hash = B256::repeat_byte(0x64);
     let mut stream = LogValueStream::new(
         DEFAULT_PARAMS,
-        ValueSpaceAnchor::new(100, block_hash, 42),
+        BlockPointer::new(100, block_hash, 42),
         [BlockInput::new(100, block_hash, [])],
         LogValueStreamTermination::BatchExhausted {
             next_block: BlockNumHash::new(102, B256::repeat_byte(0x66)),

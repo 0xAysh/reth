@@ -1,6 +1,6 @@
 use crate::{
-    coverage::ResumeAnchorMismatch, BatchContinuation, BlockPointer, LogValueStreamError,
-    MapBoundary, Params, PendingDelimiter, ValueSpaceAnchor,
+    BatchContinuation, BlockPointer, LogValueStreamError, MapBoundary, Params, PendingDelimiter,
+    ResumeAnchorMismatch,
 };
 use alloy_primitives::B256;
 
@@ -17,7 +17,7 @@ pub enum RendererError {
     #[error("renderer requires a genesis anchor at block 0, index 0")]
     InvalidGenesisStart {
         /// Configured stream anchor.
-        actual: ValueSpaceAnchor,
+        actual: BlockPointer,
     },
     /// A genesis renderer was given a raw batch continuation.
     #[error("renderer cannot start genesis from a batch continuation")]
@@ -29,9 +29,17 @@ pub enum RendererError {
     #[error("renderer resume stream anchor does not match its map resume anchor")]
     StartAnchorMismatch {
         /// Required stream anchor.
-        expected: ValueSpaceAnchor,
+        expected: BlockPointer,
         /// Configured stream anchor.
-        actual: ValueSpaceAnchor,
+        actual: BlockPointer,
+    },
+    /// A Geth-oracle start passed a previous pointer with an anchor stream, or none with a
+    /// batch-continuation stream. Only the `test-utils` oracle constructor reports it.
+    #[error("oracle start previous pointer {previous:?} does not match the stream start")]
+    OracleStartMismatch {
+        /// Supplied previous pointer; `Some` means the stream starts at an anchor, `None` that it
+        /// continues a batch.
+        previous: Option<BlockPointer>,
     },
     /// A durable renderer resume was attempted from a raw continuation stream.
     #[error("renderer cannot durably resume from a batch-continuation stream")]

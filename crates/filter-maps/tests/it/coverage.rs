@@ -1,36 +1,38 @@
-//! Coverage-contract tests driven by the real log value stream.
+//! Coverage-contract tests driven by the real renderer.
 //!
-//! These tests derive durable anchors from actual stream events and check that the coverage model
+//! These tests publish the renderer's anchored completed maps and check that the coverage model
 //! claims exactly the blocks whose delimiters the stream has materialized inside completed maps.
+//! Coverage evolves the way the store drives it, through publication proposals over structurally
+//! restored coverage, and becomes visible only through canonical activation.
 //! [`RANGE_TEST_PARAMS`] gives one slot per map, so every slot completes a map and every block
 //! with logs spans several maps.
 
-use alloy_primitives::{Address, B256};
+use alloy_primitives::Address;
 use reth_filter_maps::{
     coverage::{
-        CandidateSource, CoverageSet, IndexIdentity, LogQueryTarget, MapResumeAnchor,
-        PlannedSubrange, QueryPlan, SegmentOrigin, STORAGE_FORMAT_V1,
+        CandidateSource, IndexIdentity, LogQueryTarget, PlannedSubrange, PublicationProposal,
+        PublicationStart, QueryPlan, QueryableCoverage, SegmentOrigin,
+        StructurallyRestoredCoverage,
     },
-    BlockInput, BlockPointer, LogInput, LogValueSlot, LogValueStream, LogValueStreamCompletion,
-    LogValueStreamEvent, LogValueStreamItem, LogValueStreamTermination, MapBoundary, ParamsId,
-    ValueSpaceAnchor, GETH_V1, RANGE_TEST_PARAMS,
+    test_utils::{block_hash, empty_coverage, identity},
+    AnchoredCompletedMap, BlockInput, BlockPointer, FilterMapRenderer, IndexedMatchRange, LogInput,
+    LogValueSlot, LogValueStream, LogValueStreamEvent, LogValueStreamItem,
+    LogValueStreamTermination, MapResumeAnchor, ParamsId, RendererCompletion, RendererOutput,
+    RANGE_TEST_PARAMS,
 };
-use std::collections::HashMap;
+use std::{collections::BTreeMap, convert::Infallible};
 
-const fn hash(number: u64) -> B256 {
-    B256::repeat_byte(number as u8 + 1)
-}
+/// Empty head block that follows the bounded batch of [`chain`].
+const HEAD: u64 = 6;
 
-const fn identity() -> IndexIdentity {
-    IndexIdentity::new(STORAGE_FORMAT_V1, 1, hash(0), GETH_V1, ParamsId::RangeTest)
-}
+const IDENTITY: IndexIdentity = identity(ParamsId::RangeTest);
 
 fn block(number: u64, log_count: usize) -> BlockInput {
     // Every log is topic-free: under the range-test parameters a map holds one slot, so a wider log
     // could never fit.
     BlockInput::new(
         number,
-        hash(number),
+        block_hash(number),
         (0..log_count).map(|_| LogInput::new(Address::repeat_byte(number as u8), [])),
     )
 }
@@ -45,98 +47,124 @@ fn chain() -> Vec<BlockInput> {
     vec![block(0, 0), block(1, 1), block(2, 0), block(3, 2), block(4, 3), block(5, 1)]
 }
 
-/// A durable anchor plus the number of block delimiters materialized in maps through its map.
-#[derive(Debug, Clone, Copy)]
-struct Observed {
-    anchor: MapResumeAnchor,
-    delimiters: u64,
+/// Streams `blocks` from `start` as one bounded batch that ends before [`HEAD`].
+fn batch(
+    start: BlockPointer,
+    blocks: Vec<BlockInput>,
+) -> LogValueStream<std::vec::IntoIter<BlockInput>> {
+    let termination = LogValueStreamTermination::BatchExhausted {
+        next_block: alloy_eips::BlockNumHash::new(HEAD, block_hash(HEAD)),
+    };
+    LogValueStream::new(RANGE_TEST_PARAMS, start, blocks, termination)
 }
 
-/// Drives a stream from `anchor` and pairs every boundary with its resume block's pointer.
-fn observe(anchor: ValueSpaceAnchor, blocks: Vec<BlockInput>, next_block: u64) -> Vec<Observed> {
-    let termination = LogValueStreamTermination::BatchExhausted {
-        next_block: alloy_eips::BlockNumHash::new(next_block, hash(next_block)),
-    };
-    let stream = LogValueStream::new(RANGE_TEST_PARAMS, anchor, blocks, termination);
-
-    let mut pointers: HashMap<u64, BlockPointer> = HashMap::new();
-    let mut pending: Option<(MapBoundary, u64)> = None;
-    let mut delimiters = 0;
-    let mut observed = Vec::new();
-    for item in stream {
-        let event = match item.unwrap() {
-            LogValueStreamItem::Event(event) => event,
-            LogValueStreamItem::Complete(LogValueStreamCompletion::BatchExhausted {
-                continuation,
-                ..
-            }) => {
-                // A map completed by the batch's final delimiter names the successor block. Its
-                // pointer is the continuation index: the cursor sits at a map start, where no
-                // padding can precede the next block's first log.
-                if let Some((boundary, count)) = pending.take() {
-                    assert_eq!(boundary.resume_block_number, continuation.next_block.number);
-                    let pointer = BlockPointer::new(
-                        continuation.next_block.number,
-                        continuation.next_block.hash,
-                        continuation.next_log_value_index,
-                    );
-                    let anchor = MapResumeAnchor::new(boundary, pointer).unwrap();
-                    observed.push(Observed { anchor, delimiters: count });
-                }
-                break
+/// Renders the batch, then continues it over the head block.
+///
+/// The map completed by block 5's delimiter names the head as its resume block, so the renderer
+/// anchors it only once the continuation supplies the head's pointer.
+fn render(
+    mut renderer: FilterMapRenderer<std::vec::IntoIter<BlockInput>>,
+) -> Vec<AnchoredCompletedMap> {
+    let mut maps = Vec::new();
+    loop {
+        match renderer.render_next().unwrap().unwrap() {
+            RendererOutput::Map(map) => maps.push(map),
+            RendererOutput::Complete(RendererCompletion::BatchExhausted(continuation)) => {
+                renderer = continuation
+                    .continue_with(vec![block(HEAD, 0)], LogValueStreamTermination::ReachedHead)
+                    .unwrap();
             }
-            LogValueStreamItem::Complete(LogValueStreamCompletion::ReachedHead { .. }) => break,
-        };
-        match event {
-            LogValueStreamEvent::BlockPointer(pointer) => {
-                pointers.insert(pointer.block_number, pointer);
-                if let Some((boundary, count)) = pending.take() {
-                    assert_eq!(boundary.resume_block_number, pointer.block_number);
-                    let anchor = MapResumeAnchor::new(boundary, pointer).unwrap();
-                    observed.push(Observed { anchor, delimiters: count });
-                }
-            }
-            LogValueStreamEvent::Slot(LogValueSlot::BlockDelimiter { .. }) => delimiters += 1,
-            LogValueStreamEvent::Slot(_) => {}
-            LogValueStreamEvent::MapBoundary(boundary) => {
-                match pointers.get(&boundary.resume_block_number) {
-                    Some(&pointer) => {
-                        let anchor = MapResumeAnchor::new(boundary, pointer).unwrap();
-                        observed.push(Observed { anchor, delimiters });
-                    }
-                    None => pending = Some((boundary, delimiters)),
-                }
-            }
+            RendererOutput::Complete(RendererCompletion::ReachedHead { .. }) => return maps,
         }
     }
-    assert!(pending.is_none(), "every boundary must be paired before the batch ends");
-    observed
 }
 
-fn genesis_anchors() -> Vec<Observed> {
-    observe(ValueSpaceAnchor::new(0, hash(0), 0), chain(), 6)
+fn genesis_maps() -> Vec<AnchoredCompletedMap> {
+    let stream = batch(BlockPointer::new(0, block_hash(0), 0), chain());
+    render(FilterMapRenderer::from_genesis(stream).unwrap())
+}
+
+/// Counts the block delimiters the stream materializes in maps through `map_index`.
+fn delimiters_through(map_index: u32) -> u64 {
+    let maps_end = (u64::from(map_index) + 1) * RANGE_TEST_PARAMS.values_per_map();
+    let delimiters = batch(BlockPointer::new(0, block_hash(0), 0), chain()).filter(|item| {
+        matches!(
+            item.as_ref().unwrap(),
+            LogValueStreamItem::Event(LogValueStreamEvent::Slot(
+                LogValueSlot::BlockDelimiter { index, .. }
+            )) if *index < maps_end
+        )
+    });
+    delimiters.count() as u64
+}
+
+/// Returns the coverage after publishing `maps` from `start`.
+fn publish(
+    coverage: &StructurallyRestoredCoverage,
+    start: &PublicationStart,
+    maps: &[AnchoredCompletedMap],
+) -> StructurallyRestoredCoverage {
+    match coverage.propose(start, maps).unwrap() {
+        PublicationProposal::Next { coverage, .. } => coverage,
+        PublicationProposal::AlreadyPublished { .. } => panic!("expected new coverage"),
+    }
+}
+
+/// Activates `coverage` on the fixture chain with the pointers genesis construction stored. A
+/// checkpoint enters the same value space, so those pointers serve every segment.
+fn activate(coverage: &StructurallyRestoredCoverage) -> QueryableCoverage {
+    // Publishing the maps stores every pointer they establish.
+    let pointers = genesis_maps()
+        .iter()
+        .flat_map(AnchoredCompletedMap::established_pointers)
+        .map(|pointer| (pointer.block_number, pointer))
+        .collect::<BTreeMap<_, _>>();
+    coverage
+        .activate(
+            |number| Ok::<_, Infallible>(Some(block_hash(number))),
+            |number| Ok::<_, Infallible>(pointers.get(&number).copied()),
+        )
+        .unwrap()
+}
+
+fn genesis_through(maps: &[AnchoredCompletedMap]) -> StructurallyRestoredCoverage {
+    publish(
+        &empty_coverage(&IDENTITY),
+        &PublicationStart::Open { origin: SegmentOrigin::Genesis },
+        maps,
+    )
 }
 
 fn checkpoint(anchor: MapResumeAnchor) -> SegmentOrigin {
-    let anchors: Vec<_> = genesis_anchors()
-        .into_iter()
-        .map(|observed| observed.anchor)
-        .take_while(|candidate| candidate.completed_map_index <= anchor.completed_map_index)
-        .collect();
-    assert_eq!(anchors.last(), Some(&anchor), "checkpoint must have been observed");
-    let mut source = CoverageSet::new(identity());
-    source.open_segment_batch(SegmentOrigin::Genesis, anchors).unwrap();
-    SegmentOrigin::Checkpoint(source.derived_checkpoint(anchor).unwrap())
+    let maps = genesis_maps();
+    let through = maps
+        .iter()
+        .position(|map| map.resume_anchor() == anchor)
+        .expect("checkpoint must have been rendered");
+    let published = activate(&genesis_through(&maps[..=through]));
+    SegmentOrigin::Checkpoint(published.derived_checkpoint(anchor).unwrap())
+}
+
+/// Returns the position of the map that completes inside block 3, which then still holds slots
+/// beyond that map.
+fn mid_block_3(maps: &[AnchoredCompletedMap]) -> usize {
+    maps.iter()
+        .position(|map| {
+            let anchor = map.resume_anchor();
+            anchor.pointer.block_number == 3 && !anchor.excludes_block(3, &RANGE_TEST_PARAMS)
+        })
+        .expect("a map completes inside block 3")
 }
 
 #[test]
 fn anchors_claim_exactly_the_blocks_whose_delimiters_completed_maps() {
-    let observed = genesis_anchors();
-    assert!(observed.len() > 10, "every slot completes a map under the range-test parameters");
-    for Observed { anchor, delimiters } in observed {
+    let maps = genesis_maps();
+    assert_eq!(maps.len(), 13, "every slot completes a map under the range-test parameters");
+    for map in &maps {
+        let anchor = map.resume_anchor();
         assert_eq!(
             anchor.covered_through(),
-            delimiters.checked_sub(1),
+            delimiters_through(anchor.completed_map_index).checked_sub(1),
             "anchor {anchor:?} claims coverage its maps do not hold"
         );
     }
@@ -144,18 +172,17 @@ fn anchors_claim_exactly_the_blocks_whose_delimiters_completed_maps() {
 
 #[test]
 fn a_block_spanning_maps_is_not_visible_early() {
-    let observed = genesis_anchors();
-    let mut set = CoverageSet::new(identity());
-    let mut previous: Option<MapResumeAnchor> = None;
-    for Observed { anchor, delimiters } in observed {
-        match previous {
-            None => set.open_segment(SegmentOrigin::Genesis, anchor).unwrap(),
-            Some(from) => set.extend(from, anchor).unwrap(),
-        }
-        previous = Some(anchor);
-        for number in 0..=6 {
+    let mut coverage = empty_coverage(&IDENTITY);
+    let mut start = PublicationStart::Open { origin: SegmentOrigin::Genesis };
+    for map in &genesis_maps() {
+        coverage = publish(&coverage, &start, std::slice::from_ref(map));
+        let anchor = map.resume_anchor();
+        start = PublicationStart::Extend { from: anchor };
+        let delimiters = delimiters_through(anchor.completed_map_index);
+        let visible = activate(&coverage);
+        for number in 0..=HEAD {
             assert_eq!(
-                set.covers(number),
+                visible.covers(number),
                 number < delimiters,
                 "after map {}, block {number} visibility is wrong",
                 anchor.completed_map_index
@@ -163,139 +190,123 @@ fn a_block_spanning_maps_is_not_visible_early() {
         }
     }
     // The bounded batch materialized block 5's delimiter, so all six blocks are covered.
-    assert_eq!(set.segments()[0].blocks(), Some(0..=5));
+    assert_eq!(coverage.segments()[0].blocks(), Some(0..=5));
 }
 
 #[test]
 fn a_map_ending_mid_block_does_not_publish_that_block() {
-    let observed = genesis_anchors();
-    // Block 3 has two logs; the map completed by its first address slot resumes at block 3 itself,
-    // which then still holds slots beyond the completed map.
-    let mid_block = observed
-        .iter()
-        .find(|o| {
-            o.anchor.pointer.block_number == 3 && !o.anchor.excludes_block(3, &RANGE_TEST_PARAMS)
-        })
-        .expect("a map completes inside block 3");
-    assert_eq!(mid_block.anchor.completed_map_index, 4);
-    assert_eq!(mid_block.delimiters, 3);
-    let mut set = CoverageSet::new(identity());
-    set.open_segment_batch(
-        SegmentOrigin::Genesis,
-        observed.iter().map(|observed| observed.anchor).take_while(|anchor| {
-            anchor.completed_map_index <= mid_block.anchor.completed_map_index
-        }),
-    )
-    .unwrap();
-    assert_eq!(set.segments()[0].blocks(), Some(0..=2));
-    assert!(!set.covers(3));
-    assert!(!set.segments()[0].terminal().excludes_block(3, &RANGE_TEST_PARAMS));
+    let maps = genesis_maps();
+    let mid_block = mid_block_3(&maps);
+    assert_eq!(maps[mid_block].resume_anchor().completed_map_index, 4);
+    assert_eq!(delimiters_through(4), 3);
+    let coverage = genesis_through(&maps[..=mid_block]);
+    assert_eq!(coverage.segments()[0].blocks(), Some(0..=2));
+    assert!(!activate(&coverage).covers(3));
+    assert!(!coverage.segments()[0].terminal().excludes_block(3, &RANGE_TEST_PARAMS));
 }
 
 #[test]
 fn a_checkpoint_segment_joins_genesis_construction_only_at_the_same_anchor() {
-    let observed = genesis_anchors();
+    let maps = genesis_maps();
     // Checkpoint after map 4, inside block 3, so the join straddles a block.
-    let join_at = observed
-        .iter()
-        .position(|o| {
-            o.anchor.pointer.block_number == 3 && !o.anchor.excludes_block(3, &RANGE_TEST_PARAMS)
-        })
-        .unwrap();
-    let join = observed[join_at].anchor;
+    let join_at = mid_block_3(&maps);
+    let join = maps[join_at].resume_anchor();
     assert_eq!(join.completed_map_index, 4);
 
-    // Construction from the checkpoint reproduces the same anchors as genesis construction, the
-    // join anchor included: the resumed block re-renders its slot in map 4.
-    let from_checkpoint = observe(join.resume_anchor(), chain()[3..].to_vec(), 6);
-    let expected: Vec<_> = observed[join_at..].iter().map(|o| o.anchor).collect();
-    let reproduced: Vec<_> = from_checkpoint.iter().map(|o| o.anchor).collect();
-    assert_eq!(reproduced, expected, "a checkpoint enters the same value space");
-    let genesis_through = |set: &mut CoverageSet, through: usize| {
-        set.open_segment(SegmentOrigin::Genesis, observed[0].anchor).unwrap();
-        for pair in observed[..=through].windows(2) {
-            set.extend(pair[0].anchor, pair[1].anchor).unwrap();
-        }
-    };
+    // Resuming at the checkpoint re-renders block 3's slot in map 4 without publishing it again,
+    // then reproduces exactly the maps genesis construction rendered after the join.
+    let stream = batch(join.pointer, chain()[3..].to_vec());
+    let from_checkpoint = render(FilterMapRenderer::resume(stream, join).unwrap());
+    assert_eq!(from_checkpoint, maps[join_at + 1..], "a checkpoint enters the same value space");
 
-    let mut set = CoverageSet::new(identity());
-    set.open_segment_batch(
-        checkpoint(join),
-        from_checkpoint.iter().skip(1).map(|observed| observed.anchor),
-    )
-    .unwrap();
+    let coverage = publish(
+        &empty_coverage(&IDENTITY),
+        &PublicationStart::Open { origin: checkpoint(join) },
+        &from_checkpoint,
+    );
     // Block 3 straddles the checkpoint map and is excluded until both halves are published.
-    assert_eq!(set.segments()[0].blocks(), Some(4..=5));
-    genesis_through(&mut set, join_at - 1);
-    assert_eq!(set.segments().len(), 2, "not adjacent yet");
-    assert!(!set.covers(3));
+    assert_eq!(coverage.segments()[0].blocks(), Some(4..=5));
+    let coverage = publish(
+        &coverage,
+        &PublicationStart::Open { origin: SegmentOrigin::Genesis },
+        &maps[..join_at],
+    );
+    assert_eq!(coverage.segments().len(), 2, "not adjacent yet");
+    assert!(!activate(&coverage).covers(3));
 
-    set.extend(observed[join_at - 1].anchor, join).unwrap();
-    assert_eq!(set.segments().len(), 1);
-    assert_eq!(set.segments()[0].blocks(), Some(0..=5));
-    assert_eq!(set.segments()[0].origin(), &SegmentOrigin::Genesis);
+    let from = maps[join_at - 1].resume_anchor();
+    let coverage = publish(
+        &coverage,
+        &PublicationStart::Extend { from },
+        std::slice::from_ref(&maps[join_at]),
+    );
+    assert_eq!(coverage.segments().len(), 1);
+    assert_eq!(coverage.segments()[0].blocks(), Some(0..=5));
+    assert_eq!(coverage.segments()[0].origin(), &SegmentOrigin::Genesis);
+    assert!(activate(&coverage).covers(3));
 }
 
 #[test]
 fn reorg_contracts_to_a_map_that_excludes_the_changed_block_and_retention_hides_the_tail() {
-    let observed = genesis_anchors();
-    let mut set = CoverageSet::new(identity());
-    set.open_segment(SegmentOrigin::Genesis, observed[0].anchor).unwrap();
-    for pair in observed.windows(2) {
-        set.extend(pair[0].anchor, pair[1].anchor).unwrap();
-    }
-    assert_eq!(set.segments()[0].blocks(), Some(0..=5));
+    let maps = genesis_maps();
+    let anchors = maps.iter().map(AnchoredCompletedMap::resume_anchor).collect::<Vec<_>>();
+    let coverage = genesis_through(&maps);
+    assert_eq!(coverage.segments()[0].blocks(), Some(0..=5));
 
     // Block 4 changed. Anchors resuming inside block 4 are unsafe; the last anchor whose maps hold
     // only earlier blocks is the one to contract to.
-    let safe = observed
+    let safe = anchors
         .iter()
         .rev()
-        .map(|o| o.anchor)
+        .copied()
         .find(|anchor| anchor.excludes_block(4, &RANGE_TEST_PARAMS))
         .unwrap();
     assert_eq!(safe.pointer.block_number, 4, "block 4's first map begins right after it");
-    let unsafe_anchor = observed
+    let unsafe_anchor = anchors
         .iter()
-        .map(|o| o.anchor)
-        .find(|a| a.completed_map_index > safe.completed_map_index)
+        .copied()
+        .find(|anchor| anchor.completed_map_index > safe.completed_map_index)
         .unwrap();
-    assert!(set.contract_for_reorg(4, Some(unsafe_anchor)).is_err());
-    assert_eq!(set.segments()[0].blocks(), Some(0..=5), "rejected contraction changed nothing");
+    assert!(coverage.contract_for_reorg(4, Some(unsafe_anchor)).is_err());
 
-    let outcome = set.contract_for_reorg(4, Some(safe)).unwrap();
+    let (coverage, outcome) = coverage.contract_for_reorg(4, Some(safe)).unwrap();
     assert_eq!(outcome.rebuild_from, Some(safe));
-    assert_eq!(set.segments()[0].blocks(), Some(0..=3));
-    assert!(!set.covers(4));
+    assert_eq!(coverage.segments()[0].blocks(), Some(0..=3));
+    assert!(!activate(&coverage).covers(4));
 
     // Retention: drop everything through the map that ends block 1.
-    let tail = observed.iter().map(|o| o.anchor).find(|a| a.pointer.block_number == 2).unwrap();
-    set.retain_after(tail).unwrap();
-    assert!(!set.covers(1));
-    assert!(set.covers(2));
-    assert_eq!(set.segments()[0].blocks(), Some(2..=3));
+    let tail = anchors.iter().copied().find(|anchor| anchor.pointer.block_number == 2).unwrap();
+    let coverage = coverage.retain_after(tail).unwrap();
+    let visible = activate(&coverage);
+    assert!(!visible.covers(1));
+    assert!(visible.covers(2));
+    assert_eq!(coverage.segments()[0].blocks(), Some(2..=3));
 }
 
 #[test]
-fn query_plan_partitions_around_the_published_segments() {
-    let observed = genesis_anchors();
-    let mut set = CoverageSet::new(identity());
-    let end = observed.iter().find(|o| o.delimiters == 4).unwrap().anchor;
-    set.open_segment_batch(
-        SegmentOrigin::Genesis,
-        observed
-            .iter()
-            .map(|observed| observed.anchor)
-            .take_while(|anchor| anchor.completed_map_index <= end.completed_map_index),
-    )
-    .unwrap();
-    assert_eq!(set.segments()[0].blocks(), Some(0..=3));
+fn query_plan_partitions_around_canonically_activated_segments() {
+    let maps = genesis_maps();
+    let end = maps
+        .iter()
+        .position(|map| delimiters_through(map.resume_anchor().completed_map_index) == 4)
+        .unwrap();
+    let end_map = maps[end].resume_anchor().completed_map_index;
+    let queryable = activate(&genesis_through(&maps[..=end]));
+    assert_eq!(queryable.segments()[0].blocks(), Some(0..=3));
 
-    let plan =
-        QueryPlan::new(LogQueryTarget::Range { from: 2, to: 5 }, true, &set, "head-a").unwrap();
+    let plan = QueryPlan::new(LogQueryTarget::Range { from: 2, to: 5 }, true, &queryable, "head-a")
+        .unwrap();
     let CandidateSource::Partitioned(subranges) = plan.source() else { panic!() };
-    assert_eq!(subranges.len(), 2);
-    assert!(matches!(&subranges[0], PlannedSubrange::Indexed { blocks, .. } if *blocks == (2..=3)));
-    assert_eq!(subranges[1], PlannedSubrange::Bloom { blocks: 4..=5 });
+    assert_eq!(
+        subranges,
+        &[
+            PlannedSubrange::Indexed(IndexedMatchRange::new(
+                2..=3,
+                0..=end_map,
+                ParamsId::RangeTest
+            )),
+            PlannedSubrange::Bloom { blocks: 4..=5 },
+        ]
+    );
     assert!(plan.revalidate(&"head-b").is_err());
 }

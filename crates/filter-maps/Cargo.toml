@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description = "Value-space and mapping primitives for the FilterMaps local search index"
+description = "Storage-independent FilterMaps domain model, renderer, and candidate matcher"
 
 [lints]
 workspace = true
@@ -21,3 +21,13 @@ sha2.workspace = true
 
 # misc
 thiserror.workspace = true
+
+# test-utils
+reth-filter-maps-test-utils = { workspace = true, optional = true }
+
+[dev-dependencies]
+reth-filter-maps = { workspace = true, features = ["test-utils"] }
+reth-filter-maps-test-utils.workspace = true
+
+[features]
+test-utils = ["dep:reth-filter-maps-test-utils", "reth-filter-maps/test-utils"]

@@ -3,9 +3,9 @@
 use alloy_eips::BlockNumHash;
 use alloy_primitives::{address, b256};
 use reth_filter_maps::{
-    BlockInput, LogInput, LogValueSlot, LogValueStream, LogValueStreamError, LogValueStreamEvent,
-    LogValueStreamItem, LogValueStreamTermination, MapBoundary, ValueSpaceAnchor, DEFAULT_PARAMS,
-    RANGE_TEST_PARAMS,
+    BlockInput, BlockPointer, LogInput, LogValueSlot, LogValueStream, LogValueStreamError,
+    LogValueStreamEvent, LogValueStreamItem, LogValueStreamTermination, MapBoundary,
+    DEFAULT_PARAMS, RANGE_TEST_PARAMS,
 };
 
 const BLOCK_10_HASH: alloy_primitives::B256 =
@@ -32,7 +32,7 @@ fn searchable_value_completes_the_absolute_map_before_head_completion() {
     let values_per_map = DEFAULT_PARAMS.values_per_map();
     let index = values_per_map * 2 - 1;
     let block = BlockInput::new(10, BLOCK_10_HASH, [log(0)]);
-    let anchor = ValueSpaceAnchor::new(10, BLOCK_10_HASH, index);
+    let anchor = BlockPointer::new(10, BLOCK_10_HASH, index);
 
     let items = LogValueStream::new(
         DEFAULT_PARAMS,
@@ -60,7 +60,7 @@ fn partial_map_and_pending_delimiter_at_a_new_map_emit_no_boundary() {
     let partial_block = BlockInput::new(10, BLOCK_10_HASH, [log(0)]);
     let partial = LogValueStream::new(
         DEFAULT_PARAMS,
-        ValueSpaceAnchor::new(10, BLOCK_10_HASH, 100),
+        BlockPointer::new(10, BLOCK_10_HASH, 100),
         [partial_block],
         LogValueStreamTermination::ReachedHead,
     )
@@ -72,7 +72,7 @@ fn partial_map_and_pending_delimiter_at_a_new_map_emit_no_boundary() {
     let empty_head = BlockInput::new(10, BLOCK_10_HASH, []);
     let pending_at_boundary = LogValueStream::new(
         DEFAULT_PARAMS,
-        ValueSpaceAnchor::new(10, BLOCK_10_HASH, boundary_index),
+        BlockPointer::new(10, BLOCK_10_HASH, boundary_index),
         [empty_head],
         LogValueStreamTermination::ReachedHead,
     )
@@ -87,7 +87,7 @@ fn delimiter_can_complete_a_map() {
     let block = BlockInput::new(10, BLOCK_10_HASH, []);
     let items = LogValueStream::new(
         DEFAULT_PARAMS,
-        ValueSpaceAnchor::new(10, BLOCK_10_HASH, index),
+        BlockPointer::new(10, BLOCK_10_HASH, index),
         [block],
         LogValueStreamTermination::BatchExhausted {
             next_block: BlockNumHash::new(11, BLOCK_11_HASH),
@@ -114,7 +114,7 @@ fn padding_before_a_new_block_uses_that_block_as_resume_anchor() {
         [BlockInput::new(10, BLOCK_10_HASH, []), BlockInput::new(11, BLOCK_11_HASH, [log(1)])];
     let items = LogValueStream::new(
         DEFAULT_PARAMS,
-        ValueSpaceAnchor::new(10, BLOCK_10_HASH, first_index),
+        BlockPointer::new(10, BLOCK_10_HASH, first_index),
         blocks,
         LogValueStreamTermination::ReachedHead,
     )
@@ -141,7 +141,7 @@ fn one_block_can_complete_multiple_maps_exactly_once_each() {
     let block = BlockInput::new(10, BLOCK_10_HASH, [log(0), log(0), log(0)]);
     let items = LogValueStream::new(
         RANGE_TEST_PARAMS,
-        ValueSpaceAnchor::new(10, BLOCK_10_HASH, 5),
+        BlockPointer::new(10, BLOCK_10_HASH, 5),
         [block],
         LogValueStreamTermination::ReachedHead,
     )
@@ -166,7 +166,7 @@ fn map_index_overflow_is_typed_block_atomic_and_fuses() {
     let block = BlockInput::new(10, BLOCK_10_HASH, [log(0)]);
     let mut stream = LogValueStream::new(
         DEFAULT_PARAMS,
-        ValueSpaceAnchor::new(10, BLOCK_10_HASH, index),
+        BlockPointer::new(10, BLOCK_10_HASH, index),
         [block],
         LogValueStreamTermination::ReachedHead,
     );

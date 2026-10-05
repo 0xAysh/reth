@@ -1,10 +1,31 @@
 //! Query partitioning into indexed and bloom subranges.
 
-use crate::{coverage::CoverageSet, ParamsId};
+use crate::{coverage::QueryableCoverage, IndexedMatchRange};
 use alloy_primitives::B256;
 use std::ops::RangeInclusive;
 
 /// An immutable query partition paired with its canonical-state token.
+///
+/// Plans are made only from canonically activated coverage:
+///
+/// ```
+/// use reth_filter_maps::coverage::{LogQueryTarget, QueryPlan, QueryableCoverage};
+///
+/// fn plan(coverage: &QueryableCoverage) {
+///     let _ = QueryPlan::new(LogQueryTarget::Range { from: 0, to: 9 }, true, coverage, ());
+/// }
+/// ```
+///
+/// Structurally restored coverage has not been checked against the current chain, so it cannot
+/// route a query to the matcher:
+///
+/// ```compile_fail,E0308
+/// use reth_filter_maps::coverage::{LogQueryTarget, QueryPlan, StructurallyRestoredCoverage};
+///
+/// fn plan(coverage: &StructurallyRestoredCoverage) {
+///     let _ = QueryPlan::new(LogQueryTarget::Range { from: 0, to: 9 }, true, coverage, ());
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryPlan<G> {
     generation: G,
@@ -14,15 +35,17 @@ pub struct QueryPlan<G> {
 impl<G> QueryPlan<G> {
     /// Plans `target` against `coverage` as observed under canonical `generation`.
     ///
+    /// Only [`QueryableCoverage`] can back indexed subranges, so a plan cannot route a query to
+    /// coverage that has not passed canonical activation.
+    ///
     /// `has_searchable_values` says whether the filter carries any address or topic value that
     /// can be looked up. Wildcard-only topic positions are not searchable, so every block in the
     /// range is a candidate. That is a planner decision, never an empty matcher result. A
-    /// block-hash query already knows its one
-    /// candidate and does not consult coverage at all.
+    /// block-hash query already knows its one candidate and does not consult coverage at all.
     pub fn new(
         target: LogQueryTarget,
         has_searchable_values: bool,
-        coverage: &CoverageSet,
+        coverage: &QueryableCoverage,
         generation: G,
     ) -> Result<Self, PlanError> {
         let source = match target {
@@ -61,7 +84,7 @@ impl<G> QueryPlan<G> {
             return Err(PlanError::NotIndexed { index })
         };
         match subranges.get_mut(index) {
-            Some(subrange @ PlannedSubrange::Indexed { .. }) => {
+            Some(subrange @ PlannedSubrange::Indexed(_)) => {
                 *subrange = PlannedSubrange::Bloom { blocks: subrange.blocks().clone() };
                 Ok(())
             }
@@ -109,15 +132,9 @@ pub enum CandidateSource {
 /// One subrange of a partitioned query and the path assigned to it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlannedSubrange {
-    /// Served by the `FilterMaps` matcher over the supporting maps.
-    Indexed {
-        /// Blocks to search.
-        blocks: RangeInclusive<u64>,
-        /// Maps of the supporting segment; the matcher narrows them with block pointers.
-        maps: RangeInclusive<u32>,
-        /// Parameter identity under which those rows were rendered.
-        params_id: ParamsId,
-    },
+    /// Served by the `FilterMaps` matcher over the supporting segment's maps, which the matcher
+    /// narrows with block pointers.
+    Indexed(IndexedMatchRange),
     /// Served by the existing bloom scan.
     Bloom {
         /// Blocks to scan.
@@ -129,7 +146,8 @@ impl PlannedSubrange {
     /// Returns the blocks this subrange spans.
     pub const fn blocks(&self) -> &RangeInclusive<u64> {
         match self {
-            Self::Indexed { blocks, .. } | Self::Bloom { blocks } => blocks,
+            Self::Indexed(range) => range.blocks(),
+            Self::Bloom { blocks } => blocks,
         }
     }
 }
@@ -158,23 +176,29 @@ pub enum PlanError {
 #[error("canonical chain changed while the query ran")]
 pub struct CanonicalityChanged;
 
-fn partition(blocks: RangeInclusive<u64>, coverage: &CoverageSet) -> Vec<PlannedSubrange> {
+fn partition(blocks: RangeInclusive<u64>, coverage: &QueryableCoverage) -> Vec<PlannedSubrange> {
     let mut subranges = Vec::new();
     let params_id = coverage.identity().params;
     // `None` once the covered ranges have consumed the whole numeric domain. Validated segments
     // cannot reach that far in practice, but the partition must not wrap if one ever did.
     let mut next = Some(*blocks.start());
-    for covered in coverage.intersect(blocks.clone()) {
-        let start = next.expect("covered ranges are disjoint and ascending");
-        if *covered.blocks.start() > start {
-            subranges.push(PlannedSubrange::Bloom { blocks: start..=covered.blocks.start() - 1 });
+    for segment in coverage.segments() {
+        let Some(covered) = segment.blocks() else { continue };
+        let first = *covered.start().max(blocks.start());
+        let last = *covered.end().min(blocks.end());
+        if first > last {
+            continue
         }
-        next = covered.blocks.end().checked_add(1);
-        subranges.push(PlannedSubrange::Indexed {
-            blocks: covered.blocks,
-            maps: covered.maps,
+        let start = next.expect("segments are disjoint and ascending");
+        if first > start {
+            subranges.push(PlannedSubrange::Bloom { blocks: start..=first - 1 });
+        }
+        next = last.checked_add(1);
+        subranges.push(PlannedSubrange::Indexed(IndexedMatchRange::new(
+            first..=last,
+            segment.maps(),
             params_id,
-        });
+        )));
     }
     if let Some(start) = next &&
         start <= *blocks.end()
@@ -187,19 +211,22 @@ fn partition(blocks: RangeInclusive<u64>, coverage: &CoverageSet) -> Vec<Planned
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::coverage::{test_utils::*, SegmentOrigin, VerifiedCheckpoint};
+    use crate::{
+        coverage::{test_utils::*, CoverageSet, SegmentOrigin},
+        ParamsId,
+    };
 
     /// Blocks 0..=19 over maps 0..=1 and blocks 100..=129 over maps 10..=12.
-    fn coverage() -> CoverageSet {
-        let mut set = CoverageSet::new(identity());
+    fn coverage() -> QueryableCoverage {
+        let mut set = CoverageSet::new(identity(PARAMS));
         set.open_segment_batch(SegmentOrigin::Genesis, anchors_through(0, aligned(1, 20))).unwrap();
-        let checkpoint = VerifiedCheckpoint::derived(identity(), aligned(9, 100));
-        set.open_segment_batch(
-            SegmentOrigin::Checkpoint(checkpoint),
-            anchors_through(10, aligned(12, 130)),
-        )
-        .unwrap();
-        set
+        set.open_segment_batch(checkpoint(aligned(9, 100)), anchors_through(10, aligned(12, 130)))
+            .unwrap();
+        queryable(&set)
+    }
+
+    fn indexed(blocks: RangeInclusive<u64>, maps: RangeInclusive<u32>) -> PlannedSubrange {
+        PlannedSubrange::Indexed(IndexedMatchRange::new(blocks, maps, ParamsId::Default))
     }
 
     fn partitioned(from: u64, to: u64) -> Vec<PlannedSubrange> {
@@ -213,14 +240,7 @@ mod tests {
 
     #[test]
     fn wholly_indexed_range_uses_the_matcher_only() {
-        assert_eq!(
-            partitioned(5, 15),
-            vec![PlannedSubrange::Indexed {
-                blocks: 5..=15,
-                maps: 0..=1,
-                params_id: ParamsId::Default,
-            }]
-        );
+        assert_eq!(partitioned(5, 15), vec![indexed(5..=15, 0..=1)]);
     }
 
     #[test]
@@ -233,17 +253,9 @@ mod tests {
         assert_eq!(
             partitioned(10, 140),
             vec![
-                PlannedSubrange::Indexed {
-                    blocks: 10..=19,
-                    maps: 0..=1,
-                    params_id: ParamsId::Default,
-                },
+                indexed(10..=19, 0..=1),
                 PlannedSubrange::Bloom { blocks: 20..=99 },
-                PlannedSubrange::Indexed {
-                    blocks: 100..=129,
-                    maps: 10..=12,
-                    params_id: ParamsId::Default,
-                },
+                indexed(100..=129, 10..=12),
                 PlannedSubrange::Bloom { blocks: 130..=140 },
             ]
         );
@@ -260,8 +272,9 @@ mod tests {
     #[test]
     fn block_hash_query_bypasses_coverage() {
         let plan =
-            QueryPlan::new(LogQueryTarget::BlockHash(hash(7)), true, &coverage(), 0u64).unwrap();
-        assert_eq!(plan.source(), &CandidateSource::ResolveBlockHash(hash(7)));
+            QueryPlan::new(LogQueryTarget::BlockHash(block_hash(7)), true, &coverage(), 0u64)
+                .unwrap();
+        assert_eq!(plan.source(), &CandidateSource::ResolveBlockHash(block_hash(7)));
     }
 
     #[test]

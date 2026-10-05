@@ -2,89 +2,59 @@
 
 use crate::{
     coverage::{
-        IdentityMismatch, IndexIdentity, MapResumeAnchor, SegmentError, SegmentOrigin,
-        ValidatedSegment, VerifiedCheckpoint,
+        IdentityMismatch, IndexIdentity, SegmentError, SegmentOrigin, ValidatedSegment,
+        VerifiedCheckpoint,
     },
-    Params,
+    MapResumeAnchor, Params, ParamsId,
 };
-use std::ops::RangeInclusive;
 
 /// Ordered, disjoint validated segments under one index identity.
+///
+/// This is the logical validity model behind [`StructurallyRestoredCoverage`] and
+/// [`QueryableCoverage`]. It stays private to the crate so coverage can only enter those states
+/// through restoration and activation, never by assembling segments directly.
+///
+/// [`StructurallyRestoredCoverage`]: crate::coverage::StructurallyRestoredCoverage
+/// [`QueryableCoverage`]: crate::coverage::QueryableCoverage
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CoverageSet {
+pub(crate) struct CoverageSet {
     identity: IndexIdentity,
     segments: Vec<ValidatedSegment>,
 }
 
 impl CoverageSet {
     /// Creates empty coverage under `identity`.
-    pub const fn new(identity: IndexIdentity) -> Self {
+    pub(crate) const fn new(identity: IndexIdentity) -> Self {
         Self { identity, segments: Vec::new() }
     }
 
-    /// Restores coverage after validating its identity and segment ordering.
-    pub fn restore(
-        running: &IndexIdentity,
-        stored: IndexIdentity,
-        segments: impl IntoIterator<Item = ValidatedSegment>,
-    ) -> Result<Self, RestoreError> {
-        running.check_compatible(&stored)?;
-        let mut set = Self::new(stored);
-        for segment in segments {
-            set.insert(segment)?;
-        }
-        Ok(set)
-    }
-
     /// Returns the identity all segments are bound to.
-    pub const fn identity(&self) -> &IndexIdentity {
+    pub(crate) const fn identity(&self) -> &IndexIdentity {
         &self.identity
     }
 
     /// Returns the parameter set all segments were rendered with.
-    pub const fn params(&self) -> Params {
+    pub(crate) const fn params(&self) -> Params {
         self.identity.params.params()
     }
 
     /// Returns the validated segments in ascending order.
-    pub fn segments(&self) -> &[ValidatedSegment] {
+    pub(crate) fn segments(&self) -> &[ValidatedSegment] {
         &self.segments
     }
 
     /// Returns whether `block_number` is queryable through any segment.
-    pub fn covers(&self, block_number: u64) -> bool {
+    pub(crate) fn covers(&self, block_number: u64) -> bool {
         self.segment_covering(block_number).is_some()
     }
 
     /// Returns the segment through which `block_number` is queryable.
-    pub fn segment_covering(&self, block_number: u64) -> Option<&ValidatedSegment> {
+    pub(crate) fn segment_covering(&self, block_number: u64) -> Option<&ValidatedSegment> {
         self.segments.iter().find(|segment| segment.covers(block_number))
     }
 
-    /// Returns covered parts of `blocks` and their supporting maps in ascending order.
-    pub fn intersect(&self, blocks: RangeInclusive<u64>) -> Vec<CoveredRange> {
-        self.segments
-            .iter()
-            .filter_map(|segment| {
-                let covered = segment.blocks()?;
-                let start = *covered.start().max(blocks.start());
-                let end = *covered.end().min(blocks.end());
-                (start <= end).then(|| CoveredRange { blocks: start..=end, maps: segment.maps() })
-            })
-            .collect()
-    }
-
-    /// Publishes a new segment from a trusted origin and one completed-map anchor.
-    pub fn open_segment(
-        &mut self,
-        origin: SegmentOrigin,
-        anchor: MapResumeAnchor,
-    ) -> Result<(), PublishError> {
-        self.open_segment_batch(origin, [anchor])
-    }
-
     /// Publishes a new segment from a trusted origin and every completed-map anchor.
-    pub fn open_segment_batch(
+    pub(crate) fn open_segment_batch(
         &mut self,
         origin: SegmentOrigin,
         anchors: impl IntoIterator<Item = MapResumeAnchor>,
@@ -94,7 +64,7 @@ impl CoverageSet {
     }
 
     /// Returns a checkpoint derived from an anchor published by this set.
-    pub fn derived_checkpoint(
+    pub(crate) fn derived_checkpoint(
         &self,
         anchor: MapResumeAnchor,
     ) -> Result<VerifiedCheckpoint, PublishError> {
@@ -105,17 +75,8 @@ impl CoverageSet {
         }
     }
 
-    /// Extends the segment ending at `from` through one completed-map anchor.
-    pub fn extend(
-        &mut self,
-        from: MapResumeAnchor,
-        anchor: MapResumeAnchor,
-    ) -> Result<(), PublishError> {
-        self.extend_batch(from, [anchor])
-    }
-
     /// Extends the segment ending at `from` through every supplied completed-map anchor.
-    pub fn extend_batch(
+    pub(crate) fn extend_batch(
         &mut self,
         from: MapResumeAnchor,
         anchors: impl IntoIterator<Item = MapResumeAnchor>,
@@ -138,7 +99,7 @@ impl CoverageSet {
     ///
     /// A missing safe anchor disables the affected segment. Rows become visible again only after
     /// the contaminated map has been rebuilt and republished.
-    pub fn contract_for_reorg(
+    pub(crate) fn contract_for_reorg(
         &mut self,
         earliest_changed: u64,
         mut safe_anchor: Option<MapResumeAnchor>,
@@ -185,7 +146,7 @@ impl CoverageSet {
     /// Drops coverage through the published `tail` anchor.
     ///
     /// Physical cleanup is independent; excluded rows are already invisible after this returns.
-    pub fn retain_after(&mut self, tail: MapResumeAnchor) -> Result<(), ContractionError> {
+    pub(crate) fn retain_after(&mut self, tail: MapResumeAnchor) -> Result<(), ContractionError> {
         if !self.segments.iter().any(|segment| segment.contains_anchor(tail)) {
             return Err(SegmentError::AnchorOutsideSegment { anchor: tail }.into())
         }
@@ -205,7 +166,15 @@ impl CoverageSet {
         Ok(())
     }
 
-    fn insert(&mut self, segment: ValidatedSegment) -> Result<(), PublishError> {
+    /// Keeps only the segments `keep` selects, visiting them in ascending order.
+    ///
+    /// Any subset of ordered, disjoint, already merged segments is itself ordered and disjoint,
+    /// and removing segments cannot create a new exact continuation, so no revalidation is needed.
+    pub(super) fn retain_segments(&mut self, keep: impl FnMut(&ValidatedSegment) -> bool) {
+        self.segments.retain(keep);
+    }
+
+    pub(super) fn insert(&mut self, segment: ValidatedSegment) -> Result<(), PublishError> {
         self.identity.check_compatible(segment.identity()).map_err(PublishError::Identity)?;
         let index =
             self.segments.partition_point(|existing| existing.first_map() < segment.first_map());
@@ -239,15 +208,6 @@ impl CoverageSet {
     }
 }
 
-/// A covered block subrange and the maps that support it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CoveredRange {
-    /// Queryable blocks.
-    pub blocks: RangeInclusive<u64>,
-    /// Maps of the supporting segment.
-    pub maps: RangeInclusive<u32>,
-}
-
 /// What a reorg contraction removed and where rebuilding resumes.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReorgContraction {
@@ -263,6 +223,31 @@ pub struct ReorgContraction {
 /// Reason a publication was rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum PublishError {
+    /// The publication holds no completed map.
+    #[error("publication holds no completed map")]
+    EmptyPublication,
+    /// A map was rendered under another parameter set than the coverage identity's.
+    #[error("map {map_index} was rendered under {actual:?}, coverage requires {expected:?}")]
+    ParamsMismatch {
+        /// Offending map.
+        map_index: u32,
+        /// Parameter set of the coverage identity.
+        expected: ParamsId,
+        /// Parameter set the map was rendered under.
+        actual: ParamsId,
+    },
+    /// The batch's block pointers disagree, leave a gap, regress, or precede its start.
+    #[error("publication pointer evidence is inconsistent at block {block_number}")]
+    InconsistentPointer {
+        /// First block at which the evidence is inconsistent.
+        block_number: u64,
+    },
+    /// A map is already covered, but the batch is not an exact retry of its publication.
+    #[error("map {map_index} is already covered by a different publication")]
+    AlreadyCovered {
+        /// First already covered map of the batch.
+        map_index: u32,
+    },
     /// The extension does not name any segment's current terminal.
     #[error("no segment ends at anchor {anchor:?}")]
     UnknownAnchor {
@@ -299,17 +284,6 @@ pub enum PublishError {
     /// The segment itself is malformed.
     #[error(transparent)]
     Segment(#[from] SegmentError),
-}
-
-/// Reason stored coverage could not be restored.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum RestoreError {
-    /// The stored identity is incompatible with the running implementation.
-    #[error(transparent)]
-    Identity(#[from] IdentityMismatch),
-    /// The stored segments are malformed or overlap.
-    #[error("stored coverage is corrupt: {0}")]
-    Corrupt(#[from] PublishError),
 }
 
 /// Reason a contraction was rejected. The coverage set is unchanged after any of these.
@@ -360,6 +334,7 @@ fn check_adjacent(left: &ValidatedSegment, right: &ValidatedSegment) -> Result<(
 mod tests {
     use super::*;
     use crate::{coverage::test_utils::*, ParamsId};
+    use std::ops::RangeInclusive;
 
     fn blocks(set: &CoverageSet) -> Vec<Option<RangeInclusive<u64>>> {
         set.segments().iter().map(ValidatedSegment::blocks).collect()
@@ -382,18 +357,9 @@ mod tests {
         set.extend_batch(from, anchors_through(from.completed_map_index + 1, to))
     }
 
-    fn segment_through(
-        identity: &IndexIdentity,
-        origin: SegmentOrigin,
-        terminal: MapResumeAnchor,
-    ) -> Result<ValidatedSegment, SegmentError> {
-        let first_map = origin.anchor().map_or(0, |anchor| anchor.completed_map_index + 1);
-        ValidatedSegment::new_batch(identity, origin, anchors_through(first_map, terminal))
-    }
-
     #[test]
     fn genesis_segment_grows_through_its_terminal_only() {
-        let mut set = CoverageSet::new(identity());
+        let mut set = CoverageSet::new(identity(PARAMS));
         open_through(&mut set, SegmentOrigin::Genesis, aligned(0, 10)).unwrap();
         assert_eq!(blocks(&set), vec![Some(0..=9)]);
 
@@ -410,7 +376,7 @@ mod tests {
 
     #[test]
     fn disjoint_checkpoint_segments_remain_independent() {
-        let mut set = CoverageSet::new(identity());
+        let mut set = CoverageSet::new(identity(PARAMS));
         open_through(&mut set, SegmentOrigin::Genesis, aligned(1, 20)).unwrap();
         open_through(&mut set, checkpoint(aligned(9, 100)), aligned(12, 130)).unwrap();
         assert_eq!(blocks(&set), vec![Some(0..=19), Some(100..=129)]);
@@ -418,19 +384,12 @@ mod tests {
         assert!(!set.covers(20));
         assert!(!set.covers(99));
         assert!(set.covers(100));
-        assert_eq!(
-            set.intersect(10..=110),
-            vec![
-                CoveredRange { blocks: 10..=19, maps: 0..=1 },
-                CoveredRange { blocks: 100..=110, maps: 10..=12 },
-            ]
-        );
     }
 
     #[test]
     fn adjacent_segments_merge_only_under_exact_anchor_continuity() {
         let join = anchor(9, 100, 10 * VPM - 5);
-        let mut set = CoverageSet::new(identity());
+        let mut set = CoverageSet::new(identity(PARAMS));
         open_through(&mut set, SegmentOrigin::Genesis, aligned(1, 20)).unwrap();
         open_through(&mut set, checkpoint(join), aligned(12, 130)).unwrap();
         // Block 100 straddles the join and is not yet covered by either side.
@@ -458,7 +417,7 @@ mod tests {
 
     #[test]
     fn a_new_segment_merges_into_the_one_it_continues() {
-        let mut set = CoverageSet::new(identity());
+        let mut set = CoverageSet::new(identity(PARAMS));
         open_through(&mut set, SegmentOrigin::Genesis, aligned(1, 20)).unwrap();
         open_through(&mut set, checkpoint(aligned(1, 20)), aligned(4, 50)).unwrap();
         assert_eq!(blocks(&set), vec![Some(0..=49)]);
@@ -466,7 +425,7 @@ mod tests {
 
     #[test]
     fn overlapping_publication_is_rejected() {
-        let mut set = CoverageSet::new(identity());
+        let mut set = CoverageSet::new(identity(PARAMS));
         open_through(&mut set, SegmentOrigin::Genesis, aligned(5, 60)).unwrap();
         assert!(matches!(
             open_through(&mut set, checkpoint(aligned(2, 30)), aligned(8, 90)),
@@ -481,8 +440,8 @@ mod tests {
 
     #[test]
     fn checkpoint_for_another_identity_is_rejected() {
-        let mut set = CoverageSet::new(identity());
-        let mut other = identity();
+        let mut set = CoverageSet::new(identity(PARAMS));
+        let mut other = identity(PARAMS);
         other.chain_id = 2;
         let foreign = VerifiedCheckpoint::derived(other, aligned(9, 100));
         assert!(matches!(
@@ -490,7 +449,7 @@ mod tests {
             Err(PublishError::Segment(SegmentError::Identity(_)))
         ));
 
-        other = identity();
+        other = identity(PARAMS);
         other.params = ParamsId::RangeTest;
         let foreign = VerifiedCheckpoint::derived(other, aligned(9, 100));
         assert!(matches!(
@@ -501,7 +460,7 @@ mod tests {
 
     #[test]
     fn reorg_contracts_to_the_preceding_safe_anchor() {
-        let mut set = CoverageSet::new(identity());
+        let mut set = CoverageSet::new(identity(PARAMS));
         let safe = aligned(2, 30);
         open_through(&mut set, SegmentOrigin::Genesis, safe).unwrap();
         extend_through(&mut set, safe, aligned(5, 60)).unwrap();
@@ -517,7 +476,7 @@ mod tests {
 
     #[test]
     fn reorg_rejects_an_anchor_whose_map_holds_the_changed_block() {
-        let mut set = CoverageSet::new(identity());
+        let mut set = CoverageSet::new(identity(PARAMS));
         open_through(&mut set, SegmentOrigin::Genesis, aligned(5, 60)).unwrap();
         let before = set.clone();
 
@@ -539,7 +498,7 @@ mod tests {
 
     #[test]
     fn reorg_without_a_safe_anchor_disables_the_segment() {
-        let mut set = CoverageSet::new(identity());
+        let mut set = CoverageSet::new(identity(PARAMS));
         open_through(&mut set, SegmentOrigin::Genesis, aligned(5, 60)).unwrap();
         let outcome = set.contract_for_reorg(33, None).unwrap();
         assert_eq!(outcome.rebuild_from, None);
@@ -549,7 +508,7 @@ mod tests {
 
     #[test]
     fn reorg_disables_segments_that_lie_beyond_the_change_and_keeps_earlier_ones() {
-        let mut set = CoverageSet::new(identity());
+        let mut set = CoverageSet::new(identity(PARAMS));
         open_through(&mut set, SegmentOrigin::Genesis, aligned(1, 20)).unwrap();
         let second_origin = aligned(9, 100);
         let safe = aligned(10, 110);
@@ -566,7 +525,7 @@ mod tests {
     #[test]
     fn reorg_at_a_checkpoint_segment_origin_removes_it_and_keeps_the_origin() {
         let origin = aligned(9, 100);
-        let mut set = CoverageSet::new(identity());
+        let mut set = CoverageSet::new(identity(PARAMS));
         open_through(&mut set, checkpoint(origin), aligned(12, 130)).unwrap();
         let outcome = set.contract_for_reorg(105, Some(origin)).unwrap();
         assert_eq!(outcome.rebuild_from, Some(origin));
@@ -576,7 +535,7 @@ mod tests {
 
     #[test]
     fn retention_contraction_immediately_removes_visibility() {
-        let mut set = CoverageSet::new(identity());
+        let mut set = CoverageSet::new(identity(PARAMS));
         let tail = anchor(2, 30, 3 * VPM - 1);
         open_through(&mut set, SegmentOrigin::Genesis, tail).unwrap();
         extend_through(&mut set, tail, aligned(5, 60)).unwrap();
@@ -597,7 +556,7 @@ mod tests {
 
     #[test]
     fn retention_rejects_an_anchor_the_set_did_not_publish() {
-        let mut set = CoverageSet::new(identity());
+        let mut set = CoverageSet::new(identity(PARAMS));
         open_through(&mut set, SegmentOrigin::Genesis, aligned(1, 20)).unwrap();
         open_through(&mut set, checkpoint(aligned(9, 100)), aligned(12, 130)).unwrap();
         let before = set.clone();
@@ -616,14 +575,14 @@ mod tests {
         use crate::coverage::BlockReceiptEvidence;
         use alloy_eips::BlockNumHash;
 
-        let mut set = CoverageSet::new(identity());
+        let mut set = CoverageSet::new(identity(PARAMS));
         open_through(&mut set, SegmentOrigin::Genesis, aligned(5, 60)).unwrap();
 
         // Block 60 retained only selected receipts: construction stops before releasing it, so
         // the segment ends at the last safely publishable map.
         let hole = BlockReceiptEvidence {
-            block: BlockNumHash::new(60, hash(60)),
-            canonical_hash: Some(hash(60)),
+            block: BlockNumHash::new(60, block_hash(60)),
+            canonical_hash: Some(block_hash(60)),
             persisted: true,
             transaction_count: 4,
             receipt_count: Some(1),
@@ -644,63 +603,5 @@ mod tests {
         assert_eq!(blocks(&set), vec![Some(0..=59), Some(100..=129)]);
         assert!(!set.covers(60));
         assert!(!set.covers(99));
-    }
-
-    #[test]
-    fn restore_fails_closed_on_identity_mismatch() {
-        let mut stored = identity();
-        stored.params = ParamsId::RangeTest;
-        let segment = ValidatedSegment::new_batch(
-            &stored,
-            SegmentOrigin::Genesis,
-            [anchor(0, 0, 0), anchor(1, 0, 0), anchor(2, 0, 0), anchor(3, 3, 4)],
-        )
-        .unwrap();
-        assert!(matches!(
-            CoverageSet::restore(&identity(), stored, [segment]),
-            Err(RestoreError::Identity(IdentityMismatch::Params { .. }))
-        ));
-    }
-
-    #[test]
-    fn restore_rejects_overlapping_stored_segments() {
-        let first = segment_through(&identity(), SegmentOrigin::Genesis, aligned(5, 60)).unwrap();
-        let second =
-            segment_through(&identity(), checkpoint(aligned(3, 40)), aligned(8, 90)).unwrap();
-        assert!(matches!(
-            CoverageSet::restore(&identity(), identity(), [first, second]),
-            Err(RestoreError::Corrupt(PublishError::BlockOverlap { .. }))
-        ));
-    }
-
-    #[test]
-    fn restore_rejects_a_segment_built_under_another_identity() {
-        let mut foreign = identity();
-        foreign.genesis_hash = hash(99);
-        let segment = segment_through(&foreign, SegmentOrigin::Genesis, aligned(5, 60)).unwrap();
-        assert!(matches!(
-            CoverageSet::restore(&identity(), identity(), [segment]),
-            Err(RestoreError::Corrupt(PublishError::Identity(_)))
-        ));
-    }
-
-    #[test]
-    fn restore_rejects_block_overlap_even_when_maps_are_disjoint() {
-        let first = segment_through(&identity(), SegmentOrigin::Genesis, aligned(1, 100)).unwrap();
-        let second =
-            segment_through(&identity(), checkpoint(aligned(9, 50)), aligned(12, 130)).unwrap();
-        assert!(matches!(
-            CoverageSet::restore(&identity(), identity(), [first, second]),
-            Err(RestoreError::Corrupt(PublishError::BlockOverlap { .. }))
-        ));
-    }
-
-    #[test]
-    fn restore_orders_and_merges_stored_segments() {
-        let later =
-            segment_through(&identity(), checkpoint(aligned(5, 60)), aligned(8, 90)).unwrap();
-        let earlier = segment_through(&identity(), SegmentOrigin::Genesis, aligned(5, 60)).unwrap();
-        let set = CoverageSet::restore(&identity(), identity(), [later, earlier]).unwrap();
-        assert_eq!(blocks(&set), vec![Some(0..=89)]);
     }
 }

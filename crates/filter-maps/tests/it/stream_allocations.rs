@@ -2,8 +2,8 @@
 
 use alloy_primitives::B256;
 use reth_filter_maps::{
-    BlockInput, LogInput, LogValueStream, LogValueStreamEvent, LogValueStreamItem,
-    LogValueStreamTermination, ValueSpaceAnchor, DEFAULT_PARAMS,
+    BlockInput, BlockPointer, LogInput, LogValueStream, LogValueStreamEvent, LogValueStreamItem,
+    LogValueStreamTermination, DEFAULT_PARAMS,
 };
 use std::{
     alloc::{GlobalAlloc, Layout, System},
@@ -59,7 +59,7 @@ fn a_large_block_does_not_allocate_expanded_output() {
     ALLOCATED.with(|count| count.set(Some(0)));
     let mut stream = LogValueStream::new(
         DEFAULT_PARAMS,
-        ValueSpaceAnchor::new(0, B256::ZERO, 0),
+        BlockPointer::new(0, B256::ZERO, 0),
         [input],
         LogValueStreamTermination::ReachedHead,
     );
