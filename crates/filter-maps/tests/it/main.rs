@@ -1,6 +1,7 @@
 //! Root module for filter-map integration tests, so the tests are built into a single binary.
 
 mod boundary_padding;
+mod coverage;
 mod genesis_stream;
 mod golden;
 mod golden_stream;

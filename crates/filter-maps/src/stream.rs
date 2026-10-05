@@ -475,7 +475,7 @@ impl LogInput {
 /// empty. Padding caused by the first log precedes this pointer but uses this block as the
 /// boundary's resume identity. A block pointer is metadata: it does not consume a log value index
 /// and is not a filter-map slot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BlockPointer {
     /// Block number.
     pub block_number: u64,

@@ -264,6 +264,71 @@ pub const RANGE_TEST_PARAMS: Params = Params {
     log_layer_diff: 4,
 };
 
+/// Recognized parameter-set identity.
+///
+/// Published coverage is meaningful only under a recognized parameter set, so persistence and
+/// coverage metadata store this identity rather than the numerical fields of [`Params`]. Decoding
+/// an unrecognized identity fails instead of reinterpreting rows under invented dimensions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum ParamsId {
+    /// [`DEFAULT_PARAMS`], the mainnet parameter set.
+    Default = 1,
+    /// [`RANGE_TEST_PARAMS`], the block-exact test parameter set.
+    RangeTest = 2,
+}
+
+impl ParamsId {
+    /// Returns the recognized parameter set named by this identity.
+    pub const fn params(self) -> Params {
+        match self {
+            Self::Default => DEFAULT_PARAMS,
+            Self::RangeTest => RANGE_TEST_PARAMS,
+        }
+    }
+
+    /// Returns the identity of a recognized parameter set, or `None` for any other field
+    /// combination.
+    pub fn of(params: &Params) -> Option<Self> {
+        [Self::Default, Self::RangeTest].into_iter().find(|id| id.params() == *params)
+    }
+}
+
+impl From<ParamsId> for u8 {
+    fn from(id: ParamsId) -> Self {
+        id as Self
+    }
+}
+
+impl TryFrom<u8> for ParamsId {
+    type Error = UnknownParamsId;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Default),
+            2 => Ok(Self::RangeTest),
+            value => Err(UnknownParamsId(value)),
+        }
+    }
+}
+
+/// Error returned when decoding a persisted parameter-set identity that is not recognized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("unknown parameter-set identity {0}")]
+pub struct UnknownParamsId(u8);
+
+impl UnknownParamsId {
+    /// Creates an unknown-identity error for the rejected encoded value.
+    pub const fn new(value: u8) -> Self {
+        Self(value)
+    }
+
+    /// Returns the rejected encoded value.
+    pub const fn value(self) -> u8 {
+        self.0
+    }
+}
+
 /// Error returned by [`Params::validate`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ParamsError {
@@ -426,6 +491,29 @@ mod tests {
             params.base_row_group_size = size;
             assert_eq!(params.validate(), Err(ParamsError::BaseRowGroupSizeNotPowerOfTwo(size)));
         }
+    }
+
+    #[test]
+    fn params_id_round_trips_through_its_encoding() {
+        for id in [ParamsId::Default, ParamsId::RangeTest] {
+            assert_eq!(ParamsId::try_from(u8::from(id)), Ok(id));
+            assert_eq!(ParamsId::of(&id.params()), Some(id));
+        }
+    }
+
+    #[test]
+    fn params_id_rejects_unrecognized_encodings() {
+        for value in [0, 3, u8::MAX] {
+            assert_eq!(ParamsId::try_from(value), Err(UnknownParamsId(value)));
+        }
+    }
+
+    #[test]
+    fn arbitrary_params_have_no_identity() {
+        let mut params = DEFAULT_PARAMS;
+        params.log_maps_per_epoch = 9;
+        assert_eq!(params.validate(), Ok(()), "still passes Geth's sanitize checks");
+        assert_eq!(ParamsId::of(&params), None, "but is not a recognized parameter set");
     }
 
     #[test]
