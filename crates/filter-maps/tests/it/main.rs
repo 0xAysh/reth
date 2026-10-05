@@ -3,6 +3,7 @@
 mod boundary_padding;
 mod genesis_stream;
 mod golden;
+mod golden_stream;
 mod log_values;
 mod map_boundaries;
 mod resume_anchors;

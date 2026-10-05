@@ -3,9 +3,9 @@
 use alloy_eips::BlockNumHash;
 use alloy_primitives::B256;
 use reth_filter_maps::{
-    BatchContinuation, BlockInput, LogInput, LogValueStream, LogValueStreamError,
-    LogValueStreamEvent, LogValueStreamItem, LogValueStreamTermination, ValueSpaceAnchor,
-    DEFAULT_PARAMS, RANGE_TEST_PARAMS,
+    BatchContinuation, BlockInput, LogInput, LogValueSlot, LogValueStream,
+    LogValueStreamCompletion, LogValueStreamError, LogValueStreamEvent, LogValueStreamItem,
+    LogValueStreamTermination, ValueSpaceAnchor, DEFAULT_PARAMS, RANGE_TEST_PARAMS,
 };
 use std::cell::Cell;
 
@@ -34,6 +34,96 @@ fn block(number: u64, topics: usize) -> BlockInput {
         B256::ZERO,
         [LogInput::new(Default::default(), vec![B256::ZERO; topics])],
     )
+}
+
+fn composition_block(number: u64, topics: usize) -> BlockInput {
+    BlockInput::new(
+        number,
+        B256::repeat_byte(number as u8),
+        [LogInput::new(Default::default(), vec![B256::repeat_byte(0xaa); topics])],
+    )
+}
+
+fn three_batch_output(anchor: ValueSpaceAnchor, blocks: &[BlockInput]) -> Vec<LogValueStreamItem> {
+    assert_eq!(blocks.len(), 3);
+    let mut output = Vec::new();
+    let mut continuation = None;
+
+    for (index, block) in blocks.iter().cloned().enumerate() {
+        let final_batch = index == blocks.len() - 1;
+        let termination = if final_batch {
+            LogValueStreamTermination::ReachedHead
+        } else {
+            let next = &blocks[index + 1];
+            LogValueStreamTermination::BatchExhausted {
+                next_block: BlockNumHash::new(next.number, next.hash),
+            }
+        };
+        let stream = if let Some(continuation) = continuation {
+            LogValueStream::continue_from(DEFAULT_PARAMS, continuation, [block], termination)
+        } else {
+            LogValueStream::new(DEFAULT_PARAMS, anchor, [block], termination)
+        };
+        let mut batch = stream.collect::<Result<Vec<_>, _>>().unwrap();
+        if final_batch {
+            output.extend(batch);
+            continue
+        }
+        let Some(LogValueStreamItem::Complete(LogValueStreamCompletion::BatchExhausted {
+            continuation: next,
+            ..
+        })) = batch.pop()
+        else {
+            panic!("intermediate batch must return a continuation")
+        };
+        continuation = Some(next);
+        output.extend(batch);
+    }
+
+    output
+}
+
+#[test]
+fn three_bounded_batches_equal_uninterrupted_traversal_across_boundary_kinds() {
+    let values_per_map = DEFAULT_PARAMS.values_per_map();
+    let cases = [
+        (values_per_map - 1, [0, 0, 0], "searchable"),
+        (values_per_map - 2, [0, 0, 0], "delimiter"),
+        (values_per_map - 3, [0, 2, 0], "padding"),
+    ];
+
+    for (start, topic_counts, boundary_kind) in cases {
+        let blocks = topic_counts
+            .into_iter()
+            .enumerate()
+            .map(|(offset, topics)| composition_block(10 + offset as u64, topics))
+            .collect::<Vec<_>>();
+        let anchor = ValueSpaceAnchor::new(blocks[0].number, blocks[0].hash, start);
+        let uninterrupted = LogValueStream::new(
+            DEFAULT_PARAMS,
+            anchor,
+            blocks.clone(),
+            LogValueStreamTermination::ReachedHead,
+        )
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+        let has_expected_boundary = uninterrupted.windows(2).any(|items| {
+            let [LogValueStreamItem::Event(LogValueStreamEvent::Slot(slot)),
+                LogValueStreamItem::Event(LogValueStreamEvent::MapBoundary(_))] = items
+            else {
+                return false
+            };
+            matches!(
+                (boundary_kind, slot),
+                ("searchable", LogValueSlot::Value { .. }) |
+                    ("delimiter", LogValueSlot::BlockDelimiter { .. }) |
+                    ("padding", LogValueSlot::Padding { .. })
+            )
+        });
+        assert!(has_expected_boundary, "missing {boundary_kind}-completed map");
+        assert_eq!(three_batch_output(anchor, &blocks), uninterrupted, "{boundary_kind}");
+    }
 }
 
 #[test]
