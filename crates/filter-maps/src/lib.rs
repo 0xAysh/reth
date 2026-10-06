@@ -17,9 +17,11 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+// The renderer that drives the iterator and the rows below is rebuilt on the lean core next.
+#[allow(dead_code)]
+mod iter;
 mod matcher;
 mod params;
-// The renderer that drives these rows is rebuilt on the lean core next.
 #[allow(dead_code)]
 mod renderer {
     pub(crate) mod rows;
