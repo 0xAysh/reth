@@ -30,6 +30,8 @@ mod render;
 mod store;
 #[cfg(test)]
 mod test_utils;
+#[cfg(test)]
+mod tests;
 mod value;
 
 pub use indexer::Indexer;

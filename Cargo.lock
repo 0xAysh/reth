@@ -9183,6 +9183,7 @@ dependencies = [
  "alloy-consensus",
  "alloy-primitives",
  "metrics",
+ "proptest",
  "reth-chain-state",
  "reth-ethereum-primitives",
  "reth-filter-maps-test-utils",

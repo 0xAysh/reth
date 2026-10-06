@@ -42,4 +42,5 @@ tracing.workspace = true
 reth-ethereum-primitives.workspace = true
 reth-filter-maps-test-utils.workspace = true
 reth-provider = { workspace = true, features = ["test-utils"] }
+proptest.workspace = true
 tempfile.workspace = true
