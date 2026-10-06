@@ -5,22 +5,20 @@
 //! subrange, and resolves them to blocks through explicit block-pointer lookups. Results are
 //! candidates only: receipt loading and exact log filtering remain authoritative.
 
-use crate::{address_value, topic_value, Params, ParamsId};
+use crate::{address_value, topic_value, Params, DEFAULT_PARAMS};
 use alloy_primitives::{Address, B256};
 use std::{collections::BTreeMap, error::Error, ops::RangeInclusive};
 
-/// Pure candidate matcher owning one logical source and its pinned identity.
+/// Pure candidate matcher owning one logical source.
 #[derive(Debug)]
 pub struct FilterMapMatcher<S> {
     source: S,
-    pinned_params_id: ParamsId,
 }
 
 impl<S: FilterMapMatchSource> FilterMapMatcher<S> {
-    /// Pins source metadata without performing a fallible row or pointer read.
-    pub fn new(source: S) -> Self {
-        let pinned_params_id = source.params_id();
-        Self { source, pinned_params_id }
+    /// Wraps a source without performing a fallible row or pointer read.
+    pub const fn new(source: S) -> Self {
+        Self { source }
     }
 
     /// Matches one already-planned indexed subrange atomically.
@@ -31,16 +29,6 @@ impl<S: FilterMapMatchSource> FilterMapMatcher<S> {
     ) -> Result<CandidateSet, MatcherError<S::Error>> {
         if !pattern.has_searchable_values() {
             return Err(MatcherError::NoSearchableValues)
-        }
-        if range.params_id != self.pinned_params_id {
-            return Err(MatcherError::ParamsMismatch {
-                planned: range.params_id,
-                source_params: self.pinned_params_id,
-            })
-        }
-        let actual = self.source.params_id();
-        if actual != self.pinned_params_id {
-            return Err(MatcherError::SourceParamsChanged { pinned: self.pinned_params_id, actual })
         }
         let first_block = *range.blocks.start();
         let last_block = *range.blocks.end();
@@ -74,7 +62,7 @@ impl<S: FilterMapMatchSource> FilterMapMatcher<S> {
                 after: after_index,
             })
         }
-        let params = self.pinned_params_id.params();
+        let params = DEFAULT_PARAMS;
         let required_first_u64 = first_index / params.values_per_map();
         let required_last_u64 = last_index / params.values_per_map();
         let required_first = u32::try_from(required_first_u64)
@@ -403,25 +391,17 @@ pub enum PatternError {
     },
 }
 
-/// One planner-normalized indexed subrange and the maps that support its validated segment.
-///
-/// [`QueryPlan`](crate::coverage::QueryPlan) emits these for the parts of a query that queryable
-/// coverage supports.
+/// One indexed subrange and the maps that support it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IndexedMatchRange {
     blocks: RangeInclusive<u64>,
     supporting_maps: RangeInclusive<u32>,
-    params_id: ParamsId,
 }
 
 impl IndexedMatchRange {
     /// Creates a matcher input. Semantic range validation occurs in `match_subrange`.
-    pub const fn new(
-        blocks: RangeInclusive<u64>,
-        supporting_maps: RangeInclusive<u32>,
-        params_id: ParamsId,
-    ) -> Self {
-        Self { blocks, supporting_maps, params_id }
+    pub const fn new(blocks: RangeInclusive<u64>, supporting_maps: RangeInclusive<u32>) -> Self {
+        Self { blocks, supporting_maps }
     }
 
     /// Returns the exact block interval to search.
@@ -433,20 +413,12 @@ impl IndexedMatchRange {
     pub const fn supporting_maps(&self) -> &RangeInclusive<u32> {
         &self.supporting_maps
     }
-
-    /// Returns the planned parameter-set identity.
-    pub const fn params_id(&self) -> ParamsId {
-        self.params_id
-    }
 }
 
 /// Logical reads required by the pure matcher.
 pub trait FilterMapMatchSource {
     /// Typed source failure.
     type Error: Error + 'static;
-
-    /// Returns the recognized identity under which all source data is interpreted.
-    fn params_id(&self) -> ParamsId;
 
     /// Reads one capped logical-row prefix for every requested map, preserving request order.
     fn read_row_prefixes(
@@ -490,22 +462,6 @@ pub enum MatcherError<E> {
     /// The filter has no address or topic constraint suitable for map lookup.
     #[error("filter has no searchable address or topic value")]
     NoSearchableValues,
-    /// The planner and source use different recognized parameter sets.
-    #[error("planned parameter identity {planned:?} differs from source {source_params:?}")]
-    ParamsMismatch {
-        /// Parameter set used by the plan.
-        planned: ParamsId,
-        /// Parameter set exposed by the source.
-        source_params: ParamsId,
-    },
-    /// The source changed parameter identity after the matcher pinned it.
-    #[error("source parameter identity changed from {pinned:?} to {actual:?}")]
-    SourceParamsChanged {
-        /// Parameter identity pinned at construction.
-        pinned: ParamsId,
-        /// Parameter identity returned during matching.
-        actual: ParamsId,
-    },
     /// The requested block interval is reversed.
     #[error("block range {first}..={last} is reversed")]
     ReversedBlockRange {

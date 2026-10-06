@@ -8,7 +8,6 @@ use std::collections::BTreeMap;
 struct SourceError;
 
 struct Source {
-    params_id: ParamsId,
     rows: BTreeMap<(u32, u32), Vec<u32>>,
     pointers: BTreeMap<u64, u64>,
     row_reads: usize,
@@ -17,22 +16,12 @@ struct Source {
 
 impl Source {
     fn empty() -> Self {
-        Self {
-            params_id: ParamsId::Default,
-            rows: BTreeMap::new(),
-            pointers: BTreeMap::new(),
-            row_reads: 0,
-            pointer_reads: 0,
-        }
+        Self { rows: BTreeMap::new(), pointers: BTreeMap::new(), row_reads: 0, pointer_reads: 0 }
     }
 }
 
 impl FilterMapMatchSource for Source {
     type Error = SourceError;
-
-    fn params_id(&self) -> ParamsId {
-        self.params_id
-    }
 
     fn read_row_prefixes(
         &mut self,
@@ -89,10 +78,7 @@ fn wildcard_only_patterns_are_rejected_before_data_reads() {
         assert!(!pattern.has_searchable_values());
         let mut matcher = FilterMapMatcher::new(Source::empty());
         assert!(matches!(
-            matcher.match_subrange(
-                &pattern,
-                IndexedMatchRange::new(10..=10, 0..=0, ParamsId::Default)
-            ),
+            matcher.match_subrange(&pattern, IndexedMatchRange::new(10..=10, 0..=0)),
             Err(MatcherError::NoSearchableValues)
         ));
         let source = matcher.into_source();
@@ -115,7 +101,7 @@ fn address_hit_is_reversed_clipped_and_resolved_to_a_block() {
     let candidates = matcher
         .match_subrange(
             &MatchPattern::new(vec![address], vec![]).unwrap(),
-            IndexedMatchRange::new(10..=10, 0..=0, ParamsId::Default),
+            IndexedMatchRange::new(10..=10, 0..=0),
         )
         .unwrap();
     assert_eq!(candidates.potential_indices(), &[3]);
@@ -136,33 +122,10 @@ fn constrained_topic_translates_to_the_address_start() {
     let candidates = FilterMapMatcher::new(source)
         .match_subrange(
             &MatchPattern::new(vec![], vec![TopicSelection::OneOf(vec![topic])]).unwrap(),
-            IndexedMatchRange::new(10..=10, 0..=0, ParamsId::Default),
+            IndexedMatchRange::new(10..=10, 0..=0),
         )
         .unwrap();
     assert_eq!(candidates.potential_indices(), &[3]);
-}
-
-#[test]
-fn identity_and_range_errors_happen_before_row_reads() {
-    let address = address!("0000000000000000000000000000000000000001");
-    let pattern = MatchPattern::new(vec![address], vec![]).unwrap();
-    let mut source = Source::empty();
-    source.pointers.extend([(10, 0), (11, 10)]);
-    let mut matcher = FilterMapMatcher::new(source);
-
-    assert!(matches!(
-        matcher
-            .match_subrange(&pattern, IndexedMatchRange::new(10..=10, 0..=0, ParamsId::RangeTest)),
-        Err(MatcherError::ParamsMismatch { .. })
-    ));
-    assert_eq!(matcher.source.row_reads, 0);
-
-    matcher.source.params_id = ParamsId::RangeTest;
-    assert!(matches!(
-        matcher.match_subrange(&pattern, IndexedMatchRange::new(10..=10, 0..=0, ParamsId::Default)),
-        Err(MatcherError::SourceParamsChanged { .. })
-    ));
-    assert_eq!(matcher.source.row_reads, 0);
 }
 
 #[test]
@@ -177,7 +140,7 @@ fn malformed_columns_are_errors_not_empty_matches() {
     assert!(matches!(
         FilterMapMatcher::new(source).match_subrange(
             &MatchPattern::new(vec![address], vec![]).unwrap(),
-            IndexedMatchRange::new(10..=10, 0..=0, ParamsId::Default),
+            IndexedMatchRange::new(10..=10, 0..=0),
         ),
         Err(MatcherError::MalformedColumn { .. })
     ));
@@ -226,13 +189,12 @@ fn generated_tiny_domain_never_omits_exact_matches() {
         ];
         for (pattern, exact_blocks) in cases {
             let candidates = FilterMapMatcher::new(Source {
-                params_id: source.params_id,
                 rows: source.rows.clone(),
                 pointers: source.pointers.clone(),
                 row_reads: 0,
                 pointer_reads: 0,
             })
-            .match_subrange(&pattern, IndexedMatchRange::new(10..=11, 0..=0, ParamsId::Default))
+            .match_subrange(&pattern, IndexedMatchRange::new(10..=11, 0..=0))
             .unwrap();
             for exact in exact_blocks {
                 assert!(
@@ -246,7 +208,7 @@ fn generated_tiny_domain_never_omits_exact_matches() {
         let clipped = FilterMapMatcher::new(source)
             .match_subrange(
                 &MatchPattern::new(vec![address_a, address_b], vec![]).unwrap(),
-                IndexedMatchRange::new(11..=11, 0..=0, ParamsId::Default),
+                IndexedMatchRange::new(11..=11, 0..=0),
             )
             .unwrap();
         assert_eq!(clipped.candidate_blocks(), &[11]);
@@ -266,10 +228,6 @@ struct MalformedSource {
 
 impl FilterMapMatchSource for MalformedSource {
     type Error = SourceError;
-
-    fn params_id(&self) -> ParamsId {
-        ParamsId::Default
-    }
 
     fn read_row_prefixes(
         &mut self,
@@ -306,7 +264,7 @@ fn malformed_source_shapes_fail_closed() {
         [(Malformation::WrongRowCount, "row-count"), (Malformation::PrefixTooLong, "prefix")]
     {
         let error = FilterMapMatcher::new(MalformedSource { kind, value })
-            .match_subrange(&pattern, IndexedMatchRange::new(10..=10, 0..=0, ParamsId::Default))
+            .match_subrange(&pattern, IndexedMatchRange::new(10..=10, 0..=0))
             .unwrap_err();
         match expected {
             "row-count" => assert!(matches!(error, MatcherError::RowCountMismatch { .. })),
@@ -324,10 +282,6 @@ struct LayerSource {
 
 impl FilterMapMatchSource for LayerSource {
     type Error = SourceError;
-
-    fn params_id(&self) -> ParamsId {
-        ParamsId::Default
-    }
 
     fn read_row_prefixes(
         &mut self,
@@ -358,7 +312,7 @@ fn matcher_traverses_layers_and_bounds_saturated_sources() {
     let address = address!("0000000000000000000000000000000000000001");
     let value = address_value(address);
     let pattern = MatchPattern::new(vec![address], vec![]).unwrap();
-    let range = IndexedMatchRange::new(10..=10, 0..=0, ParamsId::Default);
+    let range = IndexedMatchRange::new(10..=10, 0..=0);
 
     let mut matcher =
         FilterMapMatcher::new(LayerSource { value, saturate_forever: false, limits: Vec::new() });
@@ -377,12 +331,11 @@ fn matcher_traverses_layers_and_bounds_saturated_sources() {
 
 #[test]
 fn recognized_map_domain_cannot_overflow_candidate_arithmetic() {
-    for params in [crate::DEFAULT_PARAMS, crate::RANGE_TEST_PARAMS] {
-        let largest = u64::from(u32::MAX)
-            .checked_mul(params.values_per_map())
-            .and_then(|first| first.checked_add(params.values_per_map() - 1));
-        assert!(largest.is_some());
-    }
+    let params = DEFAULT_PARAMS;
+    let largest = u64::from(u32::MAX)
+        .checked_mul(params.values_per_map())
+        .and_then(|first| first.checked_add(params.values_per_map() - 1));
+    assert!(largest.is_some());
 }
 
 #[test]
@@ -397,7 +350,7 @@ fn pointer_order_and_range_boundaries_fail_closed() {
     let error = FilterMapMatcher::new(source)
         .match_subrange(
             &MatchPattern::new(vec![address], vec![]).unwrap(),
-            IndexedMatchRange::new(10..=11, 0..=0, ParamsId::Default),
+            IndexedMatchRange::new(10..=11, 0..=0),
         )
         .unwrap_err();
     assert!(matches!(error, MatcherError::PointerOrderMismatch { .. }));
@@ -407,7 +360,7 @@ fn pointer_order_and_range_boundaries_fail_closed() {
     let error = FilterMapMatcher::new(source)
         .match_subrange(
             &MatchPattern::new(vec![address], vec![]).unwrap(),
-            IndexedMatchRange::new(u64::MAX..=u64::MAX, 0..=0, ParamsId::Default),
+            IndexedMatchRange::new(u64::MAX..=u64::MAX, 0..=0),
         )
         .unwrap_err();
     assert!(matches!(error, MatcherError::BlockSuccessorOverflow { .. }));

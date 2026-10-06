@@ -8257,7 +8257,6 @@ dependencies = [
  "roaring",
  "serde",
  "test-fuzz",
- "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -9181,24 +9180,9 @@ dependencies = [
 name = "reth-filter-maps"
 version = "2.7.0"
 dependencies = [
- "alloy-eips",
  "alloy-primitives",
- "reth-filter-maps",
  "reth-filter-maps-test-utils",
  "sha2 0.10.9",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "reth-filter-maps-storage"
-version = "2.7.0"
-dependencies = [
- "alloy-primitives",
- "reth-db",
- "reth-db-api",
- "reth-filter-maps",
- "sha2 0.10.9",
- "tempfile",
  "thiserror 2.0.21",
 ]
 

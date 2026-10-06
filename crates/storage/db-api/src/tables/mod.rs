@@ -21,11 +21,6 @@ use crate::{
         accounts::BlockNumberAddress,
         bal::{StoredBlockAccessList, StoredBlockAccessListKey},
         blocks::{HeaderHash, StoredBlockOmmers},
-        filter_maps::{
-            FilterMapBaseRowKey, FilterMapExtendedRowKey, StoredBaseRowGroup, StoredBlockPointer,
-            StoredCoverageCatalog, StoredExtendedRow, StoredIndexIdentity, StoredMapResumeAnchor,
-            StoredMapRowDirectory,
-        },
         storage_sharded_key::StorageShardedKey,
         AccountBeforeTx, ClientVersion, CompactU256, IntegerList, ShardedKey,
         StoredBlockBodyIndices, StoredBlockWithdrawals,
@@ -550,48 +545,6 @@ tables! {
     table Metadata {
         type Key = String;
         type Value = Vec<u8>;
-    }
-
-    /// Stores the singleton `FilterMaps` index identity.
-    table FilterMapIdentity {
-        type Key = u8;
-        type Value = StoredIndexIdentity;
-    }
-
-    /// Stores the singleton `FilterMaps` coverage catalog.
-    table FilterMapCoverage {
-        type Key = u8;
-        type Value = StoredCoverageCatalog;
-    }
-
-    /// Stores one durable resume anchor per completed map.
-    table FilterMapAnchors {
-        type Key = u32;
-        type Value = StoredMapResumeAnchor;
-    }
-
-    /// Stores block-number-addressable `FilterMaps` pointers.
-    table FilterMapBlockPointers {
-        type Key = u64;
-        type Value = StoredBlockPointer;
-    }
-
-    /// Stores one row directory per completed map.
-    table FilterMapDirectories {
-        type Key = u32;
-        type Value = StoredMapRowDirectory;
-    }
-
-    /// Stores grouped base row prefixes.
-    table FilterMapBaseRows {
-        type Key = FilterMapBaseRowKey;
-        type Value = StoredBaseRowGroup;
-    }
-
-    /// Stores individual row overflow columns.
-    table FilterMapExtendedRows {
-        type Key = FilterMapExtendedRowKey;
-        type Value = StoredExtendedRow;
     }
 }
 
