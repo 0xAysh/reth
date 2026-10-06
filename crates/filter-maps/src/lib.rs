@@ -1,8 +1,14 @@
 //! The `FilterMaps` local search index.
 //!
 //! A filter map is a grid of rows by columns that marks the searchable log values of a fixed run
-//! of log value slots. The matcher reads the rows of finished maps and returns candidate blocks
-//! for a [`MatchPattern`]. Receipts and the exact log filter stay authoritative.
+//! of log value slots. The [`Indexer`] renders the logs of finalized blocks into finished maps and
+//! stores them in a dedicated `RocksDB` with Geth's key layout. A [`ReaderSnapshot`] matches a
+//! [`MatchPattern`] against the stored maps and returns candidate blocks. Receipts and the exact
+//! log filter stay authoritative.
+//!
+//! ```text
+//! receipts -> log iterator -> renderer -> group buffer -> store -> matcher -> candidate blocks
+//! ```
 //!
 //! The math is a port of go-ethereum's `core/filtermaps` package. Geth is the correctness oracle,
 //! so these functions must agree with it bit for bit. Golden vectors and fixtures generated from
@@ -16,23 +22,112 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
-// The indexer that drives the renderer is added on the lean core next.
-#[allow(dead_code)]
+mod indexer;
 mod iter;
-#[allow(dead_code)]
 mod matcher;
 mod params;
-#[allow(dead_code)]
 mod render;
-#[allow(dead_code)]
 mod store;
 #[cfg(test)]
 mod test_utils;
 mod value;
 
+pub use indexer::Indexer;
 pub use matcher::{MatchPattern, TopicSelection};
 pub use params::{Params, DEFAULT_PARAMS};
 pub use value::{address_value, topic_value};
+
+use reth_storage_errors::provider::ProviderError;
+use std::{ops::RangeInclusive, path::Path, sync::Arc};
+use store::{Range, Store, StoreSnapshot};
+
+/// The `FilterMaps` index: a store, plus handles that read and fill it.
+#[derive(Debug, Clone)]
+pub struct FilterMaps {
+    store: Arc<Store>,
+    config: FilterMapsConfig,
+}
+
+impl FilterMaps {
+    /// Opens or creates the store at `path`.
+    pub fn open(path: &Path, config: FilterMapsConfig) -> Result<Self, FilterMapsError> {
+        Ok(Self { store: Arc::new(Store::open(path)?), config })
+    }
+
+    /// Returns a reader of the store.
+    pub fn reader(&self) -> FilterMapsReader {
+        FilterMapsReader { store: Arc::clone(&self.store) }
+    }
+
+    /// Returns the indexer that fills the store from `provider`.
+    pub fn indexer<P>(&self, provider: P) -> Indexer<P> {
+        Indexer::new(Arc::clone(&self.store), self.config, provider)
+    }
+}
+
+/// `FilterMaps` configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FilterMapsConfig {
+    /// The number of blocks up to the finalized block to keep indexed. 0 keeps every block that
+    /// has receipts.
+    pub history: u64,
+}
+
+/// A cheap, cloneable reader of the `FilterMaps` store.
+#[derive(Debug, Clone)]
+pub struct FilterMapsReader {
+    store: Arc<Store>,
+}
+
+impl FilterMapsReader {
+    /// Returns a consistent view of the index. Take one per query.
+    pub fn snapshot(&self) -> ReaderSnapshot<'_> {
+        let snapshot = self.store.snapshot();
+        // A range that cannot be read leaves every block on the bloom path, which is complete.
+        let range = snapshot.range().unwrap_or_else(|error| {
+            tracing::warn!(target: "filter_maps", %error, "Failed to read the FilterMaps range");
+            None
+        });
+        ReaderSnapshot { snapshot, range }
+    }
+}
+
+/// A consistent view of the `FilterMaps` index.
+#[derive(Debug)]
+pub struct ReaderSnapshot<'a> {
+    snapshot: StoreSnapshot<'a>,
+    range: Option<Range>,
+}
+
+impl ReaderSnapshot<'_> {
+    /// Returns the blocks whose log values are all in stored maps.
+    pub fn indexed_blocks(&self) -> Option<RangeInclusive<u64>> {
+        self.range.as_ref().and_then(Range::indexed_blocks)
+    }
+
+    /// Returns the candidate blocks for `pattern` in `blocks`, in ascending order.
+    ///
+    /// Blocks outside [`indexed_blocks`](Self::indexed_blocks) are all candidates: the index
+    /// knows nothing about them.
+    pub fn candidate_blocks(
+        &self,
+        blocks: RangeInclusive<u64>,
+        pattern: &MatchPattern,
+    ) -> Result<Vec<u64>, FilterMapsError> {
+        let (first, last) = blocks.into_inner();
+        let Some(indexed) = self.indexed_blocks() else { return Ok((first..=last).collect()) };
+        let (low, high) = (first.max(*indexed.start()), last.min(*indexed.end()));
+        if low > high {
+            return Ok((first..=last).collect())
+        }
+        let mut candidates = (first..low).collect::<Vec<_>>();
+        candidates.extend(matcher::candidate_blocks(&self.snapshot, low..=high, pattern)?);
+        if high < last {
+            candidates.extend(high + 1..=last);
+        }
+        Ok(candidates)
+    }
+}
 
 /// A `FilterMaps` failure.
 ///
@@ -43,6 +138,9 @@ pub enum FilterMapsError {
     /// The store failed.
     #[error(transparent)]
     Db(#[from] rocksdb::Error),
+    /// The chain provider failed, or a block's receipts are missing.
+    #[error(transparent)]
+    Provider(#[from] ProviderError),
     /// A stored record cannot be decoded or contradicts another record.
     #[error("corrupt FilterMaps record: {0}")]
     Corrupt(String),

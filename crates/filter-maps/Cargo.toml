@@ -12,7 +12,15 @@ description = "FilterMaps local search index for log queries"
 workspace = true
 
 [dependencies]
+# reth
+reth-chain-state.workspace = true
+reth-metrics.workspace = true
+reth-prune-types.workspace = true
+reth-storage-api = { workspace = true, features = ["std"] }
+reth-storage-errors.workspace = true
+
 # ethereum
+alloy-consensus.workspace = true
 alloy-primitives.workspace = true
 
 # crypto
@@ -21,10 +29,17 @@ sha2.workspace = true
 # storage
 rocksdb.workspace = true
 
+# async
+tokio = { workspace = true, features = ["sync", "macros"] }
+
 # misc
+metrics.workspace = true
 schnellru.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
+reth-ethereum-primitives.workspace = true
 reth-filter-maps-test-utils.workspace = true
+reth-provider = { workspace = true, features = ["test-utils"] }
 tempfile.workspace = true
