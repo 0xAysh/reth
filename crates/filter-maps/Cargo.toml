@@ -19,6 +19,7 @@ alloy-primitives.workspace = true
 sha2.workspace = true
 
 # misc
+schnellru.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
