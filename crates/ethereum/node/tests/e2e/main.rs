@@ -6,6 +6,7 @@ mod dev;
 mod eip6780;
 mod eth;
 mod exex;
+mod filter_maps;
 mod finality;
 mod forkchoice;
 mod invalid_payload;

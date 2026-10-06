@@ -2,13 +2,47 @@ use alloy_eips::{eip2718::Encodable2718, BlockId};
 use alloy_network::{
     Ethereum, EthereumWallet, Network, NetworkTransactionBuilder, NetworkWallet, TransactionBuilder,
 };
-use alloy_primitives::{Address, Bytes, U256};
+use alloy_primitives::{Address, Bytes, B256, U256};
 use alloy_provider::Provider;
 use alloy_rpc_types_eth::TransactionRequest;
 use alloy_signer::Signer;
 use alloy_signer_local::{coins_bip39::English, MnemonicBuilder, PrivateKeySigner};
 use futures_util::future::BoxFuture;
 use std::future::IntoFuture;
+
+/// Init code of a contract that emits many `LOG4` logs, for tests of log indexing.
+///
+/// Called with the three calldata words `(topic0, key, count)`, see [`TestAccount::emit_logs`], the
+/// contract emits `count` logs without data. Log `i`, counting from zero, has the topics `topic0`,
+/// `i`, `i ^ key` and the caller. A log costs about 1,950 gas, so a call at the EIP-7825 limit of
+/// 2^24 gas emits about 8,590 logs.
+#[rustfmt::skip]
+pub const LOG_EMITTER_INIT_CODE: &[u8] = &[
+    // Init code: return the 36 bytes of runtime that start at byte 11.
+    0x60, 0x24,             // PUSH1 36
+    0x80,                   // DUP1
+    0x60, 0x0b,             // PUSH1 11
+    0x60, 0x00,             // PUSH1 0
+    0x39,                   // CODECOPY
+    0x60, 0x00,             // PUSH1 0
+    0xf3,                   // RETURN
+    // Runtime, with the stack [count, i].
+    0x60, 0x40, 0x35,       // PUSH1 64, CALLDATALOAD: count
+    0x60, 0x00,             // PUSH1 0: i
+    0x5b,                   // 0x05: JUMPDEST
+    0x81, 0x81, 0x10, 0x15, // DUP2, DUP2, LT, ISZERO: i >= count
+    0x60, 0x22, 0x57,       // PUSH1 0x22, JUMPI: done
+    0x33,                   // CALLER: topic 3
+    0x81, 0x60, 0x20, 0x35, // DUP2, PUSH1 32, CALLDATALOAD
+    0x18,                   // XOR: topic 2 = i ^ key
+    0x82,                   // DUP3: topic 1 = i
+    0x60, 0x00, 0x35,       // PUSH1 0, CALLDATALOAD: topic 0
+    0x60, 0x00, 0x60, 0x00, // PUSH1 0, PUSH1 0: no data
+    0xa4,                   // LOG4
+    0x60, 0x01, 0x01,       // PUSH1 1, ADD: i + 1
+    0x60, 0x05, 0x56,       // PUSH1 0x05, JUMP
+    0x5b, 0x00,             // 0x22: JUMPDEST, STOP
+];
 
 /// Mnemonic of the test accounts funded by the [`test_genesis`](crate::test_genesis).
 pub const TEST_MNEMONIC: &str = "test test test test test test test test test test test junk";
@@ -222,6 +256,27 @@ impl TestAccount {
     /// See [`Self::next_contract_address`] for the address of the created contract.
     pub fn deploy(&mut self, init_code: impl Into<Bytes>) -> TestTx<'_> {
         self.tx().create().input(init_code)
+    }
+
+    /// Starts building the deployment of a log emitter, see [`LOG_EMITTER_INIT_CODE`].
+    pub fn deploy_log_emitter(&mut self) -> TestTx<'_> {
+        self.deploy(LOG_EMITTER_INIT_CODE)
+    }
+
+    /// Starts building a call of the log emitter `emitter` that emits `count` logs, see
+    /// [`LOG_EMITTER_INIT_CODE`] for their topics.
+    ///
+    /// The gas limit covers the logs: 2,000 gas per log on top of 30,000. Two calls of 7,000 logs
+    /// fit a 30M gas block.
+    pub fn emit_logs(
+        &mut self,
+        emitter: Address,
+        topic0: B256,
+        key: B256,
+        count: u64,
+    ) -> TestTx<'_> {
+        let input = [topic0, key, B256::from(U256::from(count))].concat();
+        self.call(emitter, input).gas_limit(30_000 + 2_000 * count)
     }
 
     /// Signs the transaction request of the network `N` like [`Self::sign_tx_bytes`], returning

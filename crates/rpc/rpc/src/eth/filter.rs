@@ -178,17 +178,6 @@ where
         &self.inner.active_filters
     }
 
-    /// Serves `eth_getLogs` from the `FilterMaps` index in the blocks it covers. Only the first
-    /// reader is kept.
-    pub fn set_filter_maps(&self, reader: FilterMapsReader) {
-        let _ = self.inner.filter_maps.set(reader);
-    }
-
-    /// Returns the `FilterMaps` reader, if one is set.
-    pub fn filter_maps(&self) -> Option<&FilterMapsReader> {
-        self.inner.filter_maps.get()
-    }
-
     /// Endless future that [`Self::clear_stale_filters`] every `stale_filter_ttl` interval.
     /// Nonetheless, this endless future frees the thread at every await point.
     async fn watch_and_clear_stale_filters(&self) {
@@ -451,6 +440,22 @@ where
     async fn logs(&self, filter: Filter) -> RpcResult<Vec<RpcLog<Eth::NetworkTypes>>> {
         trace!(target: "rpc::eth", "Serving eth_getLogs");
         Ok(self.logs_for_filter(filter, self.inner.query_limits).await?)
+    }
+}
+
+impl<Eth> EthFilter<Eth>
+where
+    Eth: EthApiTypes,
+{
+    /// Serves `eth_getLogs` from the `FilterMaps` index in the blocks it covers. Only the first
+    /// reader is kept.
+    pub fn set_filter_maps(&self, reader: FilterMapsReader) {
+        let _ = self.inner.filter_maps.set(reader);
+    }
+
+    /// Returns the `FilterMaps` reader, if one is set.
+    pub fn filter_maps(&self) -> Option<&FilterMapsReader> {
+        self.inner.filter_maps.get()
     }
 }
 

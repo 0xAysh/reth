@@ -884,6 +884,24 @@ where
         .await
     }
 
+    /// Waits until the `FilterMaps` index of the node covers the block with the given number, i.e.
+    /// its index head is at least `number`.
+    ///
+    /// The index only covers finalized and persisted blocks, and only the blocks whose log values
+    /// all lie in finished maps.
+    ///
+    /// Returns an error if the index does not reach the block within [`WAIT_TIMEOUT`], e.g.
+    /// because the node runs without `--filter-maps` or the block is not finalized.
+    pub async fn wait_for_filter_maps_head(&self, number: BlockNumber) -> eyre::Result<()> {
+        let filter = &self.rpc.inner.eth_handlers().filter;
+        poll_until(format!("FilterMaps to index block {number}"), move || async move {
+            let indexed =
+                filter.filter_maps().and_then(|reader| reader.snapshot().indexed_blocks());
+            Ok(indexed.is_some_and(|blocks| *blocks.end() >= number).then_some(()))
+        })
+        .await
+    }
+
     /// Waits until the block with the given hash is the latest block of the node, i.e. its
     /// canonical head.
     ///
@@ -1768,6 +1786,7 @@ mod tests {
         assert_send(node.wait_for_pool_removal([B256::ZERO]));
         assert_send(node.wait_for_persisted_block(0));
         assert_send(node.wait_for_prune_checkpoint(PruneSegment::SenderRecovery, 0));
+        assert_send(node.wait_for_filter_maps_head(0));
         assert_send(node.wait_for_head(B256::ZERO));
         assert_send(node.assert_new_block(B256::ZERO, B256::ZERO, 0));
         assert_send(node.sync_to(B256::ZERO));
