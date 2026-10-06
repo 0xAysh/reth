@@ -1,639 +1,319 @@
-//! Storage-independent candidate matching over completed filter maps.
+//! Candidate matching over finished filter maps.
 //!
-//! Matching reverses logical row columns into possible value-space indices, combines Ethereum
-//! address/topic alternatives positionally, clips candidate starts to one planned indexed
-//! subrange, and resolves them to blocks through explicit block-pointer lookups. Results are
-//! candidates only: receipt loading and exact log filtering remain authoritative.
+//! Matching reverses row columns into potential log value indices, combines address and topic
+//! alternatives by position, and resolves the indices to blocks through block pointers. The
+//! results are candidates only: receipts and the exact log filter stay authoritative. This is
+//! Geth's `core/filtermaps/matcher.go` without its worker pool.
 
-use crate::{address_value, topic_value, Params, DEFAULT_PARAMS};
+use crate::{address_value, topic_value, FilterMapsError, Params, DEFAULT_PARAMS};
 use alloy_primitives::{Address, B256};
-use std::{collections::BTreeMap, error::Error, ops::RangeInclusive};
+use std::ops::RangeInclusive;
 
-/// Pure candidate matcher owning one logical source.
-#[derive(Debug)]
-pub struct FilterMapMatcher<S> {
-    source: S,
-}
-
-impl<S: FilterMapMatchSource> FilterMapMatcher<S> {
-    /// Wraps a source without performing a fallible row or pointer read.
-    pub const fn new(source: S) -> Self {
-        Self { source }
-    }
-
-    /// Matches one already-planned indexed subrange atomically.
-    pub fn match_subrange(
-        &mut self,
-        pattern: &MatchPattern,
-        range: IndexedMatchRange,
-    ) -> Result<CandidateSet, MatcherError<S::Error>> {
-        if !pattern.has_searchable_values() {
-            return Err(MatcherError::NoSearchableValues)
-        }
-        let first_block = *range.blocks.start();
-        let last_block = *range.blocks.end();
-        if first_block > last_block {
-            return Err(MatcherError::ReversedBlockRange { first: first_block, last: last_block })
-        }
-        let available_first = *range.supporting_maps.start();
-        let available_last = *range.supporting_maps.end();
-        if available_first > available_last {
-            return Err(MatcherError::ReversedSupportingMapRange {
-                first: available_first,
-                last: available_last,
-            })
-        }
-        let after_block = last_block
-            .checked_add(1)
-            .ok_or(MatcherError::BlockSuccessorOverflow { last: last_block })?;
-        let first_index = self.pointer(first_block)?;
-        let after_index = self.pointer(after_block)?;
-        let last_index = after_index.checked_sub(1).ok_or(MatcherError::InvalidPointerRange {
-            first_block,
-            first: first_index,
-            after_block,
-            after: after_index,
-        })?;
-        if first_index > last_index {
-            return Err(MatcherError::InvalidPointerRange {
-                first_block,
-                first: first_index,
-                after_block,
-                after: after_index,
-            })
-        }
-        let params = DEFAULT_PARAMS;
-        let required_first_u64 = first_index / params.values_per_map();
-        let required_last_u64 = last_index / params.values_per_map();
-        let required_first = u32::try_from(required_first_u64)
-            .map_err(|_| MatcherError::MapIndexOverflow { index: required_first_u64 })?;
-        let required_last = u32::try_from(required_last_u64)
-            .map_err(|_| MatcherError::MapIndexOverflow { index: required_last_u64 })?;
-        if required_first < available_first || required_last > available_last {
-            return Err(MatcherError::MapsOutsideCoverage {
-                required_first,
-                required_last,
-                available_first,
-                available_last,
-            })
-        }
-
-        let mut potentials = self.match_pattern(pattern, required_first..=required_last, params)?;
-        potentials.retain(|index| *index >= first_index && *index <= last_index);
-        potentials.sort_unstable();
-        potentials.dedup();
-        let candidate_blocks =
-            self.resolve_blocks(&potentials, first_block, last_block, first_index, after_index)?;
-        Ok(CandidateSet { potential_indices: potentials, candidate_blocks })
-    }
-
-    /// Returns the owned source.
-    pub fn into_source(self) -> S {
-        self.source
-    }
-
-    fn pointer(&mut self, block: u64) -> Result<u64, MatcherError<S::Error>> {
-        self.source.block_pointer(block).map_err(MatcherError::Source)
-    }
-
-    fn match_pattern(
-        &mut self,
-        pattern: &MatchPattern,
-        maps: RangeInclusive<u32>,
-        params: Params,
-    ) -> Result<Vec<u64>, MatcherError<S::Error>> {
-        let mut output = Vec::new();
-        let mut first = *maps.start();
-        let last = *maps.end();
-        loop {
-            let epoch_last = params.last_epoch_map(params.map_epoch(first)).min(last);
-            let batch = (first..=epoch_last).collect::<Vec<_>>();
-            output.extend(self.match_pattern_batch(pattern, &batch, params)?);
-            if epoch_last == last {
-                break
-            }
-            first = epoch_last
-                .checked_add(1)
-                .ok_or(MatcherError::MapIndexOverflow { index: u64::from(epoch_last) + 1 })?;
-        }
-        Ok(output)
-    }
-
-    fn match_pattern_batch(
-        &mut self,
-        pattern: &MatchPattern,
-        maps: &[u32],
-        params: Params,
-    ) -> Result<Vec<u64>, MatcherError<S::Error>> {
-        let mut candidates = if pattern.addresses.is_empty() {
-            PotentialSet::Any
-        } else {
-            PotentialSet::Some(self.match_alternatives(&pattern.addresses, maps, params)?)
-        };
-        for (position, topic) in pattern.topics.iter().enumerate() {
-            let CompiledSelection::Values(values) = topic else { continue };
-            let hits = self.match_alternatives(values, maps, params)?;
-            candidates = combine(candidates, hits, position as u64 + 1, params.values_per_map());
-            if matches!(&candidates, PotentialSet::Some(values) if values.is_empty()) {
-                break
-            }
-        }
-        Ok(match candidates {
-            PotentialSet::Any => Vec::new(),
-            PotentialSet::Some(values) => values,
-        })
-    }
-
-    fn match_alternatives(
-        &mut self,
-        values: &[B256],
-        maps: &[u32],
-        params: Params,
-    ) -> Result<Vec<u64>, MatcherError<S::Error>> {
-        let mut union = Vec::new();
-        for &value in values {
-            union.extend(self.match_value(value, maps, params)?);
-        }
-        union.sort_unstable();
-        union.dedup();
-        Ok(union)
-    }
-
-    fn match_value(
-        &mut self,
-        value: B256,
-        maps: &[u32],
-        params: Params,
-    ) -> Result<Vec<u64>, MatcherError<S::Error>> {
-        let mut output = Vec::new();
-        let mut active = maps.to_vec();
-        let mut layer = 0u32;
-        let mut cumulative_capacity = 0u64;
-        let mut capacity_exhausted = false;
-        while !active.is_empty() {
-            let limit = params.max_row_length(layer);
-            cumulative_capacity = cumulative_capacity
-                .checked_add(u64::from(limit))
-                .ok_or(MatcherError::LayerIndexExhausted { map: active[0], value })?;
-            let mut groups = BTreeMap::<u32, Vec<u32>>::new();
-            for &map in &active {
-                groups.entry(params.row_index(map, layer, value)).or_default().push(map);
-            }
-            let mut next = Vec::new();
-            for (row, grouped_maps) in groups {
-                let rows = self
-                    .source
-                    .read_row_prefixes(&grouped_maps, row, limit)
-                    .map_err(MatcherError::Source)?;
-                if rows.len() != grouped_maps.len() {
-                    return Err(MatcherError::RowCountMismatch {
-                        requested: grouped_maps.len(),
-                        actual: rows.len(),
-                    })
-                }
-                for (&map, columns) in grouped_maps.iter().zip(rows) {
-                    if columns.len() > limit as usize {
-                        return Err(MatcherError::RowPrefixTooLong {
-                            map,
-                            row,
-                            limit,
-                            actual: columns.len(),
-                        })
-                    }
-                    let map_first = u64::from(map)
-                        .checked_mul(params.values_per_map())
-                        .ok_or(MatcherError::CandidateArithmeticOverflow { map, column: 0 })?;
-                    for column in columns.iter().copied() {
-                        if column >= params.map_width() {
-                            return Err(MatcherError::MalformedColumn { map, row, column })
-                        }
-                        let local = u64::from(column >> params.hash_bits());
-                        let index = map_first
-                            .checked_add(local)
-                            .ok_or(MatcherError::CandidateArithmeticOverflow { map, column })?;
-                        if params.column_index(index, value) == column {
-                            output.push(index);
-                        }
-                    }
-                    if columns.len() == limit as usize {
-                        next.push(map);
-                    }
-                }
-            }
-            if next.is_empty() {
-                break
-            }
-            active = next;
-            // One map cannot contain more searchable marks than value-space slots. Read one
-            // additional layer after reaching that capacity so a capped full prefix can be
-            // distinguished from a truly saturated row; another full row is then impossible.
-            if capacity_exhausted {
-                return Err(MatcherError::LayerIndexExhausted { map: active[0], value })
-            }
-            capacity_exhausted = cumulative_capacity >= params.values_per_map();
-            layer = layer
-                .checked_add(1)
-                .ok_or(MatcherError::LayerIndexExhausted { map: active[0], value })?;
-        }
-        output.sort_unstable();
-        output.dedup();
-        Ok(output)
-    }
-
-    fn resolve_blocks(
-        &mut self,
-        indices: &[u64],
-        first: u64,
-        last: u64,
-        first_pointer: u64,
-        after_pointer: u64,
-    ) -> Result<Vec<u64>, MatcherError<S::Error>> {
-        let after = last + 1;
-        let mut blocks = Vec::new();
-        let mut latest: Option<(u64, u64, u64)> = None;
-        for &index in indices {
-            if let Some((block, pointer, successor)) = latest &&
-                pointer <= index &&
-                index < successor
-            {
-                if blocks.last().copied() != Some(block) {
-                    blocks.push(block);
-                }
-                continue
-            }
-            let mut lower_block = first;
-            let mut lower_pointer = first_pointer;
-            let mut upper_block = after;
-            let mut upper_pointer = after_pointer;
-            while upper_block - lower_block > 1 {
-                let middle = lower_block + (upper_block - lower_block) / 2;
-                let pointer = self.pointer(middle)?;
-                if pointer <= lower_pointer {
-                    return Err(MatcherError::PointerOrderMismatch {
-                        lower_block,
-                        lower_pointer,
-                        upper_block: middle,
-                        upper_pointer: pointer,
-                    })
-                }
-                if pointer >= upper_pointer {
-                    return Err(MatcherError::PointerOrderMismatch {
-                        lower_block: middle,
-                        lower_pointer: pointer,
-                        upper_block,
-                        upper_pointer,
-                    })
-                }
-                if pointer <= index {
-                    lower_block = middle;
-                    lower_pointer = pointer;
-                } else {
-                    upper_block = middle;
-                    upper_pointer = pointer;
-                }
-            }
-            let successor = if upper_block == lower_block + 1 {
-                upper_pointer
-            } else {
-                self.pointer(lower_block + 1)?
-            };
-            if lower_block < first || lower_block > last {
-                return Err(MatcherError::CandidateOutsideBlockRange { index, first, last })
-            }
-            if !(lower_pointer <= index && index < successor) || lower_pointer >= successor {
-                return Err(MatcherError::PointerBracketMismatch {
-                    index,
-                    block: lower_block,
-                    pointer: lower_pointer,
-                    successor_pointer: successor,
-                })
-            }
-            latest = Some((lower_block, lower_pointer, successor));
-            if blocks.last().copied() != Some(lower_block) {
-                blocks.push(lower_block);
-            }
-        }
-        Ok(blocks)
-    }
-}
-
-/// One declared topic position in an Ethereum log filter.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TopicSelection {
-    /// The position is unconstrained, while retaining its positional offset.
-    Any,
-    /// The topic may equal any one of these values.
-    OneOf(Vec<B256>),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum CompiledSelection {
-    Any,
-    Values(Vec<B256>),
-}
-
-/// An immutable, compiled Ethereum-shaped filter pattern.
+/// An Ethereum log filter, compiled to log values.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MatchPattern {
     addresses: Vec<B256>,
-    topics: Vec<CompiledSelection>,
+    /// One entry per topic position. `None` matches any topic.
+    topics: Vec<Option<Vec<B256>>>,
 }
 
 impl MatchPattern {
-    /// Compiles addresses and up to four declared topic positions for repeated matching.
-    pub fn new(addresses: Vec<Address>, topics: Vec<TopicSelection>) -> Result<Self, PatternError> {
-        if topics.len() > 4 {
-            return Err(PatternError::TooManyTopicPositions { actual: topics.len() })
-        }
-        let mut addresses = addresses.into_iter().map(address_value).collect::<Vec<_>>();
-        addresses.sort_unstable();
-        addresses.dedup();
+    /// Compiles the addresses and topic positions of a log filter.
+    ///
+    /// No addresses, or a position without alternatives, match any value, as in Geth. Positions
+    /// after the fourth are ignored: no log has them, so ignoring them only adds candidates.
+    pub fn new(
+        addresses: impl IntoIterator<Item = Address>,
+        topics: impl IntoIterator<Item = TopicSelection>,
+    ) -> Self {
+        let addresses = sorted(addresses.into_iter().map(address_value));
         let topics = topics
             .into_iter()
-            .enumerate()
-            .map(|(position, selection)| match selection {
-                TopicSelection::Any => Ok(CompiledSelection::Any),
-                TopicSelection::OneOf(values) if values.is_empty() => {
-                    Err(PatternError::EmptyTopicAlternatives { position })
+            .take(4)
+            .map(|selection| match selection {
+                TopicSelection::OneOf(values) if !values.is_empty() => {
+                    Some(sorted(values.into_iter().map(topic_value)))
                 }
-                TopicSelection::OneOf(values) => {
-                    let mut values = values.into_iter().map(topic_value).collect::<Vec<_>>();
-                    values.sort_unstable();
-                    values.dedup();
-                    Ok(CompiledSelection::Values(values))
-                }
+                TopicSelection::OneOf(_) | TopicSelection::Any => None,
             })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { addresses, topics })
+            .collect();
+        Self { addresses, topics }
     }
 
-    /// Returns whether at least one address or topic value can be looked up in filter-map rows.
+    /// Returns whether the pattern constrains at least one address or topic. Without one, every
+    /// block is a candidate.
     pub fn has_searchable_values(&self) -> bool {
-        !self.addresses.is_empty() ||
-            self.topics.iter().any(|topic| matches!(topic, CompiledSelection::Values(_)))
+        !self.addresses.is_empty() || self.topics.iter().any(Option::is_some)
     }
 }
 
-/// Invalid Ethereum filter shape.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum PatternError {
-    /// Ethereum logs have at most four topics.
-    #[error("filter has {actual} topic positions; at most four are supported")]
-    TooManyTopicPositions {
-        /// Number of supplied topic positions.
-        actual: usize,
-    },
-    /// An OR-list must contain at least one topic.
-    #[error("topic position {position} has no alternatives")]
-    EmptyTopicAlternatives {
-        /// Zero-based topic position whose alternatives are empty.
-        position: usize,
-    },
-}
-
-/// One indexed subrange and the maps that support it.
+/// One topic position of a log filter.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct IndexedMatchRange {
-    blocks: RangeInclusive<u64>,
-    supporting_maps: RangeInclusive<u32>,
+pub enum TopicSelection {
+    /// Any topic, or none.
+    Any,
+    /// One of these topics.
+    OneOf(Vec<B256>),
 }
 
-impl IndexedMatchRange {
-    /// Creates a matcher input. Semantic range validation occurs in `match_subrange`.
-    pub const fn new(blocks: RangeInclusive<u64>, supporting_maps: RangeInclusive<u32>) -> Self {
-        Self { blocks, supporting_maps }
-    }
-
-    /// Returns the exact block interval to search.
-    pub const fn blocks(&self) -> &RangeInclusive<u64> {
-        &self.blocks
-    }
-
-    /// Returns the validated segment maps that may support this interval.
-    pub const fn supporting_maps(&self) -> &RangeInclusive<u32> {
-        &self.supporting_maps
-    }
-}
-
-/// Logical reads required by the pure matcher.
-pub trait FilterMapMatchSource {
-    /// Typed source failure.
-    type Error: Error + 'static;
-
-    /// Reads one capped logical-row prefix for every requested map, preserving request order.
-    fn read_row_prefixes(
-        &mut self,
+/// The reads the matcher needs.
+pub(crate) trait FilterMapMatchSource {
+    /// Reads the first `max_columns` columns of row `row_index` of each map, in request order.
+    /// A row that was never stored is empty.
+    fn row_prefixes(
+        &self,
         map_indices: &[u32],
         row_index: u32,
         max_columns: u32,
-    ) -> Result<Vec<Vec<u32>>, Self::Error>;
+    ) -> Result<Vec<Vec<u32>>, FilterMapsError>;
 
-    /// Returns the absolute first non-padding value-space index for `block_number`.
-    fn block_pointer(&mut self, block_number: u64) -> Result<u64, Self::Error>;
+    /// Returns the block pointer of `block_number`.
+    fn block_pointer(&self, block_number: u64) -> Result<u64, FilterMapsError>;
 }
 
-/// Ordered, unique potential log starts and their candidate blocks.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CandidateSet {
-    potential_indices: Vec<u64>,
-    candidate_blocks: Vec<u64>,
-}
-
-impl CandidateSet {
-    /// Returns possible absolute address/start indices.
-    pub fn potential_indices(&self) -> &[u64] {
-        &self.potential_indices
+/// Returns the candidate blocks for `pattern` in `blocks`, in ascending order.
+///
+/// Every block of `blocks` and the block after them must have a stored pointer.
+pub(crate) fn candidate_blocks(
+    source: &impl FilterMapMatchSource,
+    blocks: RangeInclusive<u64>,
+    pattern: &MatchPattern,
+) -> Result<Vec<u64>, FilterMapsError> {
+    if !pattern.has_searchable_values() {
+        return Ok(blocks.collect())
     }
-
-    /// Returns blocks that may contain an exact match.
-    pub fn candidate_blocks(&self) -> &[u64] {
-        &self.candidate_blocks
+    let (first, last) = blocks.into_inner();
+    let first_pointer = source.block_pointer(first)?;
+    let after_pointer = source.block_pointer(last + 1)?;
+    if first_pointer >= after_pointer {
+        return Err(FilterMapsError::PointerOrder { block: last + 1, pointer: after_pointer })
     }
+    let indices = potential_indices(source, pattern, first_pointer, after_pointer - 1)?;
+    resolve_blocks(source, &indices, (first, first_pointer), (last + 1, after_pointer))
+}
 
-    /// Consumes the result and returns its candidate blocks.
-    pub fn into_candidate_blocks(self) -> Vec<u64> {
-        self.candidate_blocks
+/// Returns the log value indices in `first..=last` where a log matching `pattern` may start, in
+/// ascending order.
+pub(crate) fn potential_indices(
+    source: &impl FilterMapMatchSource,
+    pattern: &MatchPattern,
+    first: u64,
+    last: u64,
+) -> Result<Vec<u64>, FilterMapsError> {
+    let params = DEFAULT_PARAMS;
+    let mut output = Vec::new();
+    let mut map = map_index(first)?;
+    let last_map = map_index(last)?;
+    // Each epoch is matched on its own, as in Geth, to bound the memory of one batch.
+    loop {
+        let epoch_last = params.last_epoch_map(params.map_epoch(map)).min(last_map);
+        let maps = (map..=epoch_last).collect::<Vec<_>>();
+        output.extend(match_maps(source, pattern, &maps, params)?);
+        if epoch_last == last_map {
+            break
+        }
+        map = epoch_last + 1;
     }
+    output.retain(|index| (first..=last).contains(index));
+    Ok(output)
 }
 
-/// Typed matcher failure; malformed or unavailable source data never becomes an empty result.
-#[derive(Debug, thiserror::Error)]
-pub enum MatcherError<E> {
-    /// The filter has no address or topic constraint suitable for map lookup.
-    #[error("filter has no searchable address or topic value")]
-    NoSearchableValues,
-    /// The requested block interval is reversed.
-    #[error("block range {first}..={last} is reversed")]
-    ReversedBlockRange {
-        /// First requested block.
-        first: u64,
-        /// Last requested block.
-        last: u64,
-    },
-    /// The supporting-map interval is reversed.
-    #[error("supporting map range {first}..={last} is reversed")]
-    ReversedSupportingMapRange {
-        /// First supporting map.
-        first: u32,
-        /// Last supporting map.
-        last: u32,
-    },
-    /// The inclusive block range has no representable exclusive end.
-    #[error("block {last} has no representable successor")]
-    BlockSuccessorOverflow {
-        /// Last requested block.
-        last: u64,
-    },
-    /// The range endpoint pointers do not enclose any value-space index.
-    #[error("invalid pointer range {first_block}:{first} through {after_block}:{after}")]
-    InvalidPointerRange {
-        /// First requested block.
-        first_block: u64,
-        /// First block pointer.
-        first: u64,
-        /// Block after the requested range.
-        after_block: u64,
-        /// Pointer of the block after the range.
-        after: u64,
-    },
-    /// A required absolute map index does not fit the persisted map domain.
-    #[error("absolute map index {index} does not fit u32")]
-    MapIndexOverflow {
-        /// Unrepresentable absolute map index.
-        index: u64,
-    },
-    /// Required maps lie outside the planner-authorized segment maps.
-    #[error("required maps {required_first}..={required_last} are outside {available_first}..={available_last}")]
-    MapsOutsideCoverage {
-        /// First map implied by block pointers.
-        required_first: u32,
-        /// Last map implied by block pointers.
-        required_last: u32,
-        /// First planner-authorized map.
-        available_first: u32,
-        /// Last planner-authorized map.
-        available_last: u32,
-    },
-    /// The logical source failed.
-    #[error("filter-map source failed")]
-    Source(#[source] E),
-    /// The source returned a different number of rows than requested maps.
-    #[error("source returned {actual} rows for {requested} requested maps")]
-    RowCountMismatch {
-        /// Number of requested maps.
-        requested: usize,
-        /// Number of returned row prefixes.
-        actual: usize,
-    },
-    /// A source row exceeds the requested capped prefix.
-    #[error("map {map} row {row} returned {actual} columns beyond prefix limit {limit}")]
-    RowPrefixTooLong {
-        /// Map containing the malformed row.
-        map: u32,
-        /// Row index.
-        row: u32,
-        /// Requested maximum number of columns.
-        limit: u32,
-        /// Number of returned columns.
-        actual: usize,
-    },
-    /// A source row contains a column outside the map width.
-    #[error("map {map} row {row} contains out-of-range column {column}")]
-    MalformedColumn {
-        /// Map containing the malformed row.
-        map: u32,
-        /// Row index.
-        row: u32,
-        /// Invalid column.
-        column: u32,
-    },
-    /// Mapping-layer iteration overflowed before the row became unsaturated.
-    #[error("mapping layers exhausted for map {map} and value {value}")]
-    LayerIndexExhausted {
-        /// Map whose row remained saturated.
-        map: u32,
-        /// Searched log value.
-        value: B256,
-    },
-    /// Converting a local column to an absolute value index overflowed.
-    #[error("candidate arithmetic overflow in map {map} at column {column}")]
-    CandidateArithmeticOverflow {
-        /// Candidate map.
-        map: u32,
-        /// Candidate encoded column.
-        column: u32,
-    },
-    /// A candidate resolved outside the requested block interval.
-    #[error("candidate index {index} resolves outside block range {first}..={last}")]
-    CandidateOutsideBlockRange {
-        /// Candidate value index.
-        index: u64,
-        /// First requested block.
-        first: u64,
-        /// Last requested block.
-        last: u64,
-    },
-    /// Block pointers are not strictly increasing.
-    #[error(
-        "pointer order is not strict: {lower_block}:{lower_pointer}, {upper_block}:{upper_pointer}"
-    )]
-    PointerOrderMismatch {
-        /// Lower block number.
-        lower_block: u64,
-        /// Lower block pointer.
-        lower_pointer: u64,
-        /// Upper block number.
-        upper_block: u64,
-        /// Upper block pointer.
-        upper_pointer: u64,
-    },
-    /// Adjacent pointers do not bracket a candidate assigned to their block.
-    #[error("candidate {index} is not bracketed by block {block} pointers {pointer}..{successor_pointer}")]
-    PointerBracketMismatch {
-        /// Candidate value index.
-        index: u64,
-        /// Candidate block.
-        block: u64,
-        /// Candidate block pointer.
-        pointer: u64,
-        /// Successor block pointer.
-        successor_pointer: u64,
-    },
+fn match_maps(
+    source: &impl FilterMapMatchSource,
+    pattern: &MatchPattern,
+    maps: &[u32],
+    params: Params,
+) -> Result<Vec<u64>, FilterMapsError> {
+    let mut candidates = if pattern.addresses.is_empty() {
+        None
+    } else {
+        Some(match_alternatives(source, &pattern.addresses, maps, params)?)
+    };
+    for (position, topic) in pattern.topics.iter().enumerate() {
+        let Some(values) = topic else { continue };
+        let hits = match_alternatives(source, values, maps, params)?;
+        let starts = log_starts(hits, position as u64 + 1, params.values_per_map());
+        let narrowed = match candidates {
+            None => starts,
+            Some(base) => intersect(&base, &starts),
+        };
+        if narrowed.is_empty() {
+            return Ok(narrowed)
+        }
+        candidates = Some(narrowed);
+    }
+    Ok(candidates.unwrap_or_default())
 }
 
-#[derive(Debug)]
-enum PotentialSet {
-    Any,
-    Some(Vec<u64>),
+fn match_alternatives(
+    source: &impl FilterMapMatchSource,
+    values: &[B256],
+    maps: &[u32],
+    params: Params,
+) -> Result<Vec<u64>, FilterMapsError> {
+    let mut union = Vec::new();
+    for &value in values {
+        union.extend(match_value(source, value, maps, params)?);
+    }
+    union.sort_unstable();
+    union.dedup();
+    Ok(union)
 }
 
-fn combine(base: PotentialSet, next: Vec<u64>, offset: u64, values_per_map: u64) -> PotentialSet {
-    let translated = next
-        .into_iter()
+/// Returns the indices in `maps` where `value` may be marked.
+///
+/// A row that is full on one mapping layer may continue on the next, so the maps whose row is full
+/// are read again one layer up. Maps that share a masked map index share the value's row, so each
+/// run of them hashes the row once and reads it in one call (Geth's `getMatchesForLayer`).
+fn match_value(
+    source: &impl FilterMapMatchSource,
+    value: B256,
+    maps: &[u32],
+    params: Params,
+) -> Result<Vec<u64>, FilterMapsError> {
+    let mut output = Vec::new();
+    let mut active = maps.to_vec();
+    let mut layer = 0;
+    let mut capacity = 0u64;
+    while !active.is_empty() {
+        // A map holds at most `values_per_map` marks. Once the rows read so far could hold them
+        // all, one more full row means the stored rows are corrupt.
+        if capacity >= params.values_per_map() {
+            return Err(FilterMapsError::Corrupt(format!(
+                "row of value {value} in map {} is full on every mapping layer",
+                active[0]
+            )))
+        }
+        let limit = params.max_row_length(layer);
+        capacity += u64::from(limit);
+        let mut full = Vec::new();
+        let runs = active.chunk_by(|a, b| {
+            params.masked_map_index(*a, layer) == params.masked_map_index(*b, layer)
+        });
+        for run in runs {
+            let row_index = row_index(params, run[0], layer, value);
+            let rows = source.row_prefixes(run, row_index, limit)?;
+            // A short read would silently drop candidates.
+            if rows.len() != run.len() {
+                return Err(FilterMapsError::Corrupt(format!(
+                    "read {} rows for {} maps",
+                    rows.len(),
+                    run.len()
+                )))
+            }
+            for (&map, columns) in run.iter().zip(rows) {
+                let map_first = u64::from(map) * params.values_per_map();
+                for column in &columns {
+                    let index = map_first + u64::from(column >> params.hash_bits());
+                    if params.column_index(index, value) == *column {
+                        output.push(index);
+                    }
+                }
+                if columns.len() >= limit as usize {
+                    full.push(map);
+                }
+            }
+        }
+        active = full;
+        layer += 1;
+    }
+    output.sort_unstable();
+    output.dedup();
+    Ok(output)
+}
+
+/// Resolves sorted indices to the blocks that hold them. `first` and `after` are the first block
+/// of the range and the block after it, each with its pointer.
+fn resolve_blocks(
+    source: &impl FilterMapMatchSource,
+    indices: &[u64],
+    first: (u64, u64),
+    after: (u64, u64),
+) -> Result<Vec<u64>, FilterMapsError> {
+    let mut blocks = Vec::<u64>::new();
+    // The last resolved block, its pointer, and the next block's pointer.
+    let mut latest: Option<(u64, u64, u64)> = None;
+    for &index in indices {
+        if let Some((_, pointer, next_pointer)) = latest &&
+            (pointer..next_pointer).contains(&index)
+        {
+            continue
+        }
+        let (mut lower, mut upper) = (first, after);
+        while upper.0 - lower.0 > 1 {
+            let middle = lower.0 + (upper.0 - lower.0) / 2;
+            let pointer = source.block_pointer(middle)?;
+            if pointer <= lower.1 || pointer >= upper.1 {
+                return Err(FilterMapsError::PointerOrder { block: middle, pointer })
+            }
+            if pointer <= index {
+                lower = (middle, pointer);
+            } else {
+                upper = (middle, pointer);
+            }
+        }
+        let (block, pointer) = lower;
+        let next_pointer = upper.1;
+        if !(pointer..next_pointer).contains(&index) {
+            return Err(FilterMapsError::CandidateOutsideBlock {
+                index,
+                block,
+                pointer,
+                next_pointer,
+            })
+        }
+        latest = Some((block, pointer, next_pointer));
+        blocks.push(block);
+    }
+    Ok(blocks)
+}
+
+/// Translates the indices of the value at topic `offset` to the indices where their logs start.
+/// A log never crosses a map boundary, so a start in another map is no match.
+fn log_starts(hits: Vec<u64>, offset: u64, values_per_map: u64) -> Vec<u64> {
+    hits.into_iter()
         .filter_map(|hit| {
             let start = hit.checked_sub(offset)?;
             (start / values_per_map == hit / values_per_map).then_some(start)
         })
-        .collect::<Vec<_>>();
-    match base {
-        PotentialSet::Any => PotentialSet::Some(translated),
-        PotentialSet::Some(base) => {
-            let mut intersection = Vec::new();
-            let (mut left, mut right) = (0, 0);
-            while left < base.len() && right < translated.len() {
-                match base[left].cmp(&translated[right]) {
-                    std::cmp::Ordering::Less => left += 1,
-                    std::cmp::Ordering::Greater => right += 1,
-                    std::cmp::Ordering::Equal => {
-                        intersection.push(base[left]);
-                        left += 1;
-                        right += 1;
-                    }
-                }
+        .collect()
+}
+
+/// Returns the values present in both sorted lists.
+fn intersect(left: &[u64], right: &[u64]) -> Vec<u64> {
+    let (mut i, mut j, mut output) = (0, 0, Vec::new());
+    while i < left.len() && j < right.len() {
+        match left[i].cmp(&right[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                output.push(left[i]);
+                i += 1;
+                j += 1;
             }
-            PotentialSet::Some(intersection)
         }
     }
+    output
+}
+
+fn sorted(values: impl Iterator<Item = B256>) -> Vec<B256> {
+    let mut values = values.collect::<Vec<_>>();
+    values.sort_unstable();
+    values.dedup();
+    values
+}
+
+fn map_index(index: u64) -> Result<u32, FilterMapsError> {
+    u32::try_from(index / DEFAULT_PARAMS.values_per_map()).map_err(|_| {
+        FilterMapsError::Corrupt(format!("log value index {index} is past the last map"))
+    })
+}
+
+/// Computes a row index, counting the computations in tests.
+fn row_index(params: Params, map: u32, layer: u32, value: B256) -> u32 {
+    #[cfg(test)]
+    tests::ROW_HASHES.with(|count| count.set(count.get() + 1));
+    params.row_index(map, layer, value)
 }
 
 #[cfg(test)]
