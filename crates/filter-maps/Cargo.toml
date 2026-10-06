@@ -18,9 +18,13 @@ alloy-primitives.workspace = true
 # crypto
 sha2.workspace = true
 
+# storage
+rocksdb.workspace = true
+
 # misc
 schnellru.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
 reth-filter-maps-test-utils.workspace = true
+tempfile.workspace = true

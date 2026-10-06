@@ -9182,8 +9182,10 @@ version = "2.7.0"
 dependencies = [
  "alloy-primitives",
  "reth-filter-maps-test-utils",
+ "rocksdb",
  "schnellru",
  "sha2 0.10.9",
+ "tempfile",
  "thiserror 2.0.21",
 ]
 

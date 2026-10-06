@@ -24,6 +24,8 @@ mod matcher;
 mod params;
 #[allow(dead_code)]
 mod render;
+#[allow(dead_code)]
+mod store;
 #[cfg(test)]
 mod test_utils;
 mod value;
@@ -38,6 +40,9 @@ pub use value::{address_value, topic_value};
 /// return the error.
 #[derive(Debug, thiserror::Error)]
 pub enum FilterMapsError {
+    /// The store failed.
+    #[error(transparent)]
+    Db(#[from] rocksdb::Error),
     /// A stored record cannot be decoded or contradicts another record.
     #[error("corrupt FilterMaps record: {0}")]
     Corrupt(String),

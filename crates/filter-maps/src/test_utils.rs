@@ -127,5 +127,5 @@ pub(crate) fn take_finished_maps(renderer: &mut Renderer) -> Vec<FinishedMap> {
 
 /// Returns the map that holds log value index `index`.
 pub(crate) fn map_of(index: u64) -> u32 {
-    u32::try_from(index / DEFAULT_PARAMS.values_per_map()).expect("test indices fit a map index")
+    crate::matcher::map_of(index).expect("test indices fit a map index")
 }

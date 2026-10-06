@@ -102,8 +102,8 @@ pub(crate) fn potential_indices(
 ) -> Result<Vec<u64>, FilterMapsError> {
     let params = DEFAULT_PARAMS;
     let mut output = Vec::new();
-    let mut map = map_index(first)?;
-    let last_map = map_index(last)?;
+    let mut map = map_of(first)?;
+    let last_map = map_of(last)?;
     // Each epoch is matched on its own, as in Geth, to bound the memory of one batch.
     loop {
         let epoch_last = params.last_epoch_map(params.map_epoch(map)).min(last_map);
@@ -303,7 +303,8 @@ fn sorted(values: impl Iterator<Item = B256>) -> Vec<B256> {
     values
 }
 
-fn map_index(index: u64) -> Result<u32, FilterMapsError> {
+/// Returns the map that holds log value index `index`.
+pub(crate) fn map_of(index: u64) -> Result<u32, FilterMapsError> {
     u32::try_from(index / DEFAULT_PARAMS.values_per_map()).map_err(|_| {
         FilterMapsError::Corrupt(format!("log value index {index} is past the last map"))
     })
