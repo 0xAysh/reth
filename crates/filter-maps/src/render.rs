@@ -60,7 +60,7 @@ impl Renderer {
         self.iterator.push_block(number, logs, |entry| maps.accept(entry, hash));
         // The block's pending delimiter takes the next slot, so a map that ends just before it is
         // finished already.
-        self.maps.reach(self.iterator.next_index());
+        self.maps.advance_to(self.iterator.next_index());
     }
 
     /// Takes the oldest full map group.
@@ -127,18 +127,18 @@ impl Maps {
                 self.current = BlockRef { number, hash, pointer };
             }
             Entry::Value { index, value } => {
-                self.reach(index);
+                self.advance_to(index);
                 if index >= self.first_index {
                     self.rows.place(self.params, self.index, index, value);
                 }
             }
-            Entry::Delimiter { index } | Entry::Padding { index } => self.reach(index),
+            Entry::Delimiter { index } | Entry::Padding { index } => self.advance_to(index),
         }
     }
 
     /// Finishes the map that is being rendered once the iterator reaches the next map's first
     /// slot. The owner of that slot is the last block of map.
-    fn reach(&mut self, index: u64) {
+    fn advance_to(&mut self, index: u64) {
         while index >= (u64::from(self.index) + 1) * self.params.values_per_map() {
             let map = FinishedMap {
                 index: self.index,

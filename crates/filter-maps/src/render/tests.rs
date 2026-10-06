@@ -1,6 +1,7 @@
 use super::*;
 use crate::{
-    test_utils::{block_hash, map_of, render_fixture, synthetic_logs, take_finished_maps},
+    matcher::map_of,
+    test_utils::{block_hash, render_fixture, synthetic_logs, take_finished_maps},
     DEFAULT_PARAMS,
 };
 use reth_filter_maps_test_utils::{
@@ -86,7 +87,7 @@ fn expected_rows(rows: &[parser::Row]) -> Vec<(u32, Vec<u32>)> {
 #[test]
 fn a_group_is_full_after_its_last_map() {
     let start = BlockRef { number: 100, hash: block_hash(100), pointer: 30 << 16 };
-    let mut renderer = Renderer::new(DEFAULT_PARAMS, start, map_of(start.pointer));
+    let mut renderer = Renderer::new(DEFAULT_PARAMS, start, map_of(start.pointer).unwrap());
     let mut number = start.number;
 
     push_until(&mut renderer, &mut number, |renderer| !renderer.group().is_empty());

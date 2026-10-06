@@ -160,7 +160,7 @@ pub struct NodeConfig<ChainSpec> {
     /// All JIT related arguments with --jit prefix
     pub jit: JitArgs,
 
-    /// All `FilterMaps` related arguments with --filter-maps prefix
+    /// All `FilterMaps` related arguments with --filter-maps prefix.
     pub filter_maps: FilterMapsArgs,
 }
 

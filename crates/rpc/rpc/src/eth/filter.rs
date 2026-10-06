@@ -756,14 +756,13 @@ where
         // In the blocks that FilterMaps indexes, the index names the candidate blocks. Everywhere
         // else, and for a filter without an address or topic, the header bloom does. One snapshot
         // serves the whole query, so every window sees the same index.
-        let pattern = match_pattern(filter);
-        let snapshot = self
+        let index = self
             .filter_maps
             .get()
-            .filter(|_| pattern.has_searchable_values())
-            .map(FilterMapsReader::snapshot);
-        let indexed = match &snapshot {
-            Some(snapshot) => {
+            .map(|reader| (reader.snapshot(), match_pattern(filter)))
+            .filter(|(_, pattern)| pattern.has_searchable_values());
+        let indexed = match &index {
+            Some((snapshot, _)) => {
                 indexed_window(snapshot.indexed_blocks(), receipt_floor(self.provider())?)
             }
             None => None,
@@ -778,13 +777,13 @@ where
             // reading headers is blocking, this gives the cancellation check a chance to run
             tokio::task::yield_now().await;
 
-            let candidates = snapshot
+            let candidates = index
                 .as_ref()
                 .filter(|_| in_index)
-                .map(|snapshot| snapshot.candidate_blocks(from..=to, &pattern));
+                .map(|(snapshot, pattern)| snapshot.candidate_blocks(from..=to, pattern));
             let mut matching_headers = Vec::new();
             if let Some(Ok(candidates)) = candidates {
-                // read only the headers of the candidate blocks
+                // read only the headers of the candidate blocks.
                 for number in candidates {
                     let header = self
                         .provider()
@@ -1554,11 +1553,13 @@ impl<
 mod tests {
     use super::*;
     use crate::{eth::EthApi, EthApiBuilder};
+    use alloy_consensus::TxLegacy;
     use alloy_network::Ethereum;
-    use alloy_primitives::{Bloom, FixedBytes};
+    use alloy_primitives::{Address, Bloom, Bytes, FixedBytes, Log, LogData, Signature};
     use rand::Rng;
     use reth_chainspec::{ChainSpec, ChainSpecProvider};
-    use reth_ethereum_primitives::TxType;
+    use reth_db_api::models::StoredBlockBodyIndices;
+    use reth_ethereum_primitives::{Block, BlockBody, Receipt, TransactionSigned, TxType};
     use reth_evm_ethereum::EthEvmConfig;
     use reth_network_api::noop::NoopNetwork;
     use reth_provider::test_utils::MockEthProvider;
@@ -2405,11 +2406,6 @@ mod tests {
     /// Without a `FilterMaps` reader, an address filter takes the header bloom path.
     #[tokio::test]
     async fn logs_without_filter_maps_use_the_header_bloom() {
-        use alloy_consensus::TxLegacy;
-        use alloy_primitives::{Address, Bytes, Log, LogData, Signature};
-        use reth_db_api::models::StoredBlockBodyIndices;
-        use reth_ethereum_primitives::{Block, BlockBody, Receipt, TransactionSigned};
-
         let provider = MockEthProvider::default();
         let address = Address::repeat_byte(7);
         let log = Log { address, data: LogData::new_unchecked(vec![], Bytes::new()) };

@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::{
-    matcher::candidate_blocks,
+    matcher::{candidate_blocks, map_of},
     render::{BlockRef, Renderer},
     test_utils::{block_hash, MemorySource},
 };
@@ -32,14 +32,14 @@ proptest! {
     ) {
         let mut rng = SplitMix(seed);
         let origin = BlockRef { number: 1000, hash: block_hash(1000), pointer: boundary - before };
-        let first_map = crate::matcher::map_of(origin.pointer).unwrap();
+        let first_map = map_of(origin.pointer).unwrap();
         let mut renderer = Renderer::new(DEFAULT_PARAMS, origin, first_map);
 
         // The origin block has no logs, so its pointer is the origin index.
         let mut blocks = vec![(origin.number, Vec::new())];
         renderer.push_block(origin.number, origin.hash, &[]);
         // Render until the first full map past the origin is finished.
-        let full_map = crate::matcher::map_of(boundary).unwrap();
+        let full_map = map_of(boundary).unwrap();
         let mut maps = Vec::new();
         loop {
             while let Some(group) = renderer.take_full_group() {

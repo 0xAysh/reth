@@ -1,8 +1,8 @@
 use super::*;
 use crate::{
-    matcher::{candidate_blocks, MatchPattern},
+    matcher::{candidate_blocks, map_of, MatchPattern},
     render::Renderer,
-    test_utils::{block_hash, map_of, render_fixture, synthetic_logs, take_finished_maps},
+    test_utils::{block_hash, render_fixture, synthetic_logs, take_finished_maps},
 };
 use alloy_primitives::{hex, Address};
 use reth_filter_maps_test_utils::manifest;
@@ -16,7 +16,7 @@ fn origin(number: u64, pointer: u64) -> BlockRef {
 /// Renders synthetic blocks from `origin` until map `last` is finished and returns the finished
 /// maps, grouped by map group.
 fn render_groups(origin: BlockRef, last: u32) -> Vec<Vec<FinishedMap>> {
-    let mut renderer = Renderer::new(DEFAULT_PARAMS, origin, map_of(origin.pointer));
+    let mut renderer = Renderer::new(DEFAULT_PARAMS, origin, map_of(origin.pointer).unwrap());
     let mut groups = Vec::new();
     let mut number = origin.number;
     while groups.iter().flatten().chain(renderer.group()).all(|map: &FinishedMap| map.index < last)

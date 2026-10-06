@@ -26,13 +26,13 @@ impl MatchPattern {
         addresses: impl IntoIterator<Item = Address>,
         topics: impl IntoIterator<Item = TopicSelection>,
     ) -> Self {
-        let addresses = sorted(addresses.into_iter().map(address_value));
+        let addresses = sorted_unique(addresses.into_iter().map(address_value));
         let topics = topics
             .into_iter()
             .take(4)
             .map(|selection| match selection {
                 TopicSelection::OneOf(values) if !values.is_empty() => {
-                    Some(sorted(values.into_iter().map(topic_value)))
+                    Some(sorted_unique(values.into_iter().map(topic_value)))
                 }
                 TopicSelection::OneOf(_) | TopicSelection::Any => None,
             })
@@ -230,9 +230,9 @@ fn resolve_blocks(
     first: (u64, u64),
     after: (u64, u64),
 ) -> Result<Vec<u64>, FilterMapsError> {
-    let mut blocks = Vec::<u64>::new();
+    let mut blocks = Vec::new();
     // The last resolved block, its pointer, and the next block's pointer.
-    let mut latest: Option<(u64, u64, u64)> = None;
+    let mut latest = None::<(u64, u64, u64)>;
     for &index in indices {
         if let Some((_, pointer, next_pointer)) = latest &&
             (pointer..next_pointer).contains(&index)
@@ -296,7 +296,7 @@ fn intersect(left: &[u64], right: &[u64]) -> Vec<u64> {
     output
 }
 
-fn sorted(values: impl Iterator<Item = B256>) -> Vec<B256> {
+fn sorted_unique(values: impl Iterator<Item = B256>) -> Vec<B256> {
     let mut values = values.collect::<Vec<_>>();
     values.sort_unstable();
     values.dedup();

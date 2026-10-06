@@ -142,4 +142,5 @@ test-utils = [
     "reth-stages-types/test-utils",
     "reth-tasks/test-utils",
     "reth-trie-common/test-utils",
+    "reth-prune-types/test-utils",
 ]

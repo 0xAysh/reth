@@ -10,6 +10,9 @@ use alloy_signer_local::{coins_bip39::English, MnemonicBuilder, PrivateKeySigner
 use futures_util::future::BoxFuture;
 use std::future::IntoFuture;
 
+/// Mnemonic of the test accounts funded by the [`test_genesis`](crate::test_genesis).
+pub const TEST_MNEMONIC: &str = "test test test test test test test test test test test junk";
+
 /// Init code of a contract that emits many `LOG4` logs, for tests of log indexing.
 ///
 /// Called with the three calldata words `(topic0, key, count)`, see [`TestAccount::emit_logs`], the
@@ -43,9 +46,6 @@ pub const LOG_EMITTER_INIT_CODE: &[u8] = &[
     0x60, 0x05, 0x56,       // PUSH1 0x05, JUMP
     0x5b, 0x00,             // 0x22: JUMPDEST, STOP
 ];
-
-/// Mnemonic of the test accounts funded by the [`test_genesis`](crate::test_genesis).
-pub const TEST_MNEMONIC: &str = "test test test test test test test test test test test junk";
 
 /// One of the accounts of the genesis allocations.
 #[derive(Debug)]

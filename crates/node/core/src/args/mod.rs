@@ -80,7 +80,6 @@ pub use storage::{DefaultStorageValues, StorageArgs};
 mod jit;
 pub use jit::JitArgs;
 
-/// `FilterMapsArgs` for configuring the `FilterMaps` log index.
 mod filter_maps;
 pub use filter_maps::FilterMapsArgs;
 

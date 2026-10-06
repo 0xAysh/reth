@@ -3,7 +3,6 @@
 
 use alloy_primitives::{Address, B256, U256};
 use alloy_provider::Provider;
-use alloy_rpc_types_engine::ForkchoiceState;
 use alloy_rpc_types_eth::{Filter, Log};
 use reth_chainspec::EthereumHardfork;
 use reth_e2e_test_utils::{
@@ -13,7 +12,6 @@ use reth_node_core::args::PruningArgs;
 use reth_node_ethereum::EthereumNode;
 use reth_provider::PruneCheckpointReader;
 use reth_prune_types::PruneSegment;
-use std::ops::RangeInclusive;
 
 type Node = NodeHelperType<EthereumNode>;
 
@@ -45,7 +43,7 @@ async fn log_emitter_emits_count_logs() -> eyre::Result<()> {
     let logs = mined.receipts[0].inner.logs();
     let expected = (0..100u64)
         .map(|i| (emitter, vec![topic0, word(i), word(i) ^ key, account.address().into_word()]))
-        .collect::<Vec<(Address, Vec<B256>)>>();
+        .collect::<Vec<_>>();
     let actual = logs
         .iter()
         .map(|log| {
@@ -71,11 +69,11 @@ async fn filter_maps_matches_bloom_path() -> eyre::Result<()> {
 
     let queries = chain.queries(0);
     let bloom = run_queries(&node, &queries).await?;
-    assert_eq!(indexed_blocks(&node), None, "nothing is finalized");
+    assert_eq!(node.filter_maps_indexed_blocks(), None, "nothing is finalized");
 
-    finalize_head(&node).await?;
+    node.finalize(node.block_hash(chain.head)).await?;
     node.wait_for_filter_maps_head(chain.heavy[4]).await?;
-    let indexed = indexed_blocks(&node).unwrap();
+    let indexed = node.filter_maps_indexed_blocks().unwrap();
     assert!(indexed.contains(&chain.heavy[0]) && indexed.contains(&chain.heavy[4]));
     assert_eq!(run_queries(&node, &queries).await?, bloom);
     Ok(())
@@ -93,7 +91,7 @@ async fn filter_maps_resumes_after_restart() -> eyre::Result<()> {
     chain.mine_light(&mut node, 4).await?;
     let queries = chain.queries(0);
     let bloom = run_queries(&node, &queries).await?;
-    finalize_head(&node).await?;
+    node.finalize(node.block_hash(chain.head)).await?;
     node.wait_for_filter_maps_head(chain.heavy[4]).await?;
     assert_eq!(run_queries(&node, &queries).await?, bloom);
 
@@ -105,7 +103,7 @@ async fn filter_maps_resumes_after_restart() -> eyre::Result<()> {
     chain.mine_heavy(&mut node, 3).await?;
     let queries = chain.queries(0);
     let bloom = run_queries(&node, &queries).await?;
-    finalize_head(&node).await?;
+    node.finalize(node.block_hash(chain.head)).await?;
     node.wait_for_filter_maps_head(chain.heavy[7]).await?;
     assert_eq!(run_queries(&node, &queries).await?, bloom);
     Ok(())
@@ -148,10 +146,11 @@ async fn filter_maps_pruned_node_starts_at_receipt_floor() -> eyre::Result<()> {
         Filter::new().address(chain.emitters[2]).from_block(floor - 1).to_block(floor);
     let below_floor_error = node.rpc_provider().get_logs(&below_floor).await.unwrap_err();
 
-    finalize_head(&node).await?;
+    node.finalize(node.block_hash(chain.head)).await?;
     node.wait_for_filter_maps_head(chain.heavy[0]).await?;
-    let indexed = indexed_blocks(&node).unwrap();
-    assert!(*indexed.start() >= floor, "the index starts at the floor {floor}: {indexed:?}");
+    // The store started at genesis, before anything was pruned, so it reset to start here.
+    let indexed = node.filter_maps_indexed_blocks().unwrap();
+    assert_eq!(*indexed.start(), floor);
     assert_eq!(run_queries(&node, &queries).await?, bloom);
     let error = node.rpc_provider().get_logs(&below_floor).await.unwrap_err();
     assert_eq!(error.to_string(), below_floor_error.to_string());
@@ -260,24 +259,6 @@ async fn run_queries(node: &Node, queries: &[Filter]) -> eyre::Result<Vec<Vec<Lo
         results.push(logs);
     }
     Ok(results)
-}
-
-/// Makes the head the safe and finalized block.
-async fn finalize_head(node: &Node) -> eyre::Result<()> {
-    let head = node.current_forkchoice_state()?.head_block_hash;
-    let state = ForkchoiceState {
-        head_block_hash: head,
-        safe_block_hash: head,
-        finalized_block_hash: head,
-    };
-    let updated = node.engine.forkchoice_updated(state).await?;
-    assert!(updated.is_valid(), "{updated:?}");
-    Ok(())
-}
-
-fn indexed_blocks(node: &Node) -> Option<RangeInclusive<u64>> {
-    let filter = &node.rpc.inner.eth_handlers().filter;
-    filter.filter_maps().and_then(|reader| reader.snapshot().indexed_blocks())
 }
 
 /// Returns the lowest block whose receipts the node still holds.

@@ -123,7 +123,7 @@ pub struct NodeCommand<C: ChainSpecParser, Ext: clap::Args + fmt::Debug = NoArgs
     #[command(flatten, next_help_heading = "JIT")]
     pub jit: JitArgs,
 
-    /// All `FilterMaps` related arguments with --filter-maps prefix
+    /// All `FilterMaps` related arguments with --filter-maps prefix.
     #[command(flatten, next_help_heading = "FilterMaps")]
     pub filter_maps: FilterMapsArgs,
 

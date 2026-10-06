@@ -206,3 +206,20 @@ fn missing_receipts_reset_below_the_floor_and_fail_above_it() {
         Err(FilterMapsError::Provider(ProviderError::ReceiptNotFound(block))) if block == 91.into()
     ));
 }
+
+/// The pruner deletes receipts before it commits the checkpoint that raises the receipt floor, so
+/// a batch retries missing receipts once before it fails.
+#[test]
+fn missing_receipts_are_retried_once() {
+    let provider = chain(0..=90);
+    provider.receipts.lock().remove(&70);
+    let dir = tempfile::tempdir().unwrap();
+    let maps = open(dir.path(), 0);
+    let mut indexer = maps.indexer(&provider);
+
+    assert!(indexer.index_batch(90, 90).unwrap(), "the first miss waits for the next call");
+    assert!(matches!(
+        indexer.index_batch(90, 90),
+        Err(FilterMapsError::Provider(ProviderError::ReceiptNotFound(block))) if block == 70.into()
+    ));
+}

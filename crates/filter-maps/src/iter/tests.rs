@@ -57,7 +57,7 @@ fn parse(text: &str) -> Fixture {
                 ["START", "ANCHOR", index] => fixture.start = number(index),
                 ["BLOCK", n, _] => fixture.blocks.push((number(n), Vec::new())),
                 ["LOG", count, address, topics @ ..] => {
-                    let address: Address = address.parse().expect("fixture address");
+                    let address = address.parse::<Address>().expect("fixture address");
                     let log = Log::new_unchecked(
                         address,
                         topics.iter().map(|topic| hash(topic)).collect(),

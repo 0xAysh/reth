@@ -4,7 +4,7 @@
 //! choosing an index origin just before them, never by shrinking the parameters.
 
 use crate::{
-    matcher::FilterMapMatchSource,
+    matcher::{map_of, FilterMapMatchSource},
     render::{BlockRef, FinishedMap, Renderer},
     FilterMapsError, DEFAULT_PARAMS,
 };
@@ -107,7 +107,7 @@ pub(crate) fn fixture_start(fixture: &Fixture) -> BlockRef {
 /// Renders a fixture from its origin, as the Geth oracle did, and returns the renderer.
 pub(crate) fn render_fixture(fixture: &Fixture) -> Renderer {
     let start = fixture_start(fixture);
-    let first_map = map_of(start.pointer);
+    let first_map = map_of(start.pointer).unwrap();
     let mut renderer = Renderer::new(DEFAULT_PARAMS, start, first_map);
     for block in &fixture.blocks {
         renderer.push_block(block.number, block.hash, &fixture_logs(block));
@@ -123,9 +123,4 @@ pub(crate) fn take_finished_maps(renderer: &mut Renderer) -> Vec<FinishedMap> {
     }
     maps.extend(renderer.group().iter().cloned());
     maps
-}
-
-/// Returns the map that holds log value index `index`.
-pub(crate) fn map_of(index: u64) -> u32 {
-    crate::matcher::map_of(index).expect("test indices fit a map index")
 }

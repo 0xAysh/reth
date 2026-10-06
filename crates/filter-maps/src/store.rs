@@ -46,9 +46,7 @@ impl Store {
         if let Some(record) = store.db.get(RANGE_KEY)? &&
             Range::decode(&record).is_none()
         {
-            let mut batch = WriteBatch::default();
-            wipe(&mut batch);
-            store.db.write(batch)?;
+            store.wipe()?;
         }
         Ok(store)
     }

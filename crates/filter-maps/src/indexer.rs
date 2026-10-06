@@ -20,7 +20,7 @@ use reth_prune_types::PruneSegment;
 use reth_storage_api::{BlockHashReader, PruneCheckpointReader, ReceiptProvider};
 use reth_storage_errors::provider::ProviderError;
 use std::sync::Arc;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 /// The number of blocks whose hashes are read at once, and that [`Indexer::run`] renders between
 /// two checks for shutdown.
@@ -36,12 +36,21 @@ pub struct Indexer<P> {
     provider: P,
     /// The rendering state, once the store is checked against the chain.
     state: Option<Rendering>,
+    /// The block whose receipts the last batch found missing.
+    missing_receipts: Option<u64>,
     metrics: IndexerMetrics,
 }
 
 impl<P> Indexer<P> {
     pub(crate) fn new(store: Arc<Store>, config: FilterMapsConfig, provider: P) -> Self {
-        Self { store, config, provider, state: None, metrics: IndexerMetrics::default() }
+        Self {
+            store,
+            config,
+            provider,
+            state: None,
+            missing_receipts: None,
+            metrics: IndexerMetrics::default(),
+        }
     }
 }
 
@@ -55,8 +64,8 @@ where
 {
     /// Indexes up to min(finalized, persisted) whenever either moves.
     ///
-    /// It renders [`BATCH`] blocks at a time and yields in between, so a shutdown does not wait
-    /// for a long catch-up. On an error it logs and returns. The stored range stays correct, so
+    /// It renders 1,000 blocks at a time and yields in between, so a shutdown does not wait for a
+    /// long catch-up. On an error it logs and returns. The stored range stays correct, so
     /// queries keep using it.
     pub async fn run(mut self) {
         let mut finalized = self.provider.subscribe_finalized_block();
@@ -66,7 +75,7 @@ where
             let finalized_block = finalized.borrow_and_update().as_ref().map(|h| h.number());
             let persisted_block = persisted.borrow_and_update().map(|block| block.number);
             if let (Some(finalized), Some(persisted)) = (finalized_block, persisted_block) {
-                match self.wake(finalized.min(persisted), finalized) {
+                match self.index_batch(finalized.min(persisted), finalized) {
                     Ok(true) => {}
                     Ok(false) => {
                         tokio::task::yield_now().await;
@@ -84,19 +93,35 @@ where
             }
         }
     }
+}
 
-    /// Renders one batch towards `target` and returns whether the index caught up.
-    fn wake(&mut self, target: u64, finalized: u64) -> Result<bool, FilterMapsError> {
+impl<P> Indexer<P>
+where
+    P: ReceiptProvider + BlockHashReader + PruneCheckpointReader,
+{
+    /// Indexes up to [`BATCH`] blocks towards `target` and returns whether the index caught up.
+    ///
+    /// Missing receipts are retried once, at the next call: the pruner deletes receipts before it
+    /// commits the checkpoint that raises the receipt floor, so the floor read for this batch can
+    /// be stale. If the next call still misses the same block, it fails.
+    fn index_batch(&mut self, target: u64, finalized: u64) -> Result<bool, FilterMapsError> {
         let floor = receipt_floor(&self.provider)?;
-        match self.sync(target, floor, finalized, BATCH) {
-            // The pruner may have moved the receipt floor past the block since it was read. The
-            // next pass then sees the gap and starts a new origin.
+        let result = self.sync(target, floor, finalized, BATCH);
+        let next_block = self.state.as_ref().map(|state| state.next_block);
+        match result {
             Err(FilterMapsError::Provider(ProviderError::ReceiptNotFound(_)))
-                if receipt_floor(&self.provider)? > floor =>
+                if next_block.is_some() && self.missing_receipts != next_block =>
             {
-                Ok(false)
+                warn!(target: "filter_maps", ?next_block, "Receipts are missing, retrying later");
+                self.missing_receipts = next_block;
+                Ok(true)
             }
-            result => result,
+            result => {
+                if result.is_ok() {
+                    self.missing_receipts = None;
+                }
+                result
+            }
         }
     }
 }
@@ -138,7 +163,7 @@ where
         }
         let Some(state) = self.state.as_ref() else { return Ok(true) };
         let last = target.min(state.next_block.saturating_add(max_blocks - 1));
-        self.render(last)?;
+        self.render(last, last == target)?;
         self.drop_tail(floor, finalized)?;
         Ok(last == target)
     }
@@ -204,16 +229,19 @@ where
         Ok(())
     }
 
-    fn render(&mut self, target: u64) -> Result<(), FilterMapsError> {
+    /// Renders the blocks up to `last` and writes every full group. At the target, it also writes
+    /// the maps of the unfinished group so far. Before it, they would only cost writes, and after
+    /// a restart they could hold fewer maps than the store and move the index head back.
+    fn render(&mut self, last: u64, at_target: bool) -> Result<(), FilterMapsError> {
         let Some(state) = self.state.as_mut() else { return Ok(()) };
-        while state.next_block <= target {
+        while state.next_block <= last {
             let first = state.next_block;
-            let last = target.min(first + BATCH - 1);
-            let hashes = self.provider.canonical_hashes_range(first, last + 1)?;
-            if let Some(missing) = (first..=last).nth(hashes.len()) {
+            let batch_last = last.min(first + BATCH - 1);
+            let hashes = self.provider.canonical_hashes_range(first, batch_last + 1)?;
+            if let Some(missing) = (first..=batch_last).nth(hashes.len()) {
                 return Err(ProviderError::HeaderNotFound(missing.into()).into())
             }
-            for (number, hash) in (first..=last).zip(hashes) {
+            for (number, hash) in (first..=batch_last).zip(hashes) {
                 // A block's receipts come back whole or not at all, so a pruned block can never
                 // look like a block without logs.
                 let receipts = self
@@ -228,9 +256,8 @@ where
                 }
             }
         }
-        // The renderer reached the target: store the maps of the unfinished group so far.
         let group = state.renderer.group();
-        if group.len() > state.written {
+        if at_target && group.len() > state.written {
             state.written = group.len();
             write(&self.store, &mut state.range, group, &self.metrics)?;
         }
@@ -286,6 +313,26 @@ impl Rendering {
     }
 }
 
+#[derive(Metrics)]
+#[metrics(scope = "filter_maps")]
+struct IndexerMetrics {
+    /// The first block whose log values are all in stored maps.
+    first_indexed_block: Gauge,
+    /// The index head: the last block whose log values are all in stored maps.
+    last_indexed_block: Gauge,
+    /// The number of maps stored.
+    maps_rendered: Counter,
+}
+
+impl IndexerMetrics {
+    fn record(&self, range: &Range) {
+        if let Some(blocks) = range.indexed_blocks() {
+            self.first_indexed_block.set(*blocks.start() as f64);
+            self.last_indexed_block.set(*blocks.end() as f64);
+        }
+    }
+}
+
 /// Writes a map group and extends `range` with it.
 fn write(
     store: &Store,
@@ -321,26 +368,6 @@ fn resume_point(
 fn receipt_floor(provider: &impl PruneCheckpointReader) -> Result<u64, FilterMapsError> {
     let checkpoint = provider.get_prune_checkpoint(PruneSegment::Receipts)?;
     Ok(checkpoint.and_then(|checkpoint| checkpoint.block_number).map_or(0, |block| block + 1))
-}
-
-#[derive(Metrics)]
-#[metrics(scope = "filter_maps")]
-struct IndexerMetrics {
-    /// The first block whose log values are all in stored maps.
-    first_indexed_block: Gauge,
-    /// The index head: the last block whose log values are all in stored maps.
-    last_indexed_block: Gauge,
-    /// The number of maps stored.
-    maps_rendered: Counter,
-}
-
-impl IndexerMetrics {
-    fn record(&self, range: &Range) {
-        if let Some(blocks) = range.indexed_blocks() {
-            self.first_indexed_block.set(*blocks.start() as f64);
-            self.last_indexed_block.set(*blocks.end() as f64);
-        }
-    }
 }
 
 #[cfg(test)]

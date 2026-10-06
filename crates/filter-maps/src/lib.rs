@@ -22,6 +22,10 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+use reth_storage_errors::provider::ProviderError;
+use std::{ops::RangeInclusive, path::Path, sync::Arc};
+use store::{Range, Store, StoreSnapshot};
+
 mod indexer;
 mod iter;
 mod matcher;
@@ -38,10 +42,6 @@ pub use indexer::Indexer;
 pub use matcher::{MatchPattern, TopicSelection};
 pub use params::{Params, DEFAULT_PARAMS};
 pub use value::{address_value, topic_value};
-
-use reth_storage_errors::provider::ProviderError;
-use std::{ops::RangeInclusive, path::Path, sync::Arc};
-use store::{Range, Store, StoreSnapshot};
 
 /// The `FilterMaps` index: a store, plus handles that read and fill it.
 #[derive(Debug, Clone)]

@@ -55,6 +55,7 @@ use reth_rpc_eth_api::{
 use reth_stages_types::StageId;
 use reth_transaction_pool::TransactionPool;
 use std::{
+    ops::RangeInclusive,
     pin::{pin, Pin},
     sync::{Arc, Mutex, PoisonError},
     time::{Duration, Instant},
@@ -893,13 +894,17 @@ where
     /// Returns an error if the index does not reach the block within [`WAIT_TIMEOUT`], e.g.
     /// because the node runs without `--filter-maps` or the block is not finalized.
     pub async fn wait_for_filter_maps_head(&self, number: BlockNumber) -> eyre::Result<()> {
-        let filter = &self.rpc.inner.eth_handlers().filter;
         poll_until(format!("FilterMaps to index block {number}"), move || async move {
-            let indexed =
-                filter.filter_maps().and_then(|reader| reader.snapshot().indexed_blocks());
+            let indexed = self.filter_maps_indexed_blocks();
             Ok(indexed.is_some_and(|blocks| *blocks.end() >= number).then_some(()))
         })
         .await
+    }
+
+    /// Returns the blocks the `FilterMaps` index of the node covers, or `None` if the node runs
+    /// without `--filter-maps` or the index covers no block yet.
+    pub fn filter_maps_indexed_blocks(&self) -> Option<RangeInclusive<BlockNumber>> {
+        self.rpc.inner.eth_handlers().filter.filter_maps()?.snapshot().indexed_blocks()
     }
 
     /// Waits until the block with the given hash is the latest block of the node, i.e. its
@@ -1012,6 +1017,17 @@ where
         // synced by backfill don't notify the pool, so wait for at most a second.
         let _ = tokio::time::timeout(Duration::from_secs(1), self.wait_for_pool_head(block)).await;
 
+        Ok(())
+    }
+
+    /// Makes the block with the given hash the head, safe and finalized block of the node.
+    ///
+    /// Unlike [`Self::update_forkchoice`], this returns an error unless the engine accepts the
+    /// update as `VALID`. Unlike [`Self::sync_to`], it sends the update when the block is already
+    /// the head.
+    pub async fn finalize(&self, block: BlockHash) -> eyre::Result<()> {
+        let updated = self.engine.forkchoice_updated(ForkchoiceState::same_hash(block)).await?;
+        ensure!(updated.is_valid(), "forkchoice update to {block}: {:?}", updated.payload_status);
         Ok(())
     }
 
@@ -1787,6 +1803,7 @@ mod tests {
         assert_send(node.wait_for_persisted_block(0));
         assert_send(node.wait_for_prune_checkpoint(PruneSegment::SenderRecovery, 0));
         assert_send(node.wait_for_filter_maps_head(0));
+        assert_send(node.finalize(B256::ZERO));
         assert_send(node.wait_for_head(B256::ZERO));
         assert_send(node.assert_new_block(B256::ZERO, B256::ZERO, 0));
         assert_send(node.sync_to(B256::ZERO));
