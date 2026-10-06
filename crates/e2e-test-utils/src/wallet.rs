@@ -267,7 +267,8 @@ impl TestAccount {
     /// [`LOG_EMITTER_INIT_CODE`] for their topics.
     ///
     /// The gas limit covers the logs: 2,000 gas per log on top of 30,000. Two calls of 7,000 logs
-    /// fit a 30M gas block.
+    /// fit a 30M gas block. At the account's default fees, a call of more than about 250 logs
+    /// exceeds the default RPC fee cap of 1 ETH, so lower the fees or raise `--rpc.txfeecap`.
     pub fn emit_logs(
         &mut self,
         emitter: Address,

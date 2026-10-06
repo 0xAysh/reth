@@ -22,8 +22,9 @@ use reth_storage_errors::provider::ProviderError;
 use std::sync::Arc;
 use tracing::{debug, error};
 
-/// The number of blocks whose hashes are read at once.
-const HASH_BATCH: u64 = 1_000;
+/// The number of blocks whose hashes are read at once, and that [`Indexer::run`] renders between
+/// two checks for shutdown.
+const BATCH: u64 = 1_000;
 
 /// Indexes finalized blocks into the `FilterMaps` store.
 ///
@@ -54,7 +55,9 @@ where
 {
     /// Indexes up to min(finalized, persisted) whenever either moves.
     ///
-    /// On an error it logs and returns. The stored range stays correct, so queries keep using it.
+    /// It renders [`BATCH`] blocks at a time and yields in between, so a shutdown does not wait
+    /// for a long catch-up. On an error it logs and returns. The stored range stays correct, so
+    /// queries keep using it.
     pub async fn run(mut self) {
         let mut finalized = self.provider.subscribe_finalized_block();
         let mut persisted = self.provider.subscribe_persisted_block();
@@ -62,11 +65,18 @@ where
             // The watch streams do not yield their current value, so read it first.
             let finalized_block = finalized.borrow_and_update().as_ref().map(|h| h.number());
             let persisted_block = persisted.borrow_and_update().map(|block| block.number);
-            if let (Some(finalized), Some(persisted)) = (finalized_block, persisted_block) &&
-                let Err(error) = self.wake(finalized.min(persisted), finalized)
-            {
-                error!(target: "filter_maps", %error, "FilterMaps indexer stopped");
-                return
+            if let (Some(finalized), Some(persisted)) = (finalized_block, persisted_block) {
+                match self.wake(finalized.min(persisted), finalized) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tokio::task::yield_now().await;
+                        continue
+                    }
+                    Err(error) => {
+                        error!(target: "filter_maps", %error, "FilterMaps indexer stopped");
+                        return
+                    }
+                }
             }
             tokio::select! {
                 changed = finalized.changed() => if changed.is_err() { return },
@@ -75,15 +85,16 @@ where
         }
     }
 
-    fn wake(&mut self, target: u64, finalized: u64) -> Result<(), FilterMapsError> {
+    /// Renders one batch towards `target` and returns whether the index caught up.
+    fn wake(&mut self, target: u64, finalized: u64) -> Result<bool, FilterMapsError> {
         let floor = receipt_floor(&self.provider)?;
-        match self.sync_to(target, floor, finalized) {
+        match self.sync(target, floor, finalized, BATCH) {
             // The pruner may have moved the receipt floor past the block since it was read. The
             // next pass then sees the gap and starts a new origin.
             Err(FilterMapsError::Provider(ProviderError::ReceiptNotFound(_)))
                 if receipt_floor(&self.provider)? > floor =>
             {
-                self.sync_to(target, receipt_floor(&self.provider)?, finalized)
+                Ok(false)
             }
             result => result,
         }
@@ -96,12 +107,26 @@ where
 {
     /// Indexes the finished maps of the blocks up to `target`, then drops the epochs behind the
     /// tail cutoff. `floor` is the receipt floor and `finalized` the finalized block.
+    #[cfg(test)]
     pub(crate) fn sync_to(
         &mut self,
         target: u64,
         floor: u64,
         finalized: u64,
     ) -> Result<(), FilterMapsError> {
+        self.sync(target, floor, finalized, u64::MAX).map(drop)
+    }
+
+    /// Indexes the finished maps of the blocks up to `target`, rendering at most `max_blocks`
+    /// blocks, then drops the epochs behind the tail cutoff. `floor` is the receipt floor and
+    /// `finalized` the finalized block. Returns whether the index caught up with `target`.
+    fn sync(
+        &mut self,
+        target: u64,
+        floor: u64,
+        finalized: u64,
+        max_blocks: u64,
+    ) -> Result<bool, FilterMapsError> {
         // A gap reset: the next block's receipts are pruned, so the store cannot continue.
         if self.state.as_ref().is_some_and(|state| state.next_block < floor) {
             debug!(target: "filter_maps", floor, "Receipt floor passed the index, starting over");
@@ -111,8 +136,11 @@ where
         if self.state.is_none() {
             self.state = self.start(target, floor)?;
         }
-        self.render(target)?;
-        self.drop_tail(floor, finalized)
+        let Some(state) = self.state.as_ref() else { return Ok(true) };
+        let last = target.min(state.next_block.saturating_add(max_blocks - 1));
+        self.render(last)?;
+        self.drop_tail(floor, finalized)?;
+        Ok(last == target)
     }
 
     /// Checks the store against the chain and returns where rendering resumes, or `None` while
@@ -180,7 +208,7 @@ where
         let Some(state) = self.state.as_mut() else { return Ok(()) };
         while state.next_block <= target {
             let first = state.next_block;
-            let last = target.min(first + HASH_BATCH - 1);
+            let last = target.min(first + BATCH - 1);
             let hashes = self.provider.canonical_hashes_range(first, last + 1)?;
             if let Some(missing) = (first..=last).nth(hashes.len()) {
                 return Err(ProviderError::HeaderNotFound(missing.into()).into())
