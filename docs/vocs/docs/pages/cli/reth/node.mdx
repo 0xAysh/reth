@@ -1272,6 +1272,17 @@ JIT:
 
           IR, assembly, and bytecode are written to `<datadir>/jit/<spec_id>/<code_hash>/` for each compiled contract. Note that this is not ever cleaned up, and has a non negligible performance overhead.
 
+FilterMaps:
+      --filter-maps
+          Index finalized blocks with `FilterMaps` and serve `eth_getLogs` from the index.
+
+          The index needs every log of a block, so it cannot run with `--minimal` or `--prune.receiptslogfilter`.
+
+      --filter-maps.history <BLOCKS>
+          Number of blocks up to the finalized block to keep indexed. 0 keeps every block with receipts
+
+          [default: 2350000]
+
 Logging:
       --log.stdout.format <FORMAT>
           The format to use for logs written to stdout
