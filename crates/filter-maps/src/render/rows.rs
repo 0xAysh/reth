@@ -1,4 +1,6 @@
-use crate::Params;
+//! The rows of the filter map that is being rendered, with Geth's row-mapping cache.
+
+use crate::DEFAULT_PARAMS;
 use alloy_primitives::B256;
 use schnellru::{ByLength, LruMap};
 use std::collections::HashMap;
@@ -13,32 +15,22 @@ pub(crate) struct ActiveRows {
     /// Geth's row-mapping cache: the row and mapping layer where a value was last marked. Rows
     /// only grow while a map is rendered, so the layers below the cached one stay full.
     cache: LruMap<B256, (u32, u32)>,
-    /// The number of placements that started from a cached row mapping.
-    #[cfg(test)]
-    cache_hits: usize,
 }
 
 impl ActiveRows {
     /// Creates the rows of an empty map.
     pub(crate) fn new() -> Self {
-        Self {
-            rows: HashMap::new(),
-            cache: LruMap::new(ByLength::new(CACHED_ROW_MAPPINGS)),
-            #[cfg(test)]
-            cache_hits: 0,
-        }
+        Self { rows: HashMap::new(), cache: LruMap::new(ByLength::new(CACHED_ROW_MAPPINGS)) }
     }
 
-    /// Marks `value` at log value index `index` on the lowest mapping layer whose row has room.
+    /// Marks `value` at log value index `index` on the lowest mapping layer whose row has room,
+    /// on map `map_index`.
     ///
     /// The layer always stays small: a map holds at most `values_per_map` marks, so only a handful
     /// of rows can be full at the clamped maximum row length.
-    pub(crate) fn place(&mut self, params: Params, map_index: u32, index: u64, value: B256) {
+    pub(crate) fn place(&mut self, map_index: u32, index: u64, value: B256) {
+        let params = DEFAULT_PARAMS;
         let cached = self.cache.get(&value).copied();
-        #[cfg(test)]
-        if cached.is_some() {
-            self.cache_hits += 1;
-        }
         let (mut row_index, mut layer) =
             cached.unwrap_or_else(|| (params.row_index(map_index, 0, value), 0));
         let mut moved = cached.is_none();
@@ -68,14 +60,13 @@ impl ActiveRows {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::DEFAULT_PARAMS;
 
     #[test]
     fn a_value_is_marked_at_its_row_and_column() {
         let params = DEFAULT_PARAMS;
         let value = B256::ZERO;
         let mut rows = ActiveRows::new();
-        rows.place(params, 0, 0, value);
+        rows.place(0, 0, value);
         assert_eq!(
             rows.finish(),
             [(params.row_index(0, 0, value), vec![params.column_index(0, value)])]
@@ -89,7 +80,7 @@ mod tests {
         let mut rows = ActiveRows::new();
         let base_row_length = params.base_row_length() as u64;
         for index in 0..=base_row_length {
-            rows.place(params, 0, index, value);
+            rows.place(0, index, value);
         }
 
         let base_row = params.row_index(0, 0, value);
@@ -104,7 +95,7 @@ mod tests {
     /// Places a small pool of values many times, so rows fill up and spill to higher layers, and
     /// compares the rows with a placement that starts every value at layer 0.
     #[test]
-    fn repeated_values_hit_the_row_mapping_cache() {
+    fn repeated_values_reuse_the_row_mapping_cache() {
         let params = DEFAULT_PARAMS;
         let map_index = 1500;
         let pool = [B256::repeat_byte(1), B256::repeat_byte(2), B256::repeat_byte(3)];
@@ -112,7 +103,7 @@ mod tests {
         let mut cold = HashMap::<u32, Vec<u32>>::new();
         for index in 0..600u64 {
             let value = pool[(index % 3) as usize];
-            cached.place(params, map_index, index, value);
+            cached.place(map_index, index, value);
 
             let mut layer = 0;
             loop {
@@ -125,7 +116,7 @@ mod tests {
             }
         }
 
-        assert_eq!(cached.cache_hits, 597, "every placement after a value's first one is a hit");
+        assert_eq!(cached.cache.len(), pool.len(), "every value of the pool has a cached mapping");
         let mut cold = cold.into_iter().collect::<Vec<_>>();
         cold.sort_unstable();
         assert_eq!(cached.finish(), cold);
@@ -146,7 +137,7 @@ mod tests {
             rows.rows.insert(*row, vec![0; params.max_row_length(layer) as usize]);
         }
 
-        rows.place(params, 0, 5, value);
+        rows.place(0, 5, value);
         assert_eq!(rows.rows[&layer_rows[3]], [params.column_index(5, value)]);
     }
 }

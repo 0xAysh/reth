@@ -5,15 +5,14 @@
 //! record where Geth finished a map; the renderer owns that, and the pipeline fixtures pin it.
 
 use super::*;
-use crate::DEFAULT_PARAMS;
 use alloy_primitives::{Address, Bytes};
 
 const GETH_HEADER: &str = "# Geth af7c0fd8ee09de71b1034dbe6d1112556b49b59f";
 const GENERATOR_HEADER: &str = "# Generator https://github.com/0xAysh/reth/blob/84f857a707326ffcbc4fb71d8a53104ed144b125/tools/filtermaps-oracles/stream/gen_stream_test.go";
 
-/// One observable step of the value space, as both Geth and the iterator report it.
+/// One observable step of the value space, as both Geth and the assigner report it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Event {
+enum Observation {
     Pointer { block: u64, index: u64 },
     Value { index: u64, value: B256 },
     Delimiter { index: u64, block: u64 },
@@ -23,7 +22,7 @@ enum Event {
 struct Fixture {
     start: u64,
     blocks: Vec<(u64, Vec<Log>)>,
-    expected: Vec<Event>,
+    expected: Vec<Observation>,
     head: (u64, u64, u64),
 }
 
@@ -73,17 +72,17 @@ fn parse(text: &str) -> Fixture {
             }
             continue
         }
-        let event = match fields.as_slice() {
-            ["P", n, _, i] => Event::Pointer { block: number(n), index: number(i) },
+        let observation = match fields.as_slice() {
+            ["P", n, _, i] => Observation::Pointer { block: number(n), index: number(i) },
             ["V", first, last, h, _kind] => {
                 assert!(number(first) <= number(last));
                 for index in number(first)..=number(last) {
-                    fixture.expected.push(Event::Value { index, value: hash(h) });
+                    fixture.expected.push(Observation::Value { index, value: hash(h) });
                 }
                 continue
             }
-            ["D", i, n, _] => Event::Delimiter { index: number(i), block: number(n) },
-            ["X", i] => Event::Padding { index: number(i) },
+            ["D", i, n, _] => Observation::Delimiter { index: number(i), block: number(n) },
+            ["X", i] => Observation::Padding { index: number(i) },
             ["M", ..] => continue,
             ["H", n, _, pointer, pending] => {
                 head = Some((number(n), number(pointer), number(pending)));
@@ -91,7 +90,7 @@ fn parse(text: &str) -> Fixture {
             }
             _ => panic!("unknown fixture event: {line}"),
         };
-        fixture.expected.push(event);
+        fixture.expected.push(observation);
     }
     assert!(events && !fixture.blocks.is_empty() && !fixture.expected.is_empty());
     fixture.head = head.expect("every kept fixture ends at the head");
@@ -100,20 +99,21 @@ fn parse(text: &str) -> Fixture {
 
 fn check(text: &str) {
     let fixture = parse(text);
-    let mut iterator = LogIterator::new(DEFAULT_PARAMS, fixture.start);
+    let mut assigner = SlotAssigner::new(fixture.start);
     let mut actual = Vec::new();
     let mut previous = None;
     for (number, logs) in &fixture.blocks {
-        iterator.push_block(*number, logs, |entry| {
-            actual.push(match entry {
-                Entry::BlockStart { number, pointer } => {
-                    Event::Pointer { block: number, index: pointer }
+        assigner.push_block(*number, logs, |event| {
+            actual.push(match event {
+                Event::BlockStart(start) => {
+                    Observation::Pointer { block: start.block, index: start.pointer }
                 }
-                Entry::Value { index, value } => Event::Value { index, value },
-                Entry::Delimiter { index } => {
-                    Event::Delimiter { index, block: previous.expect("a delimiter closes a block") }
-                }
-                Entry::Padding { index } => Event::Padding { index },
+                Event::Value { index, value } => Observation::Value { index, value },
+                Event::Delimiter { index } => Observation::Delimiter {
+                    index,
+                    block: previous.expect("a delimiter closes a block"),
+                },
+                Event::Padding { index } => Observation::Padding { index },
             })
         });
         previous = Some(*number);
@@ -121,12 +121,12 @@ fn check(text: &str) {
     assert_eq!(actual, fixture.expected);
 
     let (head, head_pointer, pending) = fixture.head;
-    let last_pointer = actual.iter().rev().find_map(|event| match event {
-        Event::Pointer { block, index } => Some((*block, *index)),
+    let last_pointer = actual.iter().rev().find_map(|observation| match observation {
+        Observation::Pointer { block, index } => Some((*block, *index)),
         _ => None,
     });
     assert_eq!(last_pointer, Some((head, head_pointer)), "head pointer");
-    assert_eq!(iterator.next_index(), pending, "pending head delimiter");
+    assert_eq!(assigner.next_index(), pending, "pending head delimiter");
 }
 
 macro_rules! fixture_tests {

@@ -2,15 +2,15 @@
 //!
 //! This is the map-filling part of Geth's `mapRenderer` (`core/filtermaps/map_renderer.go`).
 
-mod rows;
-
 use crate::{
-    iter::{Entry, LogIterator},
-    Params,
+    slots::{BlockPointer, Event, SlotAssigner},
+    DEFAULT_PARAMS,
 };
 use alloy_primitives::{Log, B256};
 use rows::ActiveRows;
 use std::{collections::VecDeque, mem};
+
+mod rows;
 
 /// Renders the log values of consecutive blocks into finished filter maps.
 ///
@@ -18,8 +18,8 @@ use std::{collections::VecDeque, mem};
 /// until their map group is full.
 #[derive(Debug)]
 pub(crate) struct Renderer {
-    iterator: LogIterator,
-    maps: Maps,
+    assigner: SlotAssigner,
+    builder: MapBuilder,
 }
 
 impl Renderer {
@@ -30,15 +30,15 @@ impl Renderer {
     /// stored, so they are skipped, as Geth's `newLogIteratorFromMapBoundary` does. The start
     /// block's own pointer is never recorded here: it is the origin record or belongs to an
     /// earlier map.
-    pub(crate) fn new(params: Params, start: BlockRef, first_map: u32) -> Self {
-        let map_start = u64::from(first_map) * params.values_per_map();
-        debug_assert!(start.pointer < map_start + params.values_per_map(), "start after first map");
+    pub(crate) fn new(start: BlockRef, first_map: u32) -> Self {
+        let values_per_map = DEFAULT_PARAMS.values_per_map();
+        let map_start = u64::from(first_map) * values_per_map;
+        debug_assert!(start.pointer < map_start + values_per_map, "start after first map");
         Self {
-            iterator: LogIterator::new(params, start.pointer),
-            maps: Maps {
-                params,
+            assigner: SlotAssigner::new(start.pointer),
+            builder: MapBuilder {
                 first_index: start.pointer.max(map_start),
-                index: first_map,
+                map_index: first_map,
                 rows: ActiveRows::new(),
                 pointers: Vec::new(),
                 current: start,
@@ -56,21 +56,21 @@ impl Renderer {
         hash: B256,
         logs: impl IntoIterator<Item = &'a Log>,
     ) {
-        let maps = &mut self.maps;
-        self.iterator.push_block(number, logs, |entry| maps.accept(entry, hash));
+        let builder = &mut self.builder;
+        self.assigner.push_block(number, logs, |event| builder.accept(event, hash));
         // The block's pending delimiter takes the next slot, so a map that ends just before it is
         // finished already.
-        self.maps.advance_to(self.iterator.next_index());
+        self.builder.advance_to(self.assigner.next_index());
     }
 
     /// Takes the oldest full map group.
     pub(crate) fn take_full_group(&mut self) -> Option<Vec<FinishedMap>> {
-        self.maps.full_groups.pop_front()
+        self.builder.full_groups.pop_front()
     }
 
     /// Returns the finished maps of the current map group.
     pub(crate) fn group(&self) -> &[FinishedMap] {
-        &self.maps.group
+        &self.builder.group
     }
 }
 
@@ -81,9 +81,9 @@ pub(crate) struct FinishedMap {
     pub(crate) index: u32,
     /// The nonempty rows in ascending row order, with columns in insertion order.
     pub(crate) rows: Vec<(u32, Vec<u32>)>,
-    /// The `(number, pointer)` of every block whose pointer follows the map's first slot and is at
-    /// most the next map's first slot, in block order. This is Geth's `blockLvPtrs`.
-    pub(crate) pointers: Vec<(u64, u64)>,
+    /// The pointer of every block whose pointer follows the map's first slot and is at most the
+    /// next map's first slot, in block order. This is Geth's `blockLvPtrs`.
+    pub(crate) pointers: Vec<BlockPointer>,
     /// The last block of map: the block that holds the next map's first slot.
     pub(crate) last_block: BlockRef,
 }
@@ -99,56 +99,56 @@ pub(crate) struct BlockRef {
     pub(crate) pointer: u64,
 }
 
-/// The renderer's state besides the iterator, kept apart so the iterator's sink can borrow it.
+/// Builds finished maps from the assigner's events. It is kept apart from the assigner so the
+/// assigner's sink can borrow it.
 #[derive(Debug)]
-struct Maps {
-    params: Params,
+struct MapBuilder {
     /// The first slot that is marked.
     first_index: u64,
     /// The index of the map that is being rendered.
-    index: u32,
+    map_index: u32,
     rows: ActiveRows,
-    pointers: Vec<(u64, u64)>,
-    /// The block that owns the iterator's position.
+    pointers: Vec<BlockPointer>,
+    /// The block that owns the assigner's position.
     current: BlockRef,
-    /// Whether the iterator has not yet reported the start block's pointer.
+    /// Whether the assigner has not yet reported the start block's pointer.
     at_start: bool,
     group: Vec<FinishedMap>,
     full_groups: VecDeque<Vec<FinishedMap>>,
 }
 
-impl Maps {
-    fn accept(&mut self, entry: Entry, hash: B256) {
-        match entry {
-            Entry::BlockStart { number, pointer } => {
+impl MapBuilder {
+    fn accept(&mut self, event: Event, hash: B256) {
+        match event {
+            Event::BlockStart(start) => {
                 if !mem::replace(&mut self.at_start, false) {
-                    self.pointers.push((number, pointer));
+                    self.pointers.push(start);
                 }
-                self.current = BlockRef { number, hash, pointer };
+                self.current = BlockRef { number: start.block, hash, pointer: start.pointer };
             }
-            Entry::Value { index, value } => {
+            Event::Value { index, value } => {
                 self.advance_to(index);
                 if index >= self.first_index {
-                    self.rows.place(self.params, self.index, index, value);
+                    self.rows.place(self.map_index, index, value);
                 }
             }
-            Entry::Delimiter { index } | Entry::Padding { index } => self.advance_to(index),
+            Event::Delimiter { index } | Event::Padding { index } => self.advance_to(index),
         }
     }
 
-    /// Finishes the map that is being rendered once the iterator reaches the next map's first
+    /// Finishes the map that is being rendered once the assigner reaches the next map's first
     /// slot. The owner of that slot is the last block of map.
     fn advance_to(&mut self, index: u64) {
-        while index >= (u64::from(self.index) + 1) * self.params.values_per_map() {
+        while index >= (u64::from(self.map_index) + 1) * DEFAULT_PARAMS.values_per_map() {
             let map = FinishedMap {
-                index: self.index,
+                index: self.map_index,
                 rows: mem::replace(&mut self.rows, ActiveRows::new()).finish(),
                 pointers: mem::take(&mut self.pointers),
                 last_block: self.current,
             };
             self.group.push(map);
-            self.index += 1;
-            if self.params.map_group_offset(self.index) == 0 {
+            self.map_index += 1;
+            if DEFAULT_PARAMS.map_group_offset(self.map_index) == 0 {
                 self.full_groups.push_back(mem::take(&mut self.group));
             }
         }

@@ -7,7 +7,7 @@
 //! log filter stay authoritative.
 //!
 //! ```text
-//! receipts -> log iterator -> renderer -> group buffer -> store -> matcher -> candidate blocks
+//! receipts -> slot assigner -> renderer -> group buffer -> store -> matcher -> candidate blocks
 //! ```
 //!
 //! The math is a port of go-ethereum's `core/filtermaps` package. Geth is the correctness oracle,
@@ -22,21 +22,24 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
-use reth_storage_errors::provider::ProviderError;
+use reth_prune_types::PruneSegment;
+use reth_storage_api::PruneCheckpointReader;
+use reth_storage_errors::provider::{ProviderError, ProviderResult};
 use std::{ops::RangeInclusive, path::Path, sync::Arc};
-use store::{Range, Store, StoreSnapshot};
+use store::{RangeRecord, Store, StoreSnapshot};
 
 mod indexer;
-mod iter;
 mod matcher;
 mod params;
 mod render;
+mod slots;
 mod store;
+mod value;
+
 #[cfg(test)]
 mod test_utils;
 #[cfg(test)]
 mod tests;
-mod value;
 
 pub use indexer::Indexer;
 pub use matcher::{MatchPattern, TopicSelection};
@@ -98,13 +101,13 @@ impl FilterMapsReader {
 #[derive(Debug)]
 pub struct ReaderSnapshot<'a> {
     snapshot: StoreSnapshot<'a>,
-    range: Option<Range>,
+    range: Option<RangeRecord>,
 }
 
 impl ReaderSnapshot<'_> {
     /// Returns the blocks whose log values are all in stored maps.
     pub fn indexed_blocks(&self) -> Option<RangeInclusive<u64>> {
-        self.range.as_ref().and_then(Range::indexed_blocks)
+        self.range.as_ref().and_then(RangeRecord::indexed_blocks)
     }
 
     /// Returns the candidate blocks for `pattern` in `blocks`, in ascending order.
@@ -168,4 +171,14 @@ pub enum FilterMapsError {
         /// The next block's pointer.
         next_pointer: u64,
     },
+}
+
+/// Returns the receipt floor: the lowest block whose receipts the node still holds. It is genesis
+/// on an archive node.
+///
+/// The indexer starts a fresh store here, and `eth_getLogs` answers from the index only from here
+/// on, since the receipts of a candidate block are what it serves.
+pub fn receipt_floor(provider: &impl PruneCheckpointReader) -> ProviderResult<u64> {
+    let checkpoint = provider.get_prune_checkpoint(PruneSegment::Receipts)?;
+    Ok(checkpoint.and_then(|checkpoint| checkpoint.block_number).map_or(0, |block| block + 1))
 }

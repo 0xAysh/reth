@@ -35,7 +35,7 @@ fn open(path: &Path, history: u64) -> FilterMaps {
     FilterMaps::open(path, FilterMapsConfig { history }).unwrap()
 }
 
-fn range(maps: &FilterMaps) -> Range {
+fn range(maps: &FilterMaps) -> RangeRecord {
     maps.store.snapshot().range().unwrap().expect("the store has a range")
 }
 
@@ -71,10 +71,10 @@ fn catching_up_indexes_every_finished_map() {
     let provider = chain(0..=60);
     let dir = tempfile::tempdir().unwrap();
     let maps = open(dir.path(), 0);
-    maps.indexer(&provider).sync_to(60, 0, 60).unwrap();
+    // The mock chain has no prune checkpoint, so the receipt floor is genesis.
+    maps.indexer(&provider).index_to(60, 60).unwrap();
 
-    let mut renderer =
-        Renderer::new(DEFAULT_PARAMS, BlockRef { number: 0, hash: block_hash(0), pointer: 0 }, 0);
+    let mut renderer = Renderer::new(BlockRef { number: 0, hash: block_hash(0), pointer: 0 }, 0);
     for number in 0..=60 {
         renderer.push_block(number, block_hash(number), &synthetic_logs(number, LOGS));
     }
@@ -130,7 +130,7 @@ fn startup_trims_maps_whose_last_block_is_not_canonical() {
     let maps = open(dir.path(), 0);
     maps.indexer(&provider).sync_to(60, 0, 60).unwrap();
     let old = range(&maps);
-    let (replaced, _) = maps.store.snapshot().last_block_of_map(old.after_last_map - 1).unwrap();
+    let replaced = maps.store.snapshot().last_block_of_map(old.after_last_map - 1).unwrap().number;
 
     set_block(&provider, replaced, B256::repeat_byte(0xee), synthetic_logs(replaced + 500, 10));
     maps.indexer(&provider).sync_to(60, 0, 60).unwrap();
@@ -153,7 +153,7 @@ fn the_tail_drops_whole_epochs_behind_the_cutoff() {
     indexer.sync_to(200, 0, 200).unwrap();
     let before = range(&maps);
     assert!(before.after_last_map > 1025, "the index head is in epoch 1");
-    let (last_block, _) = maps.store.snapshot().last_block_of_map(1023).unwrap();
+    let last_block = maps.store.snapshot().last_block_of_map(1023).unwrap().number;
 
     // The cutoff is finalized + 1 - history.
     indexer.config.history = 200 + 1 - last_block;
@@ -208,7 +208,7 @@ fn missing_receipts_reset_below_the_floor_and_fail_above_it() {
 }
 
 /// The pruner deletes receipts before it commits the checkpoint that raises the receipt floor, so
-/// a batch retries missing receipts once before it fails.
+/// a step retries missing receipts once before it fails.
 #[test]
 fn missing_receipts_are_retried_once() {
     let provider = chain(0..=90);
@@ -217,9 +217,9 @@ fn missing_receipts_are_retried_once() {
     let maps = open(dir.path(), 0);
     let mut indexer = maps.indexer(&provider);
 
-    assert!(indexer.index_batch(90, 90).unwrap(), "the first miss waits for the next call");
+    assert!(indexer.index_step(90, 90).unwrap(), "the first miss waits for the next call");
     assert!(matches!(
-        indexer.index_batch(90, 90),
+        indexer.index_step(90, 90),
         Err(FilterMapsError::Provider(ProviderError::ReceiptNotFound(block))) if block == 70.into()
     ));
 }

@@ -7,8 +7,9 @@
 use crate::{
     matcher::{map_of, FilterMapMatchSource},
     render::{BlockRef, FinishedMap},
-    FilterMapsError, Params, DEFAULT_PARAMS,
+    FilterMapsError, DEFAULT_PARAMS,
 };
+use alloy_eips::BlockNumHash;
 use alloy_primitives::B256;
 use rocksdb::{DBCompressionType, Options, SnapshotWithThreadMode, WriteBatch, DB};
 use std::{ops::RangeInclusive, path::Path};
@@ -44,7 +45,7 @@ impl Store {
         options.set_compression_type(DBCompressionType::None);
         let store = Self { db: DB::open(&options, path)? };
         if let Some(record) = store.db.get(RANGE_KEY)? &&
-            Range::decode(&record).is_none()
+            RangeRecord::decode(&record).is_none()
         {
             store.wipe()?;
         }
@@ -57,9 +58,13 @@ impl Store {
     }
 
     /// Wipes the store and starts it at `origin`. The origin's pointer is stored with it.
-    pub(crate) fn init(&self, origin: BlockRef) -> Result<Range, FilterMapsError> {
+    ///
+    /// An origin in the middle of a map gets no last-block record for the map before it, which
+    /// Geth writes: the indexer starts every origin at pointer 0, and resuming at the origin's map
+    /// takes the origin record instead.
+    pub(crate) fn init(&self, origin: BlockRef) -> Result<RangeRecord, FilterMapsError> {
         let map = map_of(origin.pointer)?;
-        let range = Range {
+        let range = RangeRecord {
             origin,
             first_block: origin.number,
             after_last_block: origin.number,
@@ -83,7 +88,7 @@ impl Store {
 
     /// Replaces the range record. Records outside the new range are left for later writes to
     /// overwrite.
-    pub(crate) fn set_range(&self, range: &Range) -> Result<(), FilterMapsError> {
+    pub(crate) fn set_range(&self, range: &RangeRecord) -> Result<(), FilterMapsError> {
         Ok(self.db.put(RANGE_KEY, range.encode())?)
     }
 
@@ -93,9 +98,9 @@ impl Store {
     /// latest group from its start.
     pub(crate) fn write_group(
         &self,
-        range: &Range,
+        range: &RangeRecord,
         maps: &[FinishedMap],
-    ) -> Result<Range, FilterMapsError> {
+    ) -> Result<RangeRecord, FilterMapsError> {
         let params = DEFAULT_PARAMS;
         let (Some(first), Some(last)) = (maps.first(), maps.last()) else { return Ok(*range) };
         let group = params.map_group_index(first.index);
@@ -111,25 +116,29 @@ impl Store {
         // Every row of the group is rewritten from the buffer, so no stale base row survives a
         // trim. Maps that are not in the buffer encode as empty rows.
         let base_row_length = params.base_row_length() as usize;
-        let mut cursors = maps.iter().map(|map| map.rows.iter().peekable()).collect::<Vec<_>>();
+        // The rows of each map, in ascending row order, that are not written yet.
+        let mut remaining_rows =
+            maps.iter().map(|map| map.rows.iter().peekable()).collect::<Vec<_>>();
         let mut base = vec![&[][..]; params.base_row_group_size() as usize];
         for row_index in 0..params.map_height() {
             base.fill(&[]);
-            for (map, cursor) in maps.iter().zip(&mut cursors) {
-                let Some((_, row)) = cursor.next_if(|(row, _)| *row == row_index) else { continue };
+            for (map, remaining) in maps.iter().zip(&mut remaining_rows) {
+                let Some((_, row)) = remaining.next_if(|(row, _)| *row == row_index) else {
+                    continue
+                };
                 base[params.map_group_offset(map.index) as usize] =
                     &row[..row.len().min(base_row_length)];
                 // A reader looks at the extended row only behind a full base part, so that is
                 // the only case where a stale extended row must go.
                 if row.len() >= base_row_length {
-                    let key = row_key(map_row_index(params, map.index, row_index), false);
+                    let key = row_key(map_row_index(map.index, row_index), false);
                     match &row[base_row_length..] {
                         [] => batch.delete(key),
                         overflow => batch.put(key, encode_columns(overflow)),
                     }
                 }
             }
-            let key = row_key(map_row_index(params, group, row_index), true);
+            let key = row_key(map_row_index(group, row_index), true);
             match encode_base_rows(&base) {
                 Some(value) => batch.put(key, value),
                 None => batch.delete(key),
@@ -141,11 +150,11 @@ impl Store {
                 last_block_key(map.index),
                 [&last_block.number.to_be_bytes()[..], last_block.hash.as_slice()].concat(),
             );
-            for (number, pointer) in &map.pointers {
-                batch.put(pointer_key(*number), pointer.to_be_bytes());
+            for start in &map.pointers {
+                batch.put(pointer_key(start.block), start.pointer.to_be_bytes());
             }
         }
-        let range = Range {
+        let range = RangeRecord {
             after_last_block: last.last_block.number,
             after_last_map: last.index + 1,
             ..*range
@@ -159,22 +168,26 @@ impl Store {
     ///
     /// The last block of the epoch's last map and that block's pointer stay: they are the resume
     /// point of the next epoch's first map (Geth's `deleteTailEpoch`).
-    pub(crate) fn drop_epoch(&self, range: &Range, epoch: u32) -> Result<Range, FilterMapsError> {
+    pub(crate) fn drop_epoch(
+        &self,
+        range: &RangeRecord,
+        epoch: u32,
+    ) -> Result<RangeRecord, FilterMapsError> {
         let params = DEFAULT_PARAMS;
         let first_map = params.first_epoch_map(epoch);
         let last_map = params.last_epoch_map(epoch);
         let next_map = last_map + 1;
-        let (last_block, _) = self.snapshot().last_block_of_map(last_map)?;
+        let last_block = self.snapshot().last_block_of_map(last_map)?.number;
 
         let mut batch = WriteBatch::default();
         // Row keys of an epoch are contiguous and cover both base and extended rows.
         batch.delete_range(
-            row_key(map_row_index(params, first_map, 0), false),
-            row_key(map_row_index(params, next_map, 0), false),
+            row_key(map_row_index(first_map, 0), false),
+            row_key(map_row_index(next_map, 0), false),
         );
         batch.delete_range(last_block_key(first_map), last_block_key(last_map));
         batch.delete_range(pointer_key(range.first_block), pointer_key(last_block));
-        let range = Range { first_block: last_block + 1, first_map: next_map, ..*range };
+        let range = RangeRecord { first_block: last_block + 1, first_map: next_map, ..*range };
         batch.put(RANGE_KEY, range.encode());
         self.db.write(batch)?;
         Ok(range)
@@ -194,12 +207,12 @@ impl std::fmt::Debug for StoreSnapshot<'_> {
 
 impl StoreSnapshot<'_> {
     /// Returns the range record, or `None` for an empty store.
-    pub(crate) fn range(&self) -> Result<Option<Range>, FilterMapsError> {
-        Ok(self.snapshot.get(RANGE_KEY)?.as_deref().and_then(Range::decode))
+    pub(crate) fn range(&self) -> Result<Option<RangeRecord>, FilterMapsError> {
+        Ok(self.snapshot.get(RANGE_KEY)?.as_deref().and_then(RangeRecord::decode))
     }
 
-    /// Returns the last block of map `map`: its number and hash.
-    pub(crate) fn last_block_of_map(&self, map: u32) -> Result<(u64, B256), FilterMapsError> {
+    /// Returns the last block of map `map`.
+    pub(crate) fn last_block_of_map(&self, map: u32) -> Result<BlockNumHash, FilterMapsError> {
         let value = self
             .snapshot
             .get(last_block_key(map))?
@@ -208,7 +221,7 @@ impl StoreSnapshot<'_> {
             .split_first_chunk::<8>()
             .filter(|(_, hash)| hash.len() == 32)
             .ok_or_else(|| FilterMapsError::Corrupt(format!("last block of map {map}")))?;
-        Ok((u64::from_be_bytes(*number), B256::from_slice(hash)))
+        Ok(BlockNumHash::new(u64::from_be_bytes(*number), B256::from_slice(hash)))
     }
 }
 
@@ -226,7 +239,7 @@ impl FilterMapMatchSource for StoreSnapshot<'_> {
             map_indices.chunk_by(|a, b| params.map_group_index(*a) == params.map_group_index(*b))
         {
             let base_key =
-                row_key(map_row_index(params, params.map_group_index(group[0]), row_index), true);
+                row_key(map_row_index(params.map_group_index(group[0]), row_index), true);
             let base_rows = match self.snapshot.get(base_key)? {
                 Some(value) => decode_base_rows(&value, params.base_row_group_size() as usize)?,
                 None => vec![Vec::new(); params.base_row_group_size() as usize],
@@ -237,9 +250,8 @@ impl FilterMapMatchSource for StoreSnapshot<'_> {
                 // a rewritten map is never read.
                 if row.len() == base_row_length &&
                     max_columns as usize > base_row_length &&
-                    let Some(value) = self
-                        .snapshot
-                        .get(row_key(map_row_index(params, map, row_index), false))?
+                    let Some(value) =
+                        self.snapshot.get(row_key(map_row_index(map, row_index), false))?
                 {
                     row.extend(decode_columns(&value)?);
                 }
@@ -262,7 +274,7 @@ impl FilterMapMatchSource for StoreSnapshot<'_> {
 
 /// The range record (`fm-R`): the maps and blocks the store covers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Range {
+pub(crate) struct RangeRecord {
     /// The index origin: the block where the value space starts, and its pointer.
     pub(crate) origin: BlockRef,
     /// The first block whose log values are all in stored maps.
@@ -275,7 +287,7 @@ pub(crate) struct Range {
     pub(crate) after_last_map: u32,
 }
 
-impl Range {
+impl RangeRecord {
     /// The length of the encoded record.
     const ENCODED_LEN: usize = 4 + 8 + 32 + 8 + 8 + 8 + 4 + 4;
 
@@ -300,29 +312,29 @@ impl Range {
 
     /// Decodes a record of this version, or returns `None`.
     fn decode(bytes: &[u8]) -> Option<Self> {
-        let mut reader = Reader(bytes);
-        if u32::from_le_bytes(reader.take()?) != VERSION {
+        let mut fields = FieldReader(bytes);
+        if u32::from_le_bytes(fields.take()?) != VERSION {
             return None
         }
         let range = Self {
             origin: BlockRef {
-                number: u64::from_le_bytes(reader.take()?),
-                hash: B256::from(reader.take::<32>()?),
-                pointer: u64::from_le_bytes(reader.take()?),
+                number: u64::from_le_bytes(fields.take()?),
+                hash: B256::from(fields.take::<32>()?),
+                pointer: u64::from_le_bytes(fields.take()?),
             },
-            first_block: u64::from_le_bytes(reader.take()?),
-            after_last_block: u64::from_le_bytes(reader.take()?),
-            first_map: u32::from_le_bytes(reader.take()?),
-            after_last_map: u32::from_le_bytes(reader.take()?),
+            first_block: u64::from_le_bytes(fields.take()?),
+            after_last_block: u64::from_le_bytes(fields.take()?),
+            first_map: u32::from_le_bytes(fields.take()?),
+            after_last_map: u32::from_le_bytes(fields.take()?),
         };
-        reader.0.is_empty().then_some(range)
+        fields.0.is_empty().then_some(range)
     }
 }
 
 /// Reads fixed-size fields off the front of a byte slice.
-struct Reader<'a>(&'a [u8]);
+struct FieldReader<'a>(&'a [u8]);
 
-impl Reader<'_> {
+impl FieldReader<'_> {
     fn take<const N: usize>(&mut self) -> Option<[u8; N]> {
         let (field, rest) = self.0.split_first_chunk::<N>()?;
         self.0 = rest;
@@ -332,7 +344,8 @@ impl Reader<'_> {
 
 /// Returns the storage index of row `row` of map `map` (Geth's `mapRowIndex`). Rows of one epoch
 /// are contiguous, and within a row the maps of an epoch are contiguous.
-fn map_row_index(params: Params, map: u32, row: u32) -> u64 {
+fn map_row_index(map: u32, row: u32) -> u64 {
+    let params = DEFAULT_PARAMS;
     let epoch = u64::from(params.map_epoch(map));
     let map_in_epoch = u64::from(map - params.first_epoch_map(params.map_epoch(map)));
     (((epoch << params.log_map_height()) + u64::from(row)) << params.log_maps_per_epoch()) +
@@ -341,6 +354,7 @@ fn map_row_index(params: Params, map: u32, row: u32) -> u64 {
 
 /// Deletes every `fm-` key, the range record included.
 fn wipe(batch: &mut WriteBatch) {
+    // `.` follows `-` in ASCII, so the range ends right after the last `fm-` key.
     batch.delete_range(b"fm-", b"fm.");
 }
 
@@ -386,11 +400,17 @@ fn encode_base_rows(rows: &[&[u32]]) -> Option<Vec<u8>> {
 }
 
 /// Decodes a base row group into `row_count` rows (Geth's `ReadFilterMapBaseRows`).
+///
+/// The header's length is not stored: header bits are read until the header and the columns they
+/// announce fill the value exactly.
 fn decode_base_rows(value: &[u8], row_count: usize) -> Result<Vec<Vec<u32>>, FilterMapsError> {
     let corrupt = || FilterMapsError::Corrupt("base row group".to_owned());
     let mut lengths = vec![0usize; row_count];
-    let (mut columns, mut row, mut header_len, mut header_bits, mut header_byte) =
-        (0, 0, 0, 0, 0u8);
+    let mut columns = 0;
+    let mut row = 0;
+    let mut header_len = 0;
+    let mut header_bits = 0;
+    let mut header_byte = 0u8;
     while header_len + COLUMN_BYTES * columns < value.len() {
         if header_bits == 0 {
             header_byte = value[header_len];

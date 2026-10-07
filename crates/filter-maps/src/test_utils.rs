@@ -6,7 +6,7 @@
 use crate::{
     matcher::{map_of, FilterMapMatchSource},
     render::{BlockRef, FinishedMap, Renderer},
-    FilterMapsError, DEFAULT_PARAMS,
+    FilterMapsError,
 };
 use alloy_primitives::{Address, Bytes, Log, B256};
 use reth_filter_maps_test_utils::parser::{Block, Fixture, Origin};
@@ -30,7 +30,7 @@ impl MemorySource {
     /// Adds a finished map, its block pointers, and the pointer of its last block.
     pub(crate) fn add_map(&mut self, map: &FinishedMap) {
         self.maps.insert(map.index, map.rows.iter().cloned().collect());
-        self.pointers.extend(map.pointers.iter().copied());
+        self.pointers.extend(map.pointers.iter().map(|start| (start.block, start.pointer)));
         self.pointers.insert(map.last_block.number, map.last_block.pointer);
     }
 }
@@ -107,8 +107,7 @@ pub(crate) fn fixture_start(fixture: &Fixture) -> BlockRef {
 /// Renders a fixture from its origin, as the Geth oracle did, and returns the renderer.
 pub(crate) fn render_fixture(fixture: &Fixture) -> Renderer {
     let start = fixture_start(fixture);
-    let first_map = map_of(start.pointer).unwrap();
-    let mut renderer = Renderer::new(DEFAULT_PARAMS, start, first_map);
+    let mut renderer = Renderer::new(start, map_of(start.pointer).unwrap());
     for block in &fixture.blocks {
         renderer.push_block(block.number, block.hash, &fixture_logs(block));
     }
@@ -123,4 +122,34 @@ pub(crate) fn take_finished_maps(renderer: &mut Renderer) -> Vec<FinishedMap> {
     }
     maps.extend(renderer.group().iter().cloned());
     maps
+}
+
+/// Pushes the blocks from `first_block` on into `renderer`, each with the logs that `logs`
+/// returns for its number, until map `last_map` is finished. Returns every finished map, in map
+/// order.
+pub(crate) fn render_until(
+    renderer: &mut Renderer,
+    first_block: u64,
+    last_map: u32,
+    mut logs: impl FnMut(u64) -> Vec<Log>,
+) -> Vec<FinishedMap> {
+    let mut maps = Vec::new();
+    for number in first_block.. {
+        while let Some(group) = renderer.take_full_group() {
+            maps.extend(group);
+        }
+        if maps.iter().chain(renderer.group()).any(|map| map.index >= last_map) {
+            break
+        }
+        renderer.push_block(number, block_hash(number), &logs(number));
+    }
+    maps.extend(renderer.group().iter().cloned());
+    maps
+}
+
+/// Renders synthetic blocks of 1,000 logs from `origin` until map `last_map` is finished and
+/// returns every finished map, in map order.
+pub(crate) fn render_synthetic(origin: BlockRef, last_map: u32) -> Vec<FinishedMap> {
+    let mut renderer = Renderer::new(origin, map_of(origin.pointer).unwrap());
+    render_until(&mut renderer, origin.number, last_map, |number| synthetic_logs(number, 1000))
 }

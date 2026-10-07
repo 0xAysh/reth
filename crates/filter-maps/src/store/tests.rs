@@ -1,8 +1,8 @@
 use super::*;
 use crate::{
-    matcher::{candidate_blocks, map_of, MatchPattern},
-    render::Renderer,
-    test_utils::{block_hash, render_fixture, synthetic_logs, take_finished_maps},
+    matcher::{candidate_blocks, MatchPattern},
+    slots::BlockPointer,
+    test_utils::{block_hash, fixture_start, render_fixture, render_synthetic, take_finished_maps},
 };
 use alloy_primitives::{hex, Address};
 use reth_filter_maps_test_utils::manifest;
@@ -13,30 +13,13 @@ fn origin(number: u64, pointer: u64) -> BlockRef {
     BlockRef { number, hash: block_hash(number), pointer }
 }
 
-/// Renders synthetic blocks from `origin` until map `last` is finished and returns the finished
-/// maps, grouped by map group.
-fn render_groups(origin: BlockRef, last: u32) -> Vec<Vec<FinishedMap>> {
-    let mut renderer = Renderer::new(DEFAULT_PARAMS, origin, map_of(origin.pointer).unwrap());
-    let mut groups = Vec::new();
-    let mut number = origin.number;
-    while groups.iter().flatten().chain(renderer.group()).all(|map: &FinishedMap| map.index < last)
-    {
-        assert!(number < origin.number + 1000, "1,000 blocks did not finish map {last}");
-        renderer.push_block(number, block_hash(number), &synthetic_logs(number, 1000));
-        number += 1;
-        while let Some(group) = renderer.take_full_group() {
-            groups.push(group);
-        }
-    }
-    if !renderer.group().is_empty() {
-        groups.push(renderer.group().to_vec());
-    }
-    groups
-}
-
 /// Reads row `row` of `maps` in full.
 fn read_rows(snapshot: &StoreSnapshot<'_>, maps: &[u32], row: u32) -> Vec<Vec<u32>> {
     snapshot.row_prefixes(maps, row, u32::MAX).unwrap()
+}
+
+fn indices(maps: &[FinishedMap]) -> Vec<u32> {
+    maps.iter().map(|map| map.index).collect()
 }
 
 /// Starts at map 30, so maps 30 and 31 fill group 0, and reads every row of the group back.
@@ -45,8 +28,8 @@ fn a_written_group_reads_back_through_the_matcher_source() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).unwrap();
     let origin = origin(100, 30 << 16);
-    let group = render_groups(origin, 31).remove(0);
-    assert_eq!(group.iter().map(|map| map.index).collect::<Vec<_>>(), [30, 31]);
+    let group = render_synthetic(origin, 31);
+    assert_eq!(indices(&group), [30, 31]);
 
     let range = store.init(origin).unwrap();
     let range = store.write_group(&range, &group).unwrap();
@@ -73,24 +56,17 @@ fn a_written_group_reads_back_through_the_matcher_source() {
     }
 
     assert_eq!(snapshot.block_pointer(origin.number).unwrap(), origin.pointer);
-    for (number, pointer) in group.iter().flat_map(|map| &map.pointers) {
-        assert_eq!(snapshot.block_pointer(*number).unwrap(), *pointer);
+    for start in group.iter().flat_map(|map| &map.pointers) {
+        assert_eq!(snapshot.block_pointer(start.block).unwrap(), start.pointer);
     }
-    assert_eq!(snapshot.last_block_of_map(31).unwrap(), (last.number, last.hash));
+    assert_eq!(snapshot.last_block_of_map(31).unwrap(), BlockNumHash::new(last.number, last.hash));
 }
 
 /// The `epoch-boundary` fixture marks row 34163 of map 1023, the last map of epoch 0.
 #[test]
 fn row_keys_follow_the_geth_formula() {
-    let params = DEFAULT_PARAMS;
-    assert_eq!(
-        row_key(map_row_index(params, 1023, 34163), false),
-        hex!("666d2d72000000000215cfff")
-    );
-    assert_eq!(
-        row_key(map_row_index(params, 992, 34163), true),
-        hex!("666d2d72000000000215cfe000")
-    );
+    assert_eq!(row_key(map_row_index(1023, 34163), false), hex!("666d2d72000000000215cfff"));
+    assert_eq!(row_key(map_row_index(992, 34163), true), hex!("666d2d72000000000215cfe000"));
 
     let corpus = manifest::load_and_validate_corpus().unwrap();
     let (_, fixture) =
@@ -99,8 +75,7 @@ fn row_keys_follow_the_geth_formula() {
     assert_eq!(maps[0].index, 1023);
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).unwrap();
-    let start = crate::test_utils::fixture_start(fixture);
-    let range = store.init(start).unwrap();
+    let range = store.init(fixture_start(fixture)).unwrap();
     store.write_group(&range, &maps).unwrap();
 
     let value = store.db.get(hex!("666d2d72000000000215cfe000")).unwrap().unwrap();
@@ -120,10 +95,10 @@ fn a_full_base_row_without_overflow_deletes_the_stale_extended_row() {
     let map = |columns: u32| FinishedMap {
         index: 30,
         rows: vec![(7, (0..columns).collect())],
-        pointers: vec![(6, (30 << 16) + 100)],
+        pointers: vec![BlockPointer { block: 6, pointer: (30 << 16) + 100 }],
         last_block: origin(6, (30 << 16) + 100),
     };
-    let extended_key = row_key(map_row_index(DEFAULT_PARAMS, 30, 7), false);
+    let extended_key = row_key(map_row_index(30, 7), false);
 
     let range = store.write_group(&range, &[map(9)]).unwrap();
     assert_eq!(store.db.get(&extended_key).unwrap(), Some(encode_columns(&[8])));
@@ -138,7 +113,7 @@ fn a_full_base_row_without_overflow_deletes_the_stale_extended_row() {
 fn a_reopened_store_keeps_its_range_and_rows() {
     let dir = tempfile::tempdir().unwrap();
     let origin = origin(100, 30 << 16);
-    let group = render_groups(origin, 31).remove(0);
+    let group = render_synthetic(origin, 31);
     let (range, rows) = {
         let store = Store::open(dir.path()).unwrap();
         let range = store.init(origin).unwrap();
@@ -180,12 +155,16 @@ fn dropping_an_epoch_keeps_its_last_block_of_map() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).unwrap();
     let origin = origin(100, 1021 << 16);
-    let groups = render_groups(origin, 1024);
-    let indices = groups
-        .iter()
-        .map(|group| group.iter().map(|map| map.index).collect())
-        .collect::<Vec<Vec<_>>>();
-    assert_eq!(indices, [vec![1021, 1022, 1023], vec![1024]]);
+    let maps = render_synthetic(origin, 1024);
+    let groups = maps
+        .chunk_by(|a, b| {
+            DEFAULT_PARAMS.map_group_index(a.index) == DEFAULT_PARAMS.map_group_index(b.index)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        groups.iter().map(|group| indices(group)).collect::<Vec<_>>(),
+        [vec![1021, 1022, 1023], vec![1024]]
+    );
 
     let mut range = store.init(origin).unwrap();
     for group in &groups {
@@ -197,12 +176,15 @@ fn dropping_an_epoch_keeps_its_last_block_of_map() {
 
     let snapshot = store.snapshot();
     assert_eq!(snapshot.range().unwrap(), Some(range));
-    for map in &groups[0] {
+    for map in groups[0] {
         for (row, _) in &map.rows {
             assert_eq!(read_rows(&snapshot, &[map.index], *row), [Vec::<u32>::new()]);
         }
     }
-    assert_eq!(snapshot.last_block_of_map(1023).unwrap(), (last.number, last.hash));
+    assert_eq!(
+        snapshot.last_block_of_map(1023).unwrap(),
+        BlockNumHash::new(last.number, last.hash)
+    );
     assert_eq!(snapshot.block_pointer(last.number).unwrap(), last.pointer);
     assert!(snapshot.last_block_of_map(1022).is_err());
     assert!(snapshot.block_pointer(origin.number).is_err());

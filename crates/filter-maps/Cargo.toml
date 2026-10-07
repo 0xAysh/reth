@@ -21,6 +21,7 @@ reth-storage-errors.workspace = true
 
 # ethereum
 alloy-consensus.workspace = true
+alloy-eips.workspace = true
 alloy-primitives.workspace = true
 
 # crypto

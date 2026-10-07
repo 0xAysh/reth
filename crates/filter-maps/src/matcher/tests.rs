@@ -5,12 +5,7 @@ use reth_filter_maps_test_utils::{
     manifest,
     parser::{QueryResult, TopicConstraint},
 };
-use std::{cell::Cell, collections::HashMap};
-
-thread_local! {
-    /// The number of row indices the matcher computed on this thread.
-    pub(super) static ROW_HASHES: Cell<usize> = const { Cell::new(0) };
-}
+use std::collections::HashMap;
 
 const ADDRESS: Address = address!("0x0000000000000000000000000000000000000001");
 
@@ -52,9 +47,9 @@ fn every_fixture_query_matches_geth() {
 }
 
 /// On layer 0 all 1,024 maps of an epoch share one row per value, and on layer 1 runs of 64 maps
-/// do. A query over the 32 maps of one group therefore computes one row index per layer.
+/// do. A query over the 32 maps of one group therefore reads one row per layer.
 #[test]
-fn row_indices_are_computed_once_per_masked_map_run() {
+fn rows_are_read_once_per_masked_map_run() {
     let value = address_value(ADDRESS);
     let mut source = MemorySource::default();
     for map in 64..96 {
@@ -65,10 +60,8 @@ fn row_indices_are_computed_once_per_masked_map_run() {
     }
     let pattern = MatchPattern::new([ADDRESS], []);
 
-    ROW_HASHES.with(|count| count.set(0));
     potential_indices(&source, &pattern, 64 << 16, (96 << 16) - 1).unwrap();
-    assert_eq!(ROW_HASHES.with(Cell::get), 2, "one row index on layer 0 and one on layer 1");
-    assert_eq!(source.row_reads.get(), 2, "one read per layer");
+    assert_eq!(source.row_reads.get(), 2, "one read on layer 0 and one on layer 1");
 }
 
 #[test]
@@ -117,7 +110,7 @@ fn source_with(marks: &[(u64, B256)], pointers: &[(u64, u64)]) -> MemorySource {
 }
 
 #[test]
-fn an_address_hit_resolves_to_its_block() {
+fn a_marked_address_resolves_to_its_block() {
     let source = source_with(&[(3, address_value(ADDRESS))], &[(10, 0), (11, 10), (12, 20)]);
     let pattern = MatchPattern::new([ADDRESS], []);
     assert_eq!(potential_indices(&source, &pattern, 0, 19).unwrap(), [3]);
@@ -129,7 +122,7 @@ fn an_address_hit_resolves_to_its_block() {
 }
 
 #[test]
-fn a_topic_hit_translates_to_its_log_start() {
+fn a_marked_topic_translates_to_its_log_start() {
     let topic = B256::repeat_byte(1);
     let source = source_with(&[(4, topic_value(topic))], &[(10, 0), (11, 10)]);
     let first = MatchPattern::new([], [TopicSelection::OneOf(vec![topic])]);
@@ -150,8 +143,8 @@ fn exact_matches_are_never_missed() {
         let mut marks = Vec::new();
         for (start, address, topics) in &logs {
             marks.push((*start, address_value(*address)));
-            for (offset, topic) in topics.iter().enumerate() {
-                marks.push((start + 1 + offset as u64, topic_value(*topic)));
+            for (ordinal, topic) in topics.iter().enumerate() {
+                marks.push((start + 1 + ordinal as u64, topic_value(*topic)));
             }
         }
         let source = source_with(&marks, &[(10, 0), (11, 4), (12, 7)]);
