@@ -1171,8 +1171,13 @@ where
         let filter_maps = if config.filter_maps.enabled {
             // The CLI rejects a receipts log filter next to --filter-maps, but reth.toml can set
             // one.
-            let prune_modes = node.provider().database_provider_ro()?.prune_modes_ref().clone();
-            if !prune_modes.receipts_log_filter.is_empty() {
+            let prunes_receipts = !node
+                .provider()
+                .database_provider_ro()?
+                .prune_modes_ref()
+                .receipts_log_filter
+                .is_empty();
+            if prunes_receipts {
                 eyre::bail!(
                     "--filter-maps needs every receipt, but the receipts log filter prunes some"
                 );

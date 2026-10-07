@@ -8454,6 +8454,7 @@ dependencies = [
  "reth-engine-local",
  "reth-engine-primitives",
  "reth-ethereum-primitives",
+ "reth-filter-maps",
  "reth-fs-util",
  "reth-network-api",
  "reth-network-peers",

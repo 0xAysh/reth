@@ -1,8 +1,8 @@
-//! clap [`Args`] for the `FilterMaps` log index.
+//! clap [`Args`] for the `FilterMaps` local search index.
 
 use clap::Args;
 
-/// Parameters for the `FilterMaps` log index.
+/// Parameters for the `FilterMaps` local search index.
 #[derive(Debug, Clone, Copy, Args, PartialEq, Eq)]
 #[command(next_help_heading = "FilterMaps")]
 pub struct FilterMapsArgs {

@@ -74,6 +74,7 @@ RUST_LOG=info,engine::tree=debug cargo nextest run -p reth-node-ethereum --test 
 | Sign transactions from a funded account that tracks its nonce | `wallet.account(i)` (a `TestAccount`), then `account.transfer(to, value).await`, `account.call(to, input)` or `account.deploy(init_code)` |
 | Set the nonce, gas or fees of one transaction | the `TestTx` setters, e.g. `.nonce(n)`, `.gas_limit(g)`, `.fees(max, priority)`, `.map_request(f)`; per account `with_gas_limit`, `with_fees` |
 | Know the address of the next deployment, resync the nonce | `account.next_contract_address()`, `account.sync_nonce(&provider)` |
+| Deploy a contract that emits many logs, then call it | `account.deploy_log_emitter()`, then `account.emit_logs(emitter, topic0, key, count)`; see `LOG_EMITTER_INIT_CODE` for the topics |
 | Send through an alloy provider | `node.rpc_provider_with_wallet(wallet.signer(i))` |
 | Build a blob or EIP-7702 transaction | `TransactionTestContext::tx_with_blobs_bytes`, `set_code_tx_bytes` (nonce 0, see traps) |
 | Put a raw transaction into the pool | `node.rpc.inject_tx(raw)` |
@@ -88,6 +89,7 @@ RUST_LOG=info,engine::tree=debug cargo nextest run -p reth-node-ethereum --test 
 | Control block timestamps, e.g. around a fork | `set_next_payload_timestamp(timestamp)` |
 | **Forks and reorgs** | |
 | Keep imported blocks reorgable | `set_finality(Finality::Keep)` or `Finality::Lag(n)`; the default `Finality::Head` finalizes every block |
+| Finalize a block regardless of the finality policy | `finalize(hash)`, which makes it the head, safe and finalized block and fails unless the engine answers `VALID` |
 | Build a block or a chain on any known block and make it the head | `advance_block_on(parent)`, `advance_fork(parent, n)` |
 | Make a known side chain block the head | `reorg_to(hash)` |
 | **Engine** | |
@@ -112,11 +114,13 @@ RUST_LOG=info,engine::tree=debug cargo nextest run -p reth-node-ethereum --test 
 | Wait until a block is the head | `wait_for_head(hash)`, which only observes the node; `wait_block` is also satisfied by a canonical block below the head |
 | Wait for transactions to enter or leave the pool | `wait_for_pooled(hashes)`, `wait_for_pool_removal(hashes)`, which returns right away for transactions that never entered |
 | Wait for persistence or pruning | `wait_for_persisted_block(n)`, `wait_for_prune_checkpoint(segment, n)` |
+| Wait for the `FilterMaps` index to cover a block | `wait_for_filter_maps_head(n)`, on a node started with `--filter-maps` |
 | **Assertions and inspection** | |
 | Inspect a mined block | `MinedBlock`: `block()`, `receipts`, `chain` (the committed `Chain` with its execution outcome), `ensure_success()` |
 | Wait for the receipt of a transaction sent through a provider | `PendingTransactionExt::successful_receipt`, `receipt::await_successful_receipts` |
 | Query the node over JSON-RPC | `rpc_provider()`, `rpc_provider_with_wallet(w)`, `rpc_provider_for::<Net>()` for other networks |
 | Read node state directly | `node.inner.provider`, `node.inner.pool`, `node.current_forkchoice_state()`, `node.block_hash(n)` (panics if unknown) |
+| Read the `FilterMaps` index or the receipt floor | `node.filter_maps_indexed_blocks()`, `node.receipt_floor()` |
 | Check that the persisted state and trie are consistent | `trie::assert_trie_consistency(&node.inner.provider)`, after `wait_for_persisted_block` |
 
 ## Recipes

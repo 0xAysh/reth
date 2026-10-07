@@ -1,5 +1,5 @@
-//! Tests for the `FilterMaps` log index: `eth_getLogs` gives the same answer from the index as
-//! from the header bloom.
+//! Tests for the `FilterMaps` local search index: `eth_getLogs` gives the same answer from the
+//! index as from the header bloom.
 
 use alloy_primitives::{Address, B256, U256};
 use alloy_provider::Provider;
@@ -10,7 +10,6 @@ use reth_e2e_test_utils::{
 };
 use reth_node_core::args::PruningArgs;
 use reth_node_ethereum::EthereumNode;
-use reth_provider::PruneCheckpointReader;
 use reth_prune_types::PruneSegment;
 
 type Node = NodeHelperType<EthereumNode>;
@@ -55,8 +54,8 @@ async fn log_emitter_emits_count_logs() -> eyre::Result<()> {
     Ok(())
 }
 
-/// Before the head is finalized, the index is empty and every query takes the header bloom path.
-/// Once the index covers the blocks, the same queries give the same logs.
+/// While only genesis is finalized, no map is finished and every query takes the header bloom
+/// path. Once the index covers the blocks, the same queries give the same logs.
 #[tokio::test]
 async fn filter_maps_matches_bloom_path() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
@@ -69,7 +68,7 @@ async fn filter_maps_matches_bloom_path() -> eyre::Result<()> {
 
     let queries = chain.queries(0);
     let bloom = run_queries(&node, &queries).await?;
-    assert_eq!(node.filter_maps_indexed_blocks(), None, "nothing is finalized");
+    assert_eq!(node.filter_maps_indexed_blocks(), None, "no map finishes in the genesis block");
 
     node.finalize(node.block_hash(chain.head)).await?;
     node.wait_for_filter_maps_head(chain.heavy[4]).await?;
@@ -137,7 +136,7 @@ async fn filter_maps_pruned_node_starts_at_receipt_floor() -> eyre::Result<()> {
     // The pruner keeps the last 32 blocks. With storage v2 it deletes whole static files of 8
     // blocks, so the floor moves in steps of 8.
     node.wait_for_prune_checkpoint(PruneSegment::Receipts, chain.head - 33).await?;
-    let floor = receipt_floor(&node)?;
+    let floor = node.receipt_floor()?;
     assert!(floor > 1, "receipts are pruned");
 
     let queries = chain.queries(floor);
@@ -228,24 +227,19 @@ impl Chain {
     fn queries(&self, from: u64) -> Vec<Filter> {
         let [first, second, third] = self.emitters;
         let heavy = &self.heavy;
-        let mut queries = vec![
+        let to_head = |filter: Filter| filter.from_block(from).to_block(self.head);
+        vec![
             // An address and a topic, then OR lists over addresses and over topic 1.
-            Filter::new().address(second).topic1(word(7)),
-            Filter::new().address(vec![first, third]).topic1(vec![word(2), word(5_000)]),
+            to_head(Filter::new().address(second).topic1(word(7))),
+            to_head(Filter::new().address(vec![first, third]).topic1(vec![word(2), word(5_000)])),
             // A wildcard topic 0 with topic 2 set.
-            Filter::new().topic2(word(5) ^ KEY_B),
-        ];
-        for query in &mut queries {
-            *query = query.clone().from_block(from).to_block(self.head);
-        }
-        queries.extend([
+            to_head(Filter::new().topic2(word(5) ^ KEY_B)),
             // An address alone, and a topic 0 alone.
             Filter::new().address(first).from_block(heavy[0]).to_block(heavy[1]),
             Filter::new().event_signature(TOPIC_B).from_block(heavy[1]).to_block(heavy[1]),
             // No address or topic: the header bloom always answers.
             Filter::new().from_block(*heavy.last().unwrap()).to_block(self.head),
-        ]);
-        queries
+        ]
     }
 }
 
@@ -259,12 +253,6 @@ async fn run_queries(node: &Node, queries: &[Filter]) -> eyre::Result<Vec<Vec<Lo
         results.push(logs);
     }
     Ok(results)
-}
-
-/// Returns the lowest block whose receipts the node still holds.
-fn receipt_floor(node: &Node) -> eyre::Result<u64> {
-    let checkpoint = node.inner.provider.get_prune_checkpoint(PruneSegment::Receipts)?;
-    Ok(checkpoint.and_then(|checkpoint| checkpoint.block_number).map_or(0, |block| block + 1))
 }
 
 fn word(value: u64) -> B256 {

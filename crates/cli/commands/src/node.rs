@@ -296,7 +296,7 @@ mod tests {
     }
 
     #[test]
-    fn filter_maps_cannot_run_without_every_receipt() {
+    fn filter_maps_rejects_partial_receipts() {
         for args in [
             vec!["reth", "--filter-maps", "--minimal"],
             vec![
@@ -310,7 +310,10 @@ mod tests {
                 .unwrap_err();
             assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict, "{args:?}");
         }
+    }
 
+    #[test]
+    fn filter_maps_history_defaults_to_geths() {
         let cmd =
             NodeCommand::<EthereumChainSpecParser>::try_parse_args_from(["reth", "--filter-maps"])
                 .unwrap();

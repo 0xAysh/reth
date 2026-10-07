@@ -22,29 +22,29 @@ pub const TEST_MNEMONIC: &str = "test test test test test test test test test te
 #[rustfmt::skip]
 pub const LOG_EMITTER_INIT_CODE: &[u8] = &[
     // Init code: return the 36 bytes of runtime that start at byte 11.
-    0x60, 0x24,             // PUSH1 36
-    0x80,                   // DUP1
-    0x60, 0x0b,             // PUSH1 11
-    0x60, 0x00,             // PUSH1 0
-    0x39,                   // CODECOPY
-    0x60, 0x00,             // PUSH1 0
-    0xf3,                   // RETURN
+    0x60, 0x24,             // PUSH1 36.
+    0x80,                   // DUP1.
+    0x60, 0x0b,             // PUSH1 11.
+    0x60, 0x00,             // PUSH1 0.
+    0x39,                   // CODECOPY.
+    0x60, 0x00,             // PUSH1 0.
+    0xf3,                   // RETURN.
     // Runtime, with the stack [count, i].
-    0x60, 0x40, 0x35,       // PUSH1 64, CALLDATALOAD: count
-    0x60, 0x00,             // PUSH1 0: i
-    0x5b,                   // 0x05: JUMPDEST
-    0x81, 0x81, 0x10, 0x15, // DUP2, DUP2, LT, ISZERO: i >= count
-    0x60, 0x22, 0x57,       // PUSH1 0x22, JUMPI: done
-    0x33,                   // CALLER: topic 3
-    0x81, 0x60, 0x20, 0x35, // DUP2, PUSH1 32, CALLDATALOAD
-    0x18,                   // XOR: topic 2 = i ^ key
-    0x82,                   // DUP3: topic 1 = i
-    0x60, 0x00, 0x35,       // PUSH1 0, CALLDATALOAD: topic 0
-    0x60, 0x00, 0x60, 0x00, // PUSH1 0, PUSH1 0: no data
-    0xa4,                   // LOG4
-    0x60, 0x01, 0x01,       // PUSH1 1, ADD: i + 1
-    0x60, 0x05, 0x56,       // PUSH1 0x05, JUMP
-    0x5b, 0x00,             // 0x22: JUMPDEST, STOP
+    0x60, 0x40, 0x35,       // PUSH1 64, CALLDATALOAD: count.
+    0x60, 0x00,             // PUSH1 0: i.
+    0x5b,                   // 0x05: JUMPDEST.
+    0x81, 0x81, 0x10, 0x15, // DUP2, DUP2, LT, ISZERO: i >= count.
+    0x60, 0x22, 0x57,       // PUSH1 0x22, JUMPI: done.
+    0x33,                   // CALLER: topic 3.
+    0x81, 0x60, 0x20, 0x35, // DUP2, PUSH1 32, CALLDATALOAD.
+    0x18,                   // XOR: topic 2 = i ^ key.
+    0x82,                   // DUP3: topic 1 = i.
+    0x60, 0x00, 0x35,       // PUSH1 0, CALLDATALOAD: topic 0.
+    0x60, 0x00, 0x60, 0x00, // PUSH1 0, PUSH1 0: no data.
+    0xa4,                   // LOG4.
+    0x60, 0x01, 0x01,       // PUSH1 1, ADD: i + 1.
+    0x60, 0x05, 0x56,       // PUSH1 0x05, JUMP.
+    0x5b, 0x00,             // 0x22: JUMPDEST, STOP.
 ];
 
 /// One of the accounts of the genesis allocations.

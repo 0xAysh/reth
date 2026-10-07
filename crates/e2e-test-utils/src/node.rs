@@ -29,6 +29,7 @@ use jsonrpsee::{core::client::ClientT, http_client::HttpClient};
 use reth_chainspec::EthereumHardforks;
 use reth_db::{mdbx::DatabaseArguments, open_db_read_only};
 use reth_engine_primitives::BeaconForkChoiceUpdateError;
+use reth_filter_maps::receipt_floor;
 use reth_network_api::test_utils::PeersHandleProvider;
 use reth_node_api::{
     Block, BlockBody, BlockTy, FullNodeComponents, NodePrimitives, PayloadTypes, PrimitivesTy,
@@ -904,7 +905,14 @@ where
     /// Returns the blocks the `FilterMaps` index of the node covers, or `None` if the node runs
     /// without `--filter-maps` or the index covers no block yet.
     pub fn filter_maps_indexed_blocks(&self) -> Option<RangeInclusive<BlockNumber>> {
-        self.rpc.inner.eth_handlers().filter.filter_maps()?.snapshot().indexed_blocks()
+        let reader = self.rpc.inner.eth_handlers().filter.filter_maps()?;
+        reader.snapshot().indexed_blocks()
+    }
+
+    /// Returns the receipt floor of the node: the lowest block whose receipts it still holds,
+    /// which is genesis unless the node prunes receipts.
+    pub fn receipt_floor(&self) -> eyre::Result<BlockNumber> {
+        Ok(receipt_floor(&self.inner.provider)?)
     }
 
     /// Waits until the block with the given hash is the latest block of the node, i.e. its
