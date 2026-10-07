@@ -1,297 +1,155 @@
-//! Test support shared by the `FilterMaps` crates.
+//! Test helpers shared by the crate's unit tests.
 //!
-//! Everything here is built on the crate's public API, so integration tests and dependent crates
-//! use it exactly as unit tests do. Maps come only from the public renderer, so tests exercise the
-//! same anchored output a node publishes. [`block_hash`], [`identity`], and [`empty_coverage`]
-//! describe the synthetic chain those tests render. [`InMemoryMatchSource`] is the reference
-//! [`FilterMapMatchSource`] that durable sources must agree with. [`recognized_checkpoint`] mints a
-//! checkpoint origin the way a store restores one, through a [`CheckpointVerifier`]. [`golden`]
-//! adapts the pinned Geth `FORMAT 2` corpus into renderer and matcher inputs.
-//!
-//! Unit-test helpers that need crate-private coverage internals, such as hand-built anchors or a
-//! `CoverageSet`, live in the crate-private `coverage::test_utils` module and build on these.
-
-pub mod golden;
+//! The synthetic chain uses mainnet parameters. Tests reach map, group, and epoch boundaries by
+//! choosing an index origin just before them, never by shrinking the parameters.
 
 use crate::{
-    coverage::{
-        CheckpointProvenance, CheckpointVerifier, IndexIdentity, RejectUnrecognizedCheckpoints,
-        SegmentOrigin, StoredCoverageRecord, StoredSegmentOrigin, StoredSegmentRecord,
-        StructurallyRestoredCoverage, STORAGE_FORMAT_V1,
-    },
-    AnchoredCompletedMap, BlockInput, BlockPointer, FilterMapMatchSource, FilterMapRenderer,
-    LogValueStream, LogValueStreamTermination, MapResumeAnchor, Params, ParamsId,
-    RendererCompletion, RendererOutput, GETH_V1,
+    matcher::{map_of, FilterMapMatchSource},
+    render::{BlockRef, FinishedMap, Renderer},
+    FilterMapsError,
 };
-use alloy_primitives::B256;
+use alloy_primitives::{Address, Bytes, Log, B256};
+use reth_filter_maps_test_utils::parser::{Block, Fixture, Origin};
+use std::{
+    cell::Cell,
+    collections::{BTreeMap, HashMap},
+};
 
-/// Reference [`FilterMapMatchSource`] serving rendered maps and block pointers from memory.
-#[derive(Debug)]
-pub struct InMemoryMatchSource {
-    params_id: ParamsId,
-    maps: Vec<AnchoredCompletedMap>,
-    pointers: Vec<BlockPointer>,
+/// A [`FilterMapMatchSource`] that serves finished maps and block pointers from memory.
+#[derive(Debug, Default)]
+pub(crate) struct MemorySource {
+    /// The rows of each map, by map index.
+    pub(crate) maps: BTreeMap<u32, HashMap<u32, Vec<u32>>>,
+    /// Block pointers by block number.
+    pub(crate) pointers: BTreeMap<u64, u64>,
+    /// The number of `row_prefixes` calls.
+    pub(crate) row_reads: Cell<usize>,
 }
 
-impl InMemoryMatchSource {
-    /// Serves `maps`, which must share one parameter set and ascend strictly by map index, and
-    /// `pointers`, which must name consecutive blocks with strictly increasing value indices.
-    pub fn new(
-        maps: Vec<AnchoredCompletedMap>,
-        pointers: impl IntoIterator<Item = BlockPointer>,
-    ) -> Result<Self, InMemorySourceError> {
-        let params_id = maps.first().ok_or(InMemorySourceError::NoMaps)?.map().params_id();
-        let mut previous_map = None;
-        for anchored in &maps {
-            let map = anchored.map();
-            if map.params_id() != params_id {
-                return Err(InMemorySourceError::MixedParams {
-                    expected: params_id,
-                    actual: map.params_id(),
-                })
-            }
-            if let Some(previous) = previous_map &&
-                previous >= map.map_index()
-            {
-                return Err(InMemorySourceError::MapOrder { previous, actual: map.map_index() })
-            }
-            previous_map = Some(map.map_index());
-        }
-        let pointers = pointers.into_iter().collect::<Vec<_>>();
-        for pair in pointers.windows(2) {
-            let [previous, next] = pair else { unreachable!("windows of two") };
-            if previous.block_number.checked_add(1) != Some(next.block_number) {
-                return Err(InMemorySourceError::PointerBlockOrder {
-                    previous: previous.block_number,
-                    actual: next.block_number,
-                })
-            }
-            if previous.first_log_value_index >= next.first_log_value_index {
-                return Err(InMemorySourceError::PointerIndexOrder {
-                    previous: previous.first_log_value_index,
-                    actual: next.first_log_value_index,
-                })
-            }
-        }
-        if pointers.is_empty() {
-            return Err(InMemorySourceError::NoPointers)
-        }
-        Ok(Self { params_id, maps, pointers })
+impl MemorySource {
+    /// Adds a finished map, its block pointers, and the pointer of its last block.
+    pub(crate) fn add_map(&mut self, map: &FinishedMap) {
+        self.maps.insert(map.index, map.rows.iter().cloned().collect());
+        self.pointers.extend(map.pointers.iter().map(|start| (start.block, start.pointer)));
+        self.pointers.insert(map.last_block.number, map.last_block.pointer);
     }
 }
 
-impl FilterMapMatchSource for InMemoryMatchSource {
-    type Error = InMemorySourceError;
-
-    fn params_id(&self) -> ParamsId {
-        self.params_id
-    }
-
-    fn read_row_prefixes(
-        &mut self,
+impl FilterMapMatchSource for MemorySource {
+    fn row_prefixes(
+        &self,
         map_indices: &[u32],
         row_index: u32,
         max_columns: u32,
-    ) -> Result<Vec<Vec<u32>>, Self::Error> {
+    ) -> Result<Vec<Vec<u32>>, FilterMapsError> {
+        self.row_reads.set(self.row_reads.get() + 1);
         map_indices
             .iter()
-            .map(|&map_index| {
-                let map = self
+            .map(|map| {
+                let rows = self
                     .maps
-                    .binary_search_by_key(&map_index, |map| map.map().map_index())
-                    .map_err(|_| InMemorySourceError::UnknownMap { map: map_index })?;
-                let rows = self.maps[map].map().rows();
-                let columns = rows
-                    .binary_search_by_key(&row_index, |row| row.row_index())
-                    .ok()
-                    .map(|row| rows[row].columns())
-                    .unwrap_or_default();
-                Ok(columns.iter().copied().take(max_columns as usize).collect())
+                    .get(map)
+                    .ok_or_else(|| FilterMapsError::Corrupt(format!("map {map} is not stored")))?;
+                let row = rows.get(&row_index).map(Vec::as_slice).unwrap_or_default();
+                Ok(row.iter().copied().take(max_columns as usize).collect())
             })
             .collect()
     }
 
-    fn block_pointer(&mut self, block_number: u64) -> Result<u64, Self::Error> {
+    fn block_pointer(&self, block_number: u64) -> Result<u64, FilterMapsError> {
         self.pointers
-            .binary_search_by_key(&block_number, |pointer| pointer.block_number)
-            .map(|index| self.pointers[index].first_log_value_index)
-            .map_err(|_| InMemorySourceError::UnknownPointer { block: block_number })
+            .get(&block_number)
+            .copied()
+            .ok_or_else(|| FilterMapsError::Corrupt(format!("block {block_number} has no pointer")))
     }
 }
 
-/// Reason an [`InMemoryMatchSource`] could not be built or read.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum InMemorySourceError {
-    /// No map was supplied, so the source has no parameter set.
-    #[error("at least one completed map is required")]
-    NoMaps,
-    /// No block pointer was supplied.
-    #[error("at least one block pointer is required")]
-    NoPointers,
-    /// The maps were rendered under different parameter sets.
-    #[error("completed maps mix parameter identities {expected:?} and {actual:?}")]
-    MixedParams {
-        /// Parameter set of the first map.
-        expected: ParamsId,
-        /// Differing parameter set.
-        actual: ParamsId,
-    },
-    /// The maps do not ascend strictly.
-    #[error("completed map {actual} does not strictly follow {previous}")]
-    MapOrder {
-        /// Preceding map index.
-        previous: u32,
-        /// Offending map index.
-        actual: u32,
-    },
-    /// The pointers skip or repeat a block.
-    #[error("pointer block {actual} does not immediately follow {previous}")]
-    PointerBlockOrder {
-        /// Preceding block number.
-        previous: u64,
-        /// Offending block number.
-        actual: u64,
-    },
-    /// The pointers do not increase strictly in value index.
-    #[error("pointer index {actual} does not strictly follow {previous}")]
-    PointerIndexOrder {
-        /// Preceding value index.
-        previous: u64,
-        /// Offending value index.
-        actual: u64,
-    },
-    /// A read named a map the source does not hold.
-    #[error("completed map {map} is unavailable")]
-    UnknownMap {
-        /// Requested map index.
-        map: u32,
-    },
-    /// A read named a block the source holds no pointer for.
-    #[error("block pointer {block} is unavailable")]
-    UnknownPointer {
-        /// Requested block number.
-        block: u64,
-    },
+/// Returns the hash of block `number` on the synthetic chain.
+pub(crate) fn block_hash(number: u64) -> B256 {
+    B256::left_padding_from(&number.to_be_bytes())
 }
 
-/// Every map a renderer published before it completed, and how it completed.
-#[derive(Debug)]
-pub struct RenderedMaps {
-    /// Anchored completed maps in output order.
-    pub maps: Vec<AnchoredCompletedMap>,
-    /// Terminal state of the renderer.
-    pub completion: RendererCompletion,
+/// Returns `count` logs for block `number` of the synthetic chain.
+///
+/// Every log has four topics, so it takes five slots. Addresses and topics repeat across blocks,
+/// which makes rows fill up and spill to higher mapping layers.
+pub(crate) fn synthetic_logs(number: u64, count: usize) -> Vec<Log> {
+    (0..count)
+        .map(|position| {
+            let seed = number.wrapping_mul(31).wrapping_add(position as u64);
+            let address = Address::with_last_byte((seed % 7) as u8);
+            let topics = (0..4u8)
+                .map(|topic| B256::with_last_byte((seed % 13) as u8 ^ (topic << 4)))
+                .collect();
+            Log::new_unchecked(address, topics, Bytes::new())
+        })
+        .collect()
 }
 
-/// Verifier that trusts every externally supplied checkpoint.
-///
-/// Restoration still rejects checkpoints whose anchor names another value-space version or whose
-/// derivation predecessor cannot precede it; this only stands in for the checkpoint registry.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct AcceptAllCheckpoints;
-
-impl CheckpointVerifier for AcceptAllCheckpoints {
-    fn verify_checkpoint(
-        &mut self,
-        _identity: &IndexIdentity,
-        _anchor: MapResumeAnchor,
-        _provenance: CheckpointProvenance,
-    ) -> bool {
-        true
-    }
+/// Returns a fixture block's logs in receipt order.
+pub(crate) fn fixture_logs(block: &Block) -> Vec<Log> {
+    block
+        .receipts
+        .iter()
+        .flat_map(|receipt| &receipt.logs)
+        .map(|log| Log::new_unchecked(log.address, log.topics.clone(), Bytes::new()))
+        .collect()
 }
 
-/// Returns the hash of block `number` on the synthetic test chain.
-///
-/// Only the low byte of `number` is used, so hashes repeat every 256 blocks.
-pub const fn block_hash(number: u64) -> B256 {
-    B256::repeat_byte(number as u8)
-}
-
-/// Returns the index identity of the synthetic test chain under `params`, whose genesis is
-/// [`block_hash`]`(0)`.
-pub const fn identity(params: ParamsId) -> IndexIdentity {
-    IndexIdentity::new(STORAGE_FORMAT_V1, 1, block_hash(0), GETH_V1, params)
-}
-
-/// Returns the coverage a freshly initialized store under `identity` restores.
-///
-/// # Panics
-///
-/// Panics if restoration rejects the empty record, which would be a restoration bug.
-pub fn empty_coverage(identity: &IndexIdentity) -> StructurallyRestoredCoverage {
-    let record = StoredCoverageRecord { identity: *identity, segments: Vec::new() };
-    StructurallyRestoredCoverage::restore(identity, record, [], &mut RejectUnrecognizedCheckpoints)
-        .expect("empty coverage restores under its own identity")
-}
-
-/// Pulls `renderer` until it completes.
-///
-/// # Panics
-///
-/// Panics if the renderer fails.
-pub fn render_to_completion<I: Iterator<Item = BlockInput>>(
-    mut renderer: FilterMapRenderer<I>,
-) -> RenderedMaps {
-    let mut maps = Vec::new();
-    loop {
-        match renderer.render_next().expect("renderer yields until it completes") {
-            Ok(RendererOutput::Map(map)) => maps.push(map),
-            Ok(RendererOutput::Complete(completion)) => return RenderedMaps { maps, completion },
-            Err(error) => panic!("rendering failed: {error}"),
-        }
-    }
-}
-
-/// Renders `blocks`, the first of which is block zero, from the genesis value-space origin up to
-/// the last block as canonical head.
-///
-/// # Panics
-///
-/// Panics if `blocks` is empty or rendering fails.
-pub fn render_from_genesis(params: Params, blocks: Vec<BlockInput>) -> RenderedMaps {
-    let genesis = blocks.first().expect("rendering needs the genesis block");
-    let start = BlockPointer::new(genesis.number, genesis.hash, 0);
-    let stream = LogValueStream::new(params, start, blocks, LogValueStreamTermination::ReachedHead);
-    render_to_completion(FilterMapRenderer::from_genesis(stream).expect("genesis stream"))
-}
-
-/// Returns a segment origin at the recognized checkpoint `origin`, restored as a store restores
-/// one: from a stored segment record, through [`AcceptAllCheckpoints`].
-///
-/// A stored segment owns at least one map, so `first` must be the resume anchor of the map
-/// immediately after `origin`'s.
-///
-/// # Panics
-///
-/// Panics if `first` does not immediately follow `origin`, or restoration rejects the origin.
-pub fn recognized_checkpoint(
-    identity: IndexIdentity,
-    origin: MapResumeAnchor,
-    first: MapResumeAnchor,
-) -> SegmentOrigin {
-    let first_map = origin.completed_map_index + 1;
-    assert_eq!(
-        first.completed_map_index, first_map,
-        "a checkpoint segment starts after its origin"
-    );
-    let record = StoredCoverageRecord {
-        identity,
-        segments: vec![StoredSegmentRecord {
-            origin: StoredSegmentOrigin::Checkpoint {
-                origin_anchor: origin,
-                provenance: CheckpointProvenance::Recognized { id: 1 },
-            },
-            first_map,
-            terminal_map: first_map,
-        }],
+/// Returns the block at which the Geth oracle started rendering a fixture.
+pub(crate) fn fixture_start(fixture: &Fixture) -> BlockRef {
+    let (Origin::Genesis(origin) | Origin::Checkpoint(origin)) = fixture.origin else {
+        panic!("kept fixtures start at a checkpoint")
     };
-    let restored = StructurallyRestoredCoverage::restore(
-        &identity,
-        record,
-        [first],
-        &mut AcceptAllCheckpoints,
-    )
-    .expect("recognized checkpoint restores");
-    restored.segments()[0].origin().clone()
+    BlockRef { number: origin.block, hash: origin.hash, pointer: origin.index }
+}
+
+/// Renders a fixture from its origin, as the Geth oracle did, and returns the renderer.
+pub(crate) fn render_fixture(fixture: &Fixture) -> Renderer {
+    let start = fixture_start(fixture);
+    let mut renderer = Renderer::new(start, map_of(start.pointer).unwrap());
+    for block in &fixture.blocks {
+        renderer.push_block(block.number, block.hash, &fixture_logs(block));
+    }
+    renderer
+}
+
+/// Takes the full groups out of `renderer` and returns every finished map, in map order.
+pub(crate) fn take_finished_maps(renderer: &mut Renderer) -> Vec<FinishedMap> {
+    let mut maps = Vec::new();
+    while let Some(group) = renderer.take_full_group() {
+        maps.extend(group);
+    }
+    maps.extend(renderer.group().iter().cloned());
+    maps
+}
+
+/// Pushes the blocks from `first_block` on into `renderer`, each with the logs that `logs`
+/// returns for its number, until map `last_map` is finished. Returns every finished map, in map
+/// order.
+pub(crate) fn render_until(
+    renderer: &mut Renderer,
+    first_block: u64,
+    last_map: u32,
+    mut logs: impl FnMut(u64) -> Vec<Log>,
+) -> Vec<FinishedMap> {
+    let mut maps = Vec::new();
+    for number in first_block.. {
+        while let Some(group) = renderer.take_full_group() {
+            maps.extend(group);
+        }
+        if maps.iter().chain(renderer.group()).any(|map| map.index >= last_map) {
+            break
+        }
+        renderer.push_block(number, block_hash(number), &logs(number));
+    }
+    maps.extend(renderer.group().iter().cloned());
+    maps
+}
+
+/// Renders synthetic blocks of 1,000 logs from `origin` until map `last_map` is finished and
+/// returns every finished map, in map order.
+pub(crate) fn render_synthetic(origin: BlockRef, last_map: u32) -> Vec<FinishedMap> {
+    let mut renderer = Renderer::new(origin, map_of(origin.pointer).unwrap());
+    render_until(&mut renderer, origin.number, last_map, |number| synthetic_logs(number, 1000))
 }

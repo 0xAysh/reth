@@ -6,28 +6,42 @@ rust-version.workspace = true
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
-description = "Storage-independent FilterMaps domain model, renderer, and candidate matcher"
+description = "FilterMaps local search index for log queries"
 
 [lints]
 workspace = true
 
 [dependencies]
+# reth
+reth-chain-state.workspace = true
+reth-metrics.workspace = true
+reth-prune-types.workspace = true
+reth-storage-api = { workspace = true, features = ["std"] }
+reth-storage-errors.workspace = true
+
 # ethereum
+alloy-consensus.workspace = true
 alloy-eips.workspace = true
 alloy-primitives.workspace = true
 
 # crypto
 sha2.workspace = true
 
-# misc
-thiserror.workspace = true
+# storage
+rocksdb.workspace = true
 
-# test-utils
-reth-filter-maps-test-utils = { workspace = true, optional = true }
+# async
+tokio = { workspace = true, features = ["macros", "rt", "sync"] }
+
+# misc
+metrics.workspace = true
+schnellru.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
-reth-filter-maps = { workspace = true, features = ["test-utils"] }
+reth-ethereum-primitives.workspace = true
 reth-filter-maps-test-utils.workspace = true
-
-[features]
-test-utils = ["dep:reth-filter-maps-test-utils", "reth-filter-maps/test-utils"]
+reth-provider = { workspace = true, features = ["test-utils"] }
+proptest.workspace = true
+tempfile.workspace = true

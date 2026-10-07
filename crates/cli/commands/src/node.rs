@@ -9,9 +9,9 @@ use reth_db::init_db;
 use reth_node_builder::NodeBuilder;
 use reth_node_core::{
     args::{
-        DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, EngineArgs, EraArgs, JitArgs, MetricArgs,
-        NetworkArgs, PayloadBuilderArgs, PruningArgs, RpcServerArgs, StaticFilesArgs, StorageArgs,
-        TxPoolArgs,
+        DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, EngineArgs, EraArgs, FilterMapsArgs,
+        JitArgs, MetricArgs, NetworkArgs, PayloadBuilderArgs, PruningArgs, RpcServerArgs,
+        StaticFilesArgs, StorageArgs, TxPoolArgs,
     },
     node_config::NodeConfig,
     version,
@@ -123,6 +123,10 @@ pub struct NodeCommand<C: ChainSpecParser, Ext: clap::Args + fmt::Debug = NoArgs
     #[command(flatten, next_help_heading = "JIT")]
     pub jit: JitArgs,
 
+    /// All `FilterMaps` related arguments with --filter-maps prefix.
+    #[command(flatten, next_help_heading = "FilterMaps")]
+    pub filter_maps: FilterMapsArgs,
+
     /// Additional cli arguments
     #[command(flatten, next_help_heading = "Extension")]
     pub ext: Ext,
@@ -180,6 +184,7 @@ where
             static_files,
             storage,
             jit,
+            filter_maps,
             ext,
         } = self;
 
@@ -205,6 +210,7 @@ where
             static_files,
             storage,
             jit,
+            filter_maps,
         };
 
         let data_dir = node_config.datadir();
@@ -287,6 +293,31 @@ mod tests {
                 NodeCommand::parse_from(["reth", "--chain", chain]);
             assert_eq!(args.chain.chain, chain.parse::<reth_chainspec::Chain>().unwrap());
         }
+    }
+
+    #[test]
+    fn filter_maps_rejects_partial_receipts() {
+        for args in [
+            vec!["reth", "--filter-maps", "--minimal"],
+            vec![
+                "reth",
+                "--filter-maps",
+                "--prune.receiptslogfilter",
+                "0x0000000000000000000000000000000000000001:full",
+            ],
+        ] {
+            let err = NodeCommand::<EthereumChainSpecParser>::try_parse_args_from(args.clone())
+                .unwrap_err();
+            assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn filter_maps_history_defaults_to_geths() {
+        let cmd =
+            NodeCommand::<EthereumChainSpecParser>::try_parse_args_from(["reth", "--filter-maps"])
+                .unwrap();
+        assert_eq!(cmd.filter_maps, FilterMapsArgs { enabled: true, history: 2_350_000 });
     }
 
     #[test]

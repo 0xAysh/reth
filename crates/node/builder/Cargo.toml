@@ -27,6 +27,7 @@ reth-engine-tree.workspace = true
 reth-engine-util.workspace = true
 reth-evm.workspace = true
 reth-exex.workspace = true
+reth-filter-maps.workspace = true
 reth-fs-util.workspace = true
 reth-invalid-block-hooks.workspace = true
 reth-network-api.workspace = true

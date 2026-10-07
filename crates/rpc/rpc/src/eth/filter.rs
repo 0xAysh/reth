@@ -16,6 +16,7 @@ use futures::{
 use itertools::Itertools;
 use jsonrpsee::{core::RpcResult, server::IdProvider};
 use reth_errors::ProviderError;
+use reth_filter_maps::{receipt_floor, FilterMapsReader, MatchPattern, TopicSelection};
 use reth_primitives_traits::{NodePrimitives, SealedHeader};
 use reth_rpc_eth_api::{
     helpers::{EthBlocks, LoadReceipt},
@@ -29,7 +30,7 @@ use reth_rpc_eth_types::{
 use reth_rpc_server_types::{result::rpc_error_with_code, ToRpcResult};
 use reth_storage_api::{
     BlockHashReader, BlockIdReader, BlockNumReader, BlockReader, HeaderProvider, ProviderBlock,
-    ProviderReceipt, ReceiptProvider,
+    ProviderHeader, ProviderReceipt, ReceiptProvider,
 };
 use reth_tasks::Runtime;
 use reth_transaction_pool::{NewSubpoolTransactionStream, PoolTransaction, TransactionPool};
@@ -39,14 +40,14 @@ use std::{
     iter::{Peekable, StepBy},
     ops::RangeInclusive,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 use tokio::{
     sync::{mpsc::Receiver, oneshot, Mutex},
     time::MissedTickBehavior,
 };
-use tracing::{debug, error, trace};
+use tracing::{debug, error, trace, warn};
 
 impl<Eth> EngineEthFilter<RpcLog<Eth::NetworkTypes>> for EthFilter<Eth>
 where
@@ -155,6 +156,7 @@ where
             task_spawner,
             stale_filter_ttl,
             query_limits: QueryLimits { max_blocks_per_filter, max_logs_per_response },
+            filter_maps: OnceLock::new(),
         };
 
         let eth_filter = Self { inner: Arc::new(inner) };
@@ -440,6 +442,22 @@ where
     }
 }
 
+impl<Eth> EthFilter<Eth>
+where
+    Eth: EthApiTypes,
+{
+    /// Serves `eth_getLogs` from the `FilterMaps` index in the blocks it covers. Only the first
+    /// reader is kept.
+    pub fn set_filter_maps(&self, reader: FilterMapsReader) {
+        let _ = self.inner.filter_maps.set(reader);
+    }
+
+    /// Returns the `FilterMaps` reader, if one is set.
+    pub fn filter_maps(&self) -> Option<&FilterMapsReader> {
+        self.inner.filter_maps.get()
+    }
+}
+
 impl<Eth> std::fmt::Debug for EthFilter<Eth>
 where
     Eth: EthApiTypes,
@@ -466,6 +484,8 @@ struct EthFilterInner<Eth: EthApiTypes> {
     task_spawner: Runtime,
     /// Duration since the last filter poll, after which the filter is considered stale
     stale_filter_ttl: Duration,
+    /// The `FilterMaps` index, once the node opened it. Until then, queries use the header bloom.
+    filter_maps: OnceLock<FilterMapsReader>,
 }
 
 impl<Eth> EthFilterInner<Eth>
@@ -732,41 +752,44 @@ where
         // get current chain tip to determine processing mode
         let chain_tip = self.provider().best_block_number()?;
 
+        // In the blocks that FilterMaps indexes, the index names the candidate blocks. Everywhere
+        // else, and for a filter without an address or topic, the header bloom does. One snapshot
+        // serves the whole query, so every window sees the same index.
+        let index = self.filter_maps.get().and_then(|reader| {
+            let pattern = match_pattern(filter);
+            pattern.has_searchable_values().then(|| (reader.snapshot(), pattern))
+        });
+        let indexed = match &index {
+            Some((snapshot, _)) => {
+                indexed_window(snapshot.indexed_blocks(), receipt_floor(self.provider())?)
+            }
+            None => None,
+        };
+
         // Scan the range window by window so that receipts are fetched while headers are still
         // being read: the log limit can end the query after the first window, memory is bounded by
         // one window, and a cancelled query stops at the next window.
-        for (from, to) in
-            BlockRangeInclusiveIter::new(from_block..=to_block, self.max_headers_range)
-        {
+        for window in log_windows(from_block..=to_block, indexed.as_ref(), self.max_headers_range) {
             // reading headers is blocking, this gives the cancellation check a chance to run
             tokio::task::yield_now().await;
 
-            // collect the headers of this window that match the bloom filter
-            let mut matching_headers = Vec::new();
-            let headers = self.provider().headers_range(from..=to)?;
-
-            let mut headers_iter = headers.into_iter().peekable();
-
-            while let Some(header) = headers_iter.next() {
-                if !filter.matches_bloom(header.logs_bloom()) {
-                    continue
+            let candidates = match &index {
+                Some((snapshot, pattern)) if window.indexed => {
+                    match snapshot.candidate_blocks(window.from..=window.to, pattern) {
+                        Ok(candidates) => Some(candidates),
+                        // A failed lookup loses no log: the header bloom is complete.
+                        Err(error) => {
+                            warn!(target: "rpc::eth::filter", %error, from = window.from, to = window.to, "FilterMaps lookup failed, using the header bloom");
+                            None
+                        }
+                    }
                 }
-
-                let current_number = header.number();
-
-                let block_hash = match headers_iter.peek() {
-                    Some(next_header) if next_header.number() == current_number + 1 => {
-                        // Headers are consecutive, use the more efficient parent_hash
-                        next_header.parent_hash()
-                    }
-                    _ => {
-                        // Headers not consecutive or last header, calculate hash
-                        header.hash_slow()
-                    }
-                };
-
-                matching_headers.push(SealedHeader::new(header, block_hash));
-            }
+                _ => None,
+            };
+            let matching_headers = match candidates {
+                Some(candidates) => self.candidate_headers(filter, candidates)?,
+                None => self.bloom_headers(filter, window.from..=window.to)?,
+            };
 
             // initialize the appropriate range mode based on collected headers
             let mut range_mode = RangeMode::new(
@@ -826,6 +849,56 @@ where
         }
 
         Ok(all_logs)
+    }
+
+    /// Reads the headers of the candidate blocks and keeps the ones whose bloom matches `filter`.
+    fn candidate_headers(
+        &self,
+        filter: &Filter,
+        candidates: Vec<u64>,
+    ) -> Result<Vec<SealedHeader<ProviderHeader<Eth::Provider>>>, EthFilterError> {
+        let mut matching_headers = Vec::new();
+        for number in candidates {
+            let header = self
+                .provider()
+                .sealed_header(number)?
+                .ok_or_else(|| ProviderError::HeaderNotFound(number.into()))?;
+            if filter.matches_bloom(header.logs_bloom()) {
+                matching_headers.push(header);
+            }
+        }
+        Ok(matching_headers)
+    }
+
+    /// Reads the headers of `blocks` and keeps the ones whose bloom matches `filter`.
+    fn bloom_headers(
+        &self,
+        filter: &Filter,
+        blocks: RangeInclusive<u64>,
+    ) -> Result<Vec<SealedHeader<ProviderHeader<Eth::Provider>>>, EthFilterError> {
+        let mut matching_headers = Vec::new();
+        let mut headers_iter = self.provider().headers_range(blocks)?.into_iter().peekable();
+        while let Some(header) = headers_iter.next() {
+            if !filter.matches_bloom(header.logs_bloom()) {
+                continue
+            }
+
+            let current_number = header.number();
+
+            let block_hash = match headers_iter.peek() {
+                Some(next_header) if next_header.number() == current_number + 1 => {
+                    // Headers are consecutive, use the more efficient parent_hash
+                    next_header.parent_hash()
+                }
+                _ => {
+                    // Headers not consecutive or last header, calculate hash
+                    header.hash_slow()
+                }
+            };
+
+            matching_headers.push(SealedHeader::new(header, block_hash));
+        }
+        Ok(matching_headers)
     }
 }
 
@@ -978,6 +1051,64 @@ enum FilterKind<T> {
     Log(Box<Filter>),
     Block,
     PendingTransaction(PendingTransactionKind<T>),
+}
+
+/// Compiles the address and topic constraints of a log filter for `FilterMaps`.
+fn match_pattern(filter: &Filter) -> MatchPattern {
+    MatchPattern::new(
+        filter.address.iter().copied(),
+        filter.topics.iter().map(|topics| TopicSelection::OneOf(topics.iter().copied().collect())),
+    )
+}
+
+/// Returns the indexed blocks whose receipts the node still holds.
+fn indexed_window(
+    indexed: Option<RangeInclusive<u64>>,
+    receipt_floor: u64,
+) -> Option<RangeInclusive<u64>> {
+    let (first, last) = indexed?.into_inner();
+    let first = first.max(receipt_floor);
+    (first <= last).then_some(first..=last)
+}
+
+/// A run of blocks that one header read serves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LogWindow {
+    from: u64,
+    to: u64,
+    /// Whether the `FilterMaps` index names the candidate blocks of the window.
+    indexed: bool,
+}
+
+/// Splits `blocks` at the edges of the `indexed` window, then into header windows.
+fn log_windows(
+    blocks: RangeInclusive<u64>,
+    indexed: Option<&RangeInclusive<u64>>,
+    max_headers_range: u64,
+) -> Vec<LogWindow> {
+    let (from, to) = blocks.into_inner();
+    let parts = match indexed {
+        Some(indexed) if from <= *indexed.end() && to >= *indexed.start() => {
+            let (first, last) = (from.max(*indexed.start()), to.min(*indexed.end()));
+            let mut parts = Vec::with_capacity(3);
+            if from < first {
+                parts.push(LogWindow { from, to: first - 1, indexed: false });
+            }
+            parts.push(LogWindow { from: first, to: last, indexed: true });
+            if last < to {
+                parts.push(LogWindow { from: last + 1, to, indexed: false });
+            }
+            parts
+        }
+        _ => vec![LogWindow { from, to, indexed: false }],
+    };
+    parts
+        .into_iter()
+        .flat_map(|part| {
+            BlockRangeInclusiveIter::new(part.from..=part.to, max_headers_range)
+                .map(move |(from, to)| LogWindow { from, to, indexed: part.indexed })
+        })
+        .collect()
 }
 
 /// An iterator that yields _inclusive_ block ranges of a given step size
@@ -1440,12 +1571,15 @@ impl<
 mod tests {
     use super::*;
     use crate::{eth::EthApi, EthApiBuilder};
+    use alloy_consensus::TxLegacy;
     use alloy_network::Ethereum;
-    use alloy_primitives::{Bloom, FixedBytes};
+    use alloy_primitives::{Address, Bloom, Bytes, FixedBytes, Log, LogData, Signature, B256};
     use rand::Rng;
     use reth_chainspec::{ChainSpec, ChainSpecProvider};
-    use reth_ethereum_primitives::TxType;
+    use reth_db_api::models::StoredBlockBodyIndices;
+    use reth_ethereum_primitives::{Block, BlockBody, Receipt, TransactionSigned, TxType};
     use reth_evm_ethereum::EthEvmConfig;
+    use reth_filter_maps::{FilterMaps, FilterMapsConfig};
     use reth_network_api::noop::NoopNetwork;
     use reth_provider::test_utils::MockEthProvider;
     use reth_rpc_convert::RpcConverter;
@@ -1484,6 +1618,35 @@ mod tests {
         }
 
         assert_eq!(end, *range.end());
+    }
+
+    #[test]
+    fn log_windows_split_at_the_indexed_edges() {
+        let window = |from, to, indexed| LogWindow { from, to, indexed };
+        let indexed = 1_000..=2_500;
+        assert_eq!(
+            log_windows(0..=3_000, Some(&indexed), 1_000),
+            [
+                window(0, 999, false),
+                window(1_000, 2_000, true),
+                window(2_001, 2_500, true),
+                window(2_501, 3_000, false),
+            ]
+        );
+        assert_eq!(log_windows(1_200..=1_300, Some(&indexed), 1_000), [window(1_200, 1_300, true)]);
+        assert_eq!(
+            log_windows(2_600..=2_700, Some(&indexed), 1_000),
+            [window(2_600, 2_700, false)]
+        );
+        assert_eq!(log_windows(0..=500, None, 1_000), [window(0, 500, false)]);
+    }
+
+    #[test]
+    fn the_indexed_window_starts_at_the_receipt_floor() {
+        assert_eq!(indexed_window(Some(100..=500), 0), Some(100..=500));
+        assert_eq!(indexed_window(Some(100..=500), 300), Some(300..=500));
+        assert_eq!(indexed_window(Some(100..=500), 501), None);
+        assert_eq!(indexed_window(None, 0), None);
     }
 
     // Helper function to create a test EthApi instance
@@ -2266,6 +2429,114 @@ mod tests {
             ),
             "{err:?}"
         );
+    }
+
+    /// Adds block `number` to the mock chain, with a bloom that covers `bloom_logs` and a receipt
+    /// of `logs` behind one transaction. Returns the block hash.
+    fn add_block_with_logs(
+        provider: &MockEthProvider,
+        number: u64,
+        parent_hash: B256,
+        bloom_logs: &[Log],
+        logs: Vec<Log>,
+    ) -> B256 {
+        let mut logs_bloom = Bloom::default();
+        for log in bloom_logs {
+            logs_bloom.accrue_log(log);
+        }
+        let header =
+            alloy_consensus::Header { number, parent_hash, logs_bloom, ..Default::default() };
+        let hash = header.hash_slow();
+        let tx = TransactionSigned::new_unhashed(
+            TxLegacy { chain_id: Some(1), gas_limit: 21_000, nonce: number, ..Default::default() }
+                .into(),
+            Signature::test_signature(),
+        );
+        let body = BlockBody { transactions: vec![tx], ..Default::default() };
+        provider.add_block(hash, Block { header, body });
+        provider.add_receipts(number, vec![Receipt { logs, success: true, ..Default::default() }]);
+        provider.add_block_body_indices(
+            number,
+            StoredBlockBodyIndices { first_tx_num: number, tx_count: 1 },
+        );
+        hash
+    }
+
+    /// Returns a log of `address` without topics or data.
+    fn log_of(address: Address) -> Log {
+        Log { address, data: LogData::new_unchecked(vec![], Bytes::new()) }
+    }
+
+    /// Without a `FilterMaps` reader, an address filter takes the header bloom path.
+    #[tokio::test]
+    async fn logs_without_filter_maps_use_the_header_bloom() {
+        let provider = MockEthProvider::default();
+        let address = Address::repeat_byte(7);
+        let mut parent_hash = B256::ZERO;
+        for number in 0..=4u64 {
+            let logs = if number % 2 == 1 { vec![log_of(address)] } else { Vec::new() };
+            parent_hash = add_block_with_logs(&provider, number, parent_hash, &logs, logs.clone());
+        }
+
+        let eth_filter = EthFilter::new(
+            build_test_eth_api(provider),
+            EthFilterConfig::default(),
+            Runtime::test(),
+        );
+        assert!(eth_filter.filter_maps().is_none());
+        let logs = eth_filter
+            .inner
+            .clone()
+            .get_logs_in_block_range(Filter::new().address(address), 0, 4, QueryLimits::default())
+            .await
+            .unwrap();
+        let blocks = logs.iter().map(|log| log.block_number.unwrap()).collect::<Vec<_>>();
+        assert_eq!(blocks, [1, 3]);
+    }
+
+    /// With a `FilterMaps` reader, the index names the candidate blocks of the blocks it covers.
+    /// Block 2 has a matching bloom, and matching logs that arrive after it was indexed, so only
+    /// the header bloom path would report it.
+    #[tokio::test]
+    async fn logs_in_the_indexed_window_come_from_the_index() {
+        let provider = MockEthProvider::default();
+        let address = Address::repeat_byte(7);
+        let mut parent_hash = B256::ZERO;
+        for number in 0..=4u64 {
+            let logs = if number % 2 == 1 { vec![log_of(address)] } else { Vec::new() };
+            let bloom_logs = if number == 2 { vec![log_of(address)] } else { logs.clone() };
+            parent_hash = add_block_with_logs(&provider, number, parent_hash, &bloom_logs, logs);
+        }
+        // Block 5 holds a whole filter map of unrelated five-slot logs, so map 0 finishes in it
+        // and the index covers blocks 0 to 4.
+        let filler = Log {
+            address: Address::repeat_byte(8),
+            data: LogData::new_unchecked(vec![B256::ZERO; 4], Bytes::new()),
+        };
+        add_block_with_logs(&provider, 5, parent_hash, &[], vec![filler; 13_200]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let filter_maps = FilterMaps::open(dir.path(), FilterMapsConfig { history: 0 }).unwrap();
+        filter_maps.indexer(provider.clone()).index_to(5, 5).unwrap();
+        let late = Receipt { logs: vec![log_of(address)], success: true, ..Default::default() };
+        provider.add_receipts(2, vec![late]);
+
+        let eth_filter = EthFilter::new(
+            build_test_eth_api(provider),
+            EthFilterConfig::default(),
+            Runtime::test(),
+        );
+        eth_filter.set_filter_maps(filter_maps.reader());
+        let indexed = eth_filter.filter_maps().unwrap().snapshot().indexed_blocks();
+        assert_eq!(indexed, Some(0..=4));
+        let logs = eth_filter
+            .inner
+            .clone()
+            .get_logs_in_block_range(Filter::new().address(address), 0, 4, QueryLimits::default())
+            .await
+            .unwrap();
+        let blocks = logs.iter().map(|log| log.block_number.unwrap()).collect::<Vec<_>>();
+        assert_eq!(blocks, [1, 3], "block 2 is no candidate of the index");
     }
 
     #[tokio::test]

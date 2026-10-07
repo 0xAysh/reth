@@ -1,414 +1,211 @@
 use super::*;
-use crate::DEFAULT_PARAMS;
-use alloy_primitives::{address, b256};
-use std::collections::BTreeMap;
+use crate::test_utils::{render_fixture, take_finished_maps, MemorySource};
+use alloy_primitives::address;
+use reth_filter_maps_test_utils::{
+    manifest,
+    parser::{QueryResult, TopicConstraint},
+};
+use std::collections::HashMap;
 
-#[derive(Debug, thiserror::Error)]
-#[error("test source failure")]
-struct SourceError;
+const ADDRESS: Address = address!("0x0000000000000000000000000000000000000001");
 
-struct Source {
-    params_id: ParamsId,
-    rows: BTreeMap<(u32, u32), Vec<u32>>,
-    pointers: BTreeMap<u64, u64>,
-    row_reads: usize,
-    pointer_reads: usize,
-}
+/// Matches every fixture query over the maps the renderer produced and compares the potential
+/// indices and candidate blocks with Geth's.
+#[test]
+fn every_fixture_query_matches_geth() {
+    for (entry, fixture) in manifest::load_and_validate_corpus().unwrap() {
+        let mut source = MemorySource::default();
+        for map in take_finished_maps(&mut render_fixture(&fixture)) {
+            source.add_map(&map);
+        }
+        source
+            .pointers
+            .extend(fixture.pointers.iter().map(|pointer| (pointer.block, pointer.index)));
 
-impl Source {
-    fn empty() -> Self {
-        Self {
-            params_id: ParamsId::Default,
-            rows: BTreeMap::new(),
-            pointers: BTreeMap::new(),
-            row_reads: 0,
-            pointer_reads: 0,
+        for query in &fixture.queries {
+            let id = format!("{}:{}", entry.path, query.id);
+            let topics = query.topics.iter().map(|topic| match topic {
+                TopicConstraint::Any => TopicSelection::Any,
+                TopicConstraint::Values(values) => TopicSelection::OneOf(values.clone()),
+            });
+            let pattern = MatchPattern::new(query.addresses.iter().copied(), topics);
+            assert_eq!(
+                pattern.has_searchable_values(),
+                query.result != QueryResult::ErrMatchAll,
+                "{id}"
+            );
+            if pattern.has_searchable_values() {
+                let (first, last) = query.index_range;
+                let indices = potential_indices(&source, &pattern, first, last).unwrap();
+                assert_eq!(indices, query.potential_indices, "{id}");
+            }
+            let blocks = query.first_block..=query.last_block;
+            let candidates = candidate_blocks(&source, blocks, &pattern).unwrap();
+            assert_eq!(candidates, query.candidate_blocks, "{id}");
         }
     }
 }
 
-impl FilterMapMatchSource for Source {
-    type Error = SourceError;
-
-    fn params_id(&self) -> ParamsId {
-        self.params_id
+/// On layer 0 all 1,024 maps of an epoch share one row per value, and on layer 1 runs of 64 maps
+/// do. A query over the 32 maps of one group therefore reads one row per layer.
+#[test]
+fn rows_are_read_once_per_masked_map_run() {
+    let value = address_value(ADDRESS);
+    let mut source = MemorySource::default();
+    for map in 64..96 {
+        // A full base row sends every map to layer 1, where the row is empty.
+        let row = DEFAULT_PARAMS.row_index(map, 0, value);
+        let full = (0..DEFAULT_PARAMS.base_row_length()).collect();
+        source.maps.insert(map, [(row, full)].into());
     }
+    let pattern = MatchPattern::new([ADDRESS], []);
 
-    fn read_row_prefixes(
-        &mut self,
-        maps: &[u32],
-        row: u32,
-        max_columns: u32,
-    ) -> Result<Vec<Vec<u32>>, Self::Error> {
-        self.row_reads += 1;
-        Ok(maps
-            .iter()
-            .map(|map| {
-                self.rows
-                    .get(&(*map, row))
-                    .map(|columns| columns.iter().copied().take(max_columns as usize).collect())
-                    .unwrap_or_default()
-            })
-            .collect())
-    }
-
-    fn block_pointer(&mut self, block: u64) -> Result<u64, Self::Error> {
-        self.pointer_reads += 1;
-        self.pointers.get(&block).copied().ok_or(SourceError)
-    }
+    potential_indices(&source, &pattern, 64 << 16, (96 << 16) - 1).unwrap();
+    assert_eq!(source.row_reads.get(), 2, "one read on layer 0 and one on layer 1");
 }
 
 #[test]
-fn pattern_compiles_semantic_shape_and_rejects_invalid_topics() {
-    let address = address!("0000000000000000000000000000000000000001");
-    let topic = b256!("0101010101010101010101010101010101010101010101010101010101010101");
+fn patterns_dedup_values_and_treat_empty_alternatives_as_wildcards() {
+    let topic = B256::repeat_byte(1);
     let pattern = MatchPattern::new(
-        vec![address, address],
-        vec![TopicSelection::Any, TopicSelection::OneOf(vec![topic, topic])],
-    )
-    .unwrap();
+        [ADDRESS, ADDRESS],
+        [
+            TopicSelection::Any,
+            TopicSelection::OneOf(vec![topic, topic]),
+            TopicSelection::OneOf(vec![]),
+        ],
+    );
+    assert_eq!(pattern.addresses, [address_value(ADDRESS)]);
+    assert_eq!(pattern.topics, [None, Some(vec![topic_value(topic)]), None]);
     assert!(pattern.has_searchable_values());
-    assert_eq!(pattern.addresses, vec![address_value(address)]);
-    assert_eq!(pattern.topics[0], CompiledSelection::Any);
-    assert_eq!(pattern.topics[1], CompiledSelection::Values(vec![topic_value(topic)]));
 
-    assert_eq!(
-        MatchPattern::new(vec![], vec![TopicSelection::Any; 5]).unwrap_err(),
-        PatternError::TooManyTopicPositions { actual: 5 }
-    );
-    assert_eq!(
-        MatchPattern::new(vec![], vec![TopicSelection::OneOf(vec![])]).unwrap_err(),
-        PatternError::EmptyTopicAlternatives { position: 0 }
-    );
-}
+    let five = MatchPattern::new([], vec![TopicSelection::OneOf(vec![topic]); 5]);
+    assert_eq!(five.topics.len(), 4, "logs have at most four topics");
 
-#[test]
-fn wildcard_only_patterns_are_rejected_before_data_reads() {
-    for topics in [vec![], vec![TopicSelection::Any], vec![TopicSelection::Any; 2]] {
-        let pattern = MatchPattern::new(vec![], topics).unwrap();
-        assert!(!pattern.has_searchable_values());
-        let mut matcher = FilterMapMatcher::new(Source::empty());
-        assert!(matches!(
-            matcher.match_subrange(
-                &pattern,
-                IndexedMatchRange::new(10..=10, 0..=0, ParamsId::Default)
-            ),
-            Err(MatcherError::NoSearchableValues)
-        ));
-        let source = matcher.into_source();
-        assert_eq!((source.row_reads, source.pointer_reads), (0, 0));
+    for topics in [vec![], vec![TopicSelection::Any], vec![TopicSelection::OneOf(vec![])]] {
+        assert!(!MatchPattern::new([], topics).has_searchable_values());
     }
 }
 
 #[test]
-fn address_hit_is_reversed_clipped_and_resolved_to_a_block() {
-    let address = address!("0000000000000000000000000000000000000001");
-    let value = address_value(address);
-    let index = 3;
-    let row = DEFAULT_PARAMS.row_index(0, 0, value);
-    let column = DEFAULT_PARAMS.column_index(index, value);
-    let mut source = Source::empty();
-    source.rows.insert((0, row), vec![column]);
-    source.pointers.extend([(10, 0), (11, 10)]);
+fn a_wildcard_pattern_makes_every_block_a_candidate_without_reads() {
+    let source = MemorySource::default();
+    let pattern = MatchPattern::new([], [TopicSelection::Any]);
+    assert_eq!(candidate_blocks(&source, 10..=13, &pattern).unwrap(), [10, 11, 12, 13]);
+    assert_eq!(source.row_reads.get(), 0);
+}
 
-    let mut matcher = FilterMapMatcher::new(source);
-    let candidates = matcher
-        .match_subrange(
-            &MatchPattern::new(vec![address], vec![]).unwrap(),
-            IndexedMatchRange::new(10..=10, 0..=0, ParamsId::Default),
-        )
-        .unwrap();
-    assert_eq!(candidates.potential_indices(), &[3]);
-    assert_eq!(candidates.candidate_blocks(), &[10]);
+/// Marks each `(index, value)` on map 0 the way the renderer does on an empty map.
+fn source_with(marks: &[(u64, B256)], pointers: &[(u64, u64)]) -> MemorySource {
+    let mut rows = HashMap::<u32, Vec<u32>>::new();
+    for &(index, value) in marks {
+        let row = DEFAULT_PARAMS.row_index(0, 0, value);
+        rows.entry(row).or_default().push(DEFAULT_PARAMS.column_index(index, value));
+    }
+    MemorySource {
+        maps: [(0, rows)].into(),
+        pointers: pointers.iter().copied().collect(),
+        ..Default::default()
+    }
 }
 
 #[test]
-fn constrained_topic_translates_to_the_address_start() {
-    let topic = b256!("0101010101010101010101010101010101010101010101010101010101010101");
-    let value = topic_value(topic);
-    let topic_index = 4;
-    let row = DEFAULT_PARAMS.row_index(0, 0, value);
-    let column = DEFAULT_PARAMS.column_index(topic_index, value);
-    let mut source = Source::empty();
-    source.rows.insert((0, row), vec![column]);
-    source.pointers.extend([(10, 0), (11, 10)]);
-
-    let candidates = FilterMapMatcher::new(source)
-        .match_subrange(
-            &MatchPattern::new(vec![], vec![TopicSelection::OneOf(vec![topic])]).unwrap(),
-            IndexedMatchRange::new(10..=10, 0..=0, ParamsId::Default),
-        )
-        .unwrap();
-    assert_eq!(candidates.potential_indices(), &[3]);
+fn a_marked_address_resolves_to_its_block() {
+    let source = source_with(&[(3, address_value(ADDRESS))], &[(10, 0), (11, 10), (12, 20)]);
+    let pattern = MatchPattern::new([ADDRESS], []);
+    assert_eq!(potential_indices(&source, &pattern, 0, 19).unwrap(), [3]);
+    assert_eq!(candidate_blocks(&source, 10..=11, &pattern).unwrap(), [10]);
+    assert!(
+        candidate_blocks(&source, 11..=11, &pattern).unwrap().is_empty(),
+        "block 10 is clipped"
+    );
 }
 
 #[test]
-fn identity_and_range_errors_happen_before_row_reads() {
-    let address = address!("0000000000000000000000000000000000000001");
-    let pattern = MatchPattern::new(vec![address], vec![]).unwrap();
-    let mut source = Source::empty();
-    source.pointers.extend([(10, 0), (11, 10)]);
-    let mut matcher = FilterMapMatcher::new(source);
-
-    assert!(matches!(
-        matcher
-            .match_subrange(&pattern, IndexedMatchRange::new(10..=10, 0..=0, ParamsId::RangeTest)),
-        Err(MatcherError::ParamsMismatch { .. })
-    ));
-    assert_eq!(matcher.source.row_reads, 0);
-
-    matcher.source.params_id = ParamsId::RangeTest;
-    assert!(matches!(
-        matcher.match_subrange(&pattern, IndexedMatchRange::new(10..=10, 0..=0, ParamsId::Default)),
-        Err(MatcherError::SourceParamsChanged { .. })
-    ));
-    assert_eq!(matcher.source.row_reads, 0);
+fn a_marked_topic_translates_to_its_log_start() {
+    let topic = B256::repeat_byte(1);
+    let source = source_with(&[(4, topic_value(topic))], &[(10, 0), (11, 10)]);
+    let first = MatchPattern::new([], [TopicSelection::OneOf(vec![topic])]);
+    assert_eq!(potential_indices(&source, &first, 0, 9).unwrap(), [3]);
+    let second = MatchPattern::new([], [TopicSelection::Any, TopicSelection::OneOf(vec![topic])]);
+    assert_eq!(potential_indices(&source, &second, 0, 9).unwrap(), [2]);
 }
 
+/// Two blocks with a few logs each, matched with filters that the exact filter accepts.
 #[test]
-fn malformed_columns_are_errors_not_empty_matches() {
-    let address = address!("0000000000000000000000000000000000000001");
-    let value = address_value(address);
-    let row = DEFAULT_PARAMS.row_index(0, 0, value);
-    let mut source = Source::empty();
-    source.rows.insert((0, row), vec![DEFAULT_PARAMS.map_width()]);
-    source.pointers.extend([(10, 0), (11, 10)]);
-
-    assert!(matches!(
-        FilterMapMatcher::new(source).match_subrange(
-            &MatchPattern::new(vec![address], vec![]).unwrap(),
-            IndexedMatchRange::new(10..=10, 0..=0, ParamsId::Default),
-        ),
-        Err(MatcherError::MalformedColumn { .. })
-    ));
-}
-
-#[test]
-fn generated_tiny_domain_never_omits_exact_matches() {
+fn exact_matches_are_never_missed() {
     for seed in 0u8..64 {
-        let address_a = alloy_primitives::Address::repeat_byte(seed);
-        let address_b = alloy_primitives::Address::repeat_byte(seed.wrapping_add(1));
+        let address_a = Address::repeat_byte(seed);
+        let address_b = Address::repeat_byte(seed.wrapping_add(1));
         let topic_a = B256::repeat_byte(seed.wrapping_add(2));
         let topic_b = B256::repeat_byte(seed.wrapping_add(3));
-        let logs =
-            [(10u64, 0u64, address_a, vec![topic_a, topic_b]), (11, 4, address_b, vec![topic_b])];
-        let mut source = Source::empty();
-        source.pointers.extend([(10, 0), (11, 4), (12, 7)]);
-        for (_, start, address, topics) in &logs {
-            let values = std::iter::once(address_value(*address))
-                .chain(topics.iter().copied().map(topic_value));
-            for (offset, value) in values.enumerate() {
-                let index = start + offset as u64;
-                let row = DEFAULT_PARAMS.row_index(0, 0, value);
-                let column = DEFAULT_PARAMS.column_index(index, value);
-                source.rows.entry((0, row)).or_default().push(column);
+        let logs = [(0u64, address_a, vec![topic_a, topic_b]), (4, address_b, vec![topic_b])];
+        let mut marks = Vec::new();
+        for (start, address, topics) in &logs {
+            marks.push((*start, address_value(*address)));
+            for (ordinal, topic) in topics.iter().enumerate() {
+                marks.push((start + 1 + ordinal as u64, topic_value(*topic)));
             }
         }
-        for columns in source.rows.values_mut() {
-            columns.sort_unstable();
-        }
+        let source = source_with(&marks, &[(10, 0), (11, 4), (12, 7)]);
 
+        let one_of = |topic| TopicSelection::OneOf(vec![topic]);
         let cases = [
-            (MatchPattern::new(vec![address_a], vec![]).unwrap(), vec![10]),
-            (MatchPattern::new(vec![address_a, address_b], vec![]).unwrap(), vec![10, 11]),
-            (
-                MatchPattern::new(vec![], vec![TopicSelection::OneOf(vec![topic_b])]).unwrap(),
-                vec![11],
-            ),
-            (
-                MatchPattern::new(
-                    vec![address_a],
-                    vec![TopicSelection::Any, TopicSelection::OneOf(vec![topic_b])],
-                )
-                .unwrap(),
-                vec![10],
-            ),
+            (MatchPattern::new([address_a], []), vec![10]),
+            (MatchPattern::new([address_a, address_b], []), vec![10, 11]),
+            (MatchPattern::new([], [one_of(topic_b)]), vec![11]),
+            (MatchPattern::new([address_a], [TopicSelection::Any, one_of(topic_b)]), vec![10]),
         ];
         for (pattern, exact_blocks) in cases {
-            let candidates = FilterMapMatcher::new(Source {
-                params_id: source.params_id,
-                rows: source.rows.clone(),
-                pointers: source.pointers.clone(),
-                row_reads: 0,
-                pointer_reads: 0,
-            })
-            .match_subrange(&pattern, IndexedMatchRange::new(10..=11, 0..=0, ParamsId::Default))
-            .unwrap();
+            let candidates = candidate_blocks(&source, 10..=11, &pattern).unwrap();
             for exact in exact_blocks {
-                assert!(
-                    candidates.candidate_blocks().contains(&exact),
-                    "seed {seed} omitted exact block {exact}: {candidates:?}"
-                );
+                assert!(candidates.contains(&exact), "seed {seed} missed block {exact}");
             }
         }
-
-        // Clipping the same logical rows to block 11 must never leak block 10.
-        let clipped = FilterMapMatcher::new(source)
-            .match_subrange(
-                &MatchPattern::new(vec![address_a, address_b], vec![]).unwrap(),
-                IndexedMatchRange::new(11..=11, 0..=0, ParamsId::Default),
-            )
-            .unwrap();
-        assert_eq!(clipped.candidate_blocks(), &[11]);
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-enum Malformation {
-    WrongRowCount,
-    PrefixTooLong,
-}
-
-struct MalformedSource {
-    kind: Malformation,
-    value: B256,
-}
-
-impl FilterMapMatchSource for MalformedSource {
-    type Error = SourceError;
-
-    fn params_id(&self) -> ParamsId {
-        ParamsId::Default
-    }
-
-    fn read_row_prefixes(
-        &mut self,
-        maps: &[u32],
-        _row: u32,
-        max_columns: u32,
-    ) -> Result<Vec<Vec<u32>>, Self::Error> {
-        Ok(match self.kind {
-            Malformation::WrongRowCount => Vec::new(),
-            Malformation::PrefixTooLong => {
-                vec![
-                    vec![DEFAULT_PARAMS.column_index(0, self.value); max_columns as usize + 1];
-                    maps.len()
-                ]
-            }
-        })
-    }
-
-    fn block_pointer(&mut self, block: u64) -> Result<u64, Self::Error> {
-        match block {
-            10 => Ok(0),
-            11 => Ok(10),
-            _ => Err(SourceError),
-        }
-    }
+/// A value whose base row is full continues on layer 1, which has a longer row limit.
+#[test]
+fn full_rows_continue_on_the_next_layer() {
+    let value = address_value(ADDRESS);
+    let mut rows = HashMap::<u32, Vec<u32>>::new();
+    let base_row = DEFAULT_PARAMS.row_index(0, 0, value);
+    rows.insert(base_row, vec![0; DEFAULT_PARAMS.base_row_length() as usize]);
+    rows.entry(DEFAULT_PARAMS.row_index(0, 1, value))
+        .or_default()
+        .push(DEFAULT_PARAMS.column_index(3, value));
+    let source = MemorySource { maps: [(0, rows)].into(), ..Default::default() };
+    let pattern = MatchPattern::new([ADDRESS], []);
+    assert_eq!(potential_indices(&source, &pattern, 0, 9).unwrap(), [3]);
+    assert_eq!(source.row_reads.get(), 2);
 }
 
 #[test]
-fn malformed_source_shapes_fail_closed() {
-    let address = address!("0000000000000000000000000000000000000001");
-    let value = address_value(address);
-    let pattern = MatchPattern::new(vec![address], vec![]).unwrap();
-    for (kind, expected) in
-        [(Malformation::WrongRowCount, "row-count"), (Malformation::PrefixTooLong, "prefix")]
-    {
-        let error = FilterMapMatcher::new(MalformedSource { kind, value })
-            .match_subrange(&pattern, IndexedMatchRange::new(10..=10, 0..=0, ParamsId::Default))
-            .unwrap_err();
-        match expected {
-            "row-count" => assert!(matches!(error, MatcherError::RowCountMismatch { .. })),
-            "prefix" => assert!(matches!(error, MatcherError::RowPrefixTooLong { .. })),
-            _ => unreachable!(),
-        }
+fn rows_full_on_every_layer_are_corrupt() {
+    let value = address_value(ADDRESS);
+    let mut rows = HashMap::<u32, Vec<u32>>::new();
+    for layer in 0..20 {
+        let row = DEFAULT_PARAMS.row_index(0, layer, value);
+        rows.insert(row, vec![0; DEFAULT_PARAMS.max_row_length(layer) as usize]);
     }
-}
-
-struct LayerSource {
-    value: B256,
-    saturate_forever: bool,
-    limits: Vec<u32>,
-}
-
-impl FilterMapMatchSource for LayerSource {
-    type Error = SourceError;
-
-    fn params_id(&self) -> ParamsId {
-        ParamsId::Default
-    }
-
-    fn read_row_prefixes(
-        &mut self,
-        maps: &[u32],
-        _row: u32,
-        max_columns: u32,
-    ) -> Result<Vec<Vec<u32>>, Self::Error> {
-        self.limits.push(max_columns);
-        let columns = if self.saturate_forever || max_columns == DEFAULT_PARAMS.base_row_length() {
-            (0..max_columns).collect()
-        } else {
-            vec![DEFAULT_PARAMS.column_index(3, self.value)]
-        };
-        Ok(vec![columns; maps.len()])
-    }
-
-    fn block_pointer(&mut self, block: u64) -> Result<u64, Self::Error> {
-        match block {
-            10 => Ok(0),
-            11 => Ok(10),
-            _ => Err(SourceError),
-        }
-    }
+    let source = MemorySource { maps: [(0, rows)].into(), ..Default::default() };
+    let pattern = MatchPattern::new([ADDRESS], []);
+    assert!(matches!(potential_indices(&source, &pattern, 0, 9), Err(FilterMapsError::Corrupt(_))));
 }
 
 #[test]
-fn matcher_traverses_layers_and_bounds_saturated_sources() {
-    let address = address!("0000000000000000000000000000000000000001");
-    let value = address_value(address);
-    let pattern = MatchPattern::new(vec![address], vec![]).unwrap();
-    let range = IndexedMatchRange::new(10..=10, 0..=0, ParamsId::Default);
-
-    let mut matcher =
-        FilterMapMatcher::new(LayerSource { value, saturate_forever: false, limits: Vec::new() });
-    let candidates = matcher.match_subrange(&pattern, range.clone()).unwrap();
-    assert!(candidates.potential_indices().contains(&3));
-    assert_eq!(matcher.source.limits, vec![8, 128]);
-
-    let mut matcher =
-        FilterMapMatcher::new(LayerSource { value, saturate_forever: true, limits: Vec::new() });
+fn unordered_block_pointers_are_errors() {
+    let source = source_with(&[(3, address_value(ADDRESS))], &[(10, 0), (11, 0), (12, 10)]);
+    let pattern = MatchPattern::new([ADDRESS], []);
     assert!(matches!(
-        matcher.match_subrange(&pattern, range),
-        Err(MatcherError::LayerIndexExhausted { .. })
+        candidate_blocks(&source, 10..=11, &pattern),
+        Err(FilterMapsError::PointerOrder { block: 11, pointer: 0 })
     ));
-    assert!(matcher.source.limits.len() <= 13);
-}
 
-#[test]
-fn recognized_map_domain_cannot_overflow_candidate_arithmetic() {
-    for params in [crate::DEFAULT_PARAMS, crate::RANGE_TEST_PARAMS] {
-        let largest = u64::from(u32::MAX)
-            .checked_mul(params.values_per_map())
-            .and_then(|first| first.checked_add(params.values_per_map() - 1));
-        assert!(largest.is_some());
-    }
-}
-
-#[test]
-fn pointer_order_and_range_boundaries_fail_closed() {
-    let address = address!("0000000000000000000000000000000000000001");
-    let value = address_value(address);
-    let row = DEFAULT_PARAMS.row_index(0, 0, value);
-    let column = DEFAULT_PARAMS.column_index(3, value);
-    let mut source = Source::empty();
-    source.rows.insert((0, row), vec![column]);
-    source.pointers.extend([(10, 0), (11, 0), (12, 10)]);
-    let error = FilterMapMatcher::new(source)
-        .match_subrange(
-            &MatchPattern::new(vec![address], vec![]).unwrap(),
-            IndexedMatchRange::new(10..=11, 0..=0, ParamsId::Default),
-        )
-        .unwrap_err();
-    assert!(matches!(error, MatcherError::PointerOrderMismatch { .. }));
-
-    let mut source = Source::empty();
-    source.pointers.extend([(u64::MAX, 0)]);
-    let error = FilterMapMatcher::new(source)
-        .match_subrange(
-            &MatchPattern::new(vec![address], vec![]).unwrap(),
-            IndexedMatchRange::new(u64::MAX..=u64::MAX, 0..=0, ParamsId::Default),
-        )
-        .unwrap_err();
-    assert!(matches!(error, MatcherError::BlockSuccessorOverflow { .. }));
+    let reversed = source_with(&[], &[(10, 5), (11, 5)]);
+    assert!(matches!(
+        candidate_blocks(&reversed, 10..=10, &pattern),
+        Err(FilterMapsError::PointerOrder { block: 11, pointer: 5 })
+    ));
 }

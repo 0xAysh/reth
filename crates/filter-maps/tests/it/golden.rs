@@ -6,7 +6,7 @@
 //! the pinned Geth commit and the regeneration procedure.
 
 use alloy_primitives::{Address, B256};
-use reth_filter_maps::{address_value, topic_value, DEFAULT_PARAMS, RANGE_TEST_PARAMS};
+use reth_filter_maps::{address_value, topic_value, DEFAULT_PARAMS};
 
 // The tables are `pub` as the generator emits them. Regenerating overwrites the file wholesale, so
 // nothing there is hand-maintained beyond rustfmt's wrapping.
@@ -57,37 +57,23 @@ fn column_indices_match_geth() {
 
 #[test]
 fn max_row_lengths_match_geth() {
-    let cases = [
-        (&DEFAULT_PARAMS, vectors::MAX_ROW_LENGTH_DEFAULT),
-        (&RANGE_TEST_PARAMS, vectors::MAX_ROW_LENGTH_RANGE_TEST),
-    ];
-
-    for (params, table) in cases {
-        for (layer_index, expected) in table {
-            assert_eq!(
-                params.max_row_length(*layer_index),
-                *expected,
-                "max_row_length({layer_index})"
-            );
-        }
+    for (layer_index, expected) in vectors::MAX_ROW_LENGTH_DEFAULT {
+        assert_eq!(
+            DEFAULT_PARAMS.max_row_length(*layer_index),
+            *expected,
+            "max_row_length({layer_index})"
+        );
     }
 }
 
 #[test]
 fn masked_map_indices_match_geth() {
-    let cases = [
-        (&DEFAULT_PARAMS, vectors::MASKED_MAP_INDEX_DEFAULT),
-        (&RANGE_TEST_PARAMS, vectors::MASKED_MAP_INDEX_RANGE_TEST),
-    ];
-
-    for (params, table) in cases {
-        for (map_index, layer_index, expected) in table {
-            assert_eq!(
-                params.masked_map_index(*map_index, *layer_index),
-                *expected,
-                "masked_map_index({map_index}, {layer_index})"
-            );
-        }
+    for (map_index, layer_index, expected) in vectors::MASKED_MAP_INDEX_DEFAULT {
+        assert_eq!(
+            DEFAULT_PARAMS.masked_map_index(*map_index, *layer_index),
+            *expected,
+            "masked_map_index({map_index}, {layer_index})"
+        );
     }
 }
 
@@ -95,17 +81,11 @@ fn masked_map_indices_match_geth() {
 /// boundary, which misplaces whole runs of rows rather than single values.
 #[test]
 fn epoch_helpers_match_geth() {
-    let cases = [
-        (&DEFAULT_PARAMS, vectors::EPOCH_HELPERS_DEFAULT),
-        (&RANGE_TEST_PARAMS, vectors::EPOCH_HELPERS_RANGE_TEST),
-    ];
-
-    for (params, table) in cases {
-        for (map_index, epoch, first, last) in table {
-            assert_eq!(params.map_epoch(*map_index), *epoch, "map_epoch({map_index})");
-            assert_eq!(params.first_epoch_map(*epoch), *first, "first_epoch_map({epoch})");
-            assert_eq!(params.last_epoch_map(*epoch), *last, "last_epoch_map({epoch})");
-        }
+    let params = DEFAULT_PARAMS;
+    for (map_index, epoch, first, last) in vectors::EPOCH_HELPERS_DEFAULT {
+        assert_eq!(params.map_epoch(*map_index), *epoch, "map_epoch({map_index})");
+        assert_eq!(params.first_epoch_map(*epoch), *first, "first_epoch_map({epoch})");
+        assert_eq!(params.last_epoch_map(*epoch), *last, "last_epoch_map({epoch})");
     }
 }
 
@@ -114,14 +94,11 @@ fn epoch_helpers_match_geth() {
 #[test]
 fn final_epoch_is_const_evaluable() {
     const DEFAULT_LAST: u32 = DEFAULT_PARAMS.last_epoch_map(DEFAULT_PARAMS.map_epoch(u32::MAX));
-    const RANGE_LAST: u32 = RANGE_TEST_PARAMS.last_epoch_map(RANGE_TEST_PARAMS.map_epoch(u32::MAX));
     assert_eq!(DEFAULT_LAST, vectors::EPOCH_HELPERS_DEFAULT.last().unwrap().3);
-    assert_eq!(RANGE_LAST, vectors::EPOCH_HELPERS_RANGE_TEST.last().unwrap().3);
 }
 
 /// The split of a map index into its base row group and the offset within that group, which is how
-/// base rows are keyed as database entries. Only DEFAULT is compared: `RANGE_TEST` groups
-/// deliberately stop at epoch boundaries where Geth's do not (see `Params::map_group_index`).
+/// base rows are keyed as database entries.
 #[test]
 fn map_group_helpers_match_geth() {
     for (map_index, group_index, group_offset) in vectors::MAP_GROUP_DEFAULT {
@@ -144,5 +121,4 @@ fn map_group_helpers_match_geth() {
 #[test]
 fn base_row_lengths_match_geth() {
     assert_eq!(DEFAULT_PARAMS.base_row_length(), 8);
-    assert_eq!(RANGE_TEST_PARAMS.base_row_length(), 1);
 }

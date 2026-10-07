@@ -8257,7 +8257,6 @@ dependencies = [
  "roaring",
  "serde",
  "test-fuzz",
- "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -8455,6 +8454,7 @@ dependencies = [
  "reth-engine-local",
  "reth-engine-primitives",
  "reth-ethereum-primitives",
+ "reth-filter-maps",
  "reth-fs-util",
  "reth-network-api",
  "reth-network-peers",
@@ -9181,25 +9181,26 @@ dependencies = [
 name = "reth-filter-maps"
 version = "2.7.0"
 dependencies = [
+ "alloy-consensus",
  "alloy-eips",
  "alloy-primitives",
- "reth-filter-maps",
+ "metrics",
+ "proptest",
+ "reth-chain-state",
+ "reth-ethereum-primitives",
  "reth-filter-maps-test-utils",
- "sha2 0.10.9",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "reth-filter-maps-storage"
-version = "2.7.0"
-dependencies = [
- "alloy-primitives",
- "reth-db",
- "reth-db-api",
- "reth-filter-maps",
+ "reth-metrics",
+ "reth-provider",
+ "reth-prune-types",
+ "reth-storage-api",
+ "reth-storage-errors",
+ "rocksdb",
+ "schnellru",
  "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.21",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -9560,6 +9561,7 @@ dependencies = [
  "reth-evm",
  "reth-evm-ethereum",
  "reth-exex",
+ "reth-filter-maps",
  "reth-fs-util",
  "reth-invalid-block-hooks",
  "reth-network",
@@ -9699,6 +9701,7 @@ dependencies = [
  "reth-payload-primitives",
  "reth-primitives-traits",
  "reth-provider",
+ "reth-prune-types",
  "reth-revm",
  "reth-rpc",
  "reth-rpc-api",
@@ -10089,6 +10092,7 @@ dependencies = [
  "reth-evm",
  "reth-evm-ethereum",
  "reth-execution-types",
+ "reth-filter-maps",
  "reth-metrics",
  "reth-network-api",
  "reth-network-peers",
@@ -10115,6 +10119,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tokio-stream",

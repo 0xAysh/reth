@@ -1,7 +1,7 @@
 // GENERATED from go-ethereum core/filtermaps. DO NOT EDIT.
 // Geth commit: af7c0fd8ee09de71b1034dbe6d1112556b49b59f
 //
-// Params are DEFAULT unless a table name says RANGE_TEST.
+// Params are DEFAULT.
 
 pub const ADDRESS_VALUES: &[(&str, &str)] = &[
     (
@@ -147,10 +147,6 @@ pub const COLUMN_INDEX: &[(&str, u64, u32)] = &[
 pub const MAX_ROW_LENGTH_DEFAULT: &[(u32, u32)] =
     &[(0, 8), (1, 128), (2, 2048), (3, 8192), (4, 8192), (5, 8192), (6, 8192)];
 
-// layer -> max_row_length (RANGE_TEST)
-pub const MAX_ROW_LENGTH_RANGE_TEST: &[(u32, u32)] =
-    &[(0, 1), (1, 1), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1)];
-
 // (map_index, layer) -> masked_map_index (DEFAULT)
 pub const MASKED_MAP_INDEX_DEFAULT: &[(u32, u32, u32)] = &[
     (0, 0, 0),
@@ -197,38 +193,6 @@ pub const MASKED_MAP_INDEX_DEFAULT: &[(u32, u32, u32)] = &[
     (2048, 6, 2048),
 ];
 
-// (map_index, layer) -> masked_map_index (RANGE_TEST)
-pub const MASKED_MAP_INDEX_RANGE_TEST: &[(u32, u32, u32)] = &[
-    (0, 0, 0),
-    (0, 1, 0),
-    (0, 2, 0),
-    (0, 3, 0),
-    (0, 4, 0),
-    (0, 5, 0),
-    (0, 6, 0),
-    (1, 0, 1),
-    (1, 1, 1),
-    (1, 2, 1),
-    (1, 3, 1),
-    (1, 4, 1),
-    (1, 5, 1),
-    (1, 6, 1),
-    (2, 0, 2),
-    (2, 1, 2),
-    (2, 2, 2),
-    (2, 3, 2),
-    (2, 4, 2),
-    (2, 5, 2),
-    (2, 6, 2),
-    (7, 0, 7),
-    (7, 1, 7),
-    (7, 2, 7),
-    (7, 3, 7),
-    (7, 4, 7),
-    (7, 5, 7),
-    (7, 6, 7),
-];
-
 // map_index -> (map_epoch, first_epoch_map(that epoch), last_epoch_map(that epoch)) (DEFAULT)
 pub const EPOCH_HELPERS_DEFAULT: &[(u32, u32, u32, u32)] = &[
     (0, 0, 0, 1023),
@@ -242,17 +206,6 @@ pub const EPOCH_HELPERS_DEFAULT: &[(u32, u32, u32, u32)] = &[
     (1048576, 1024, 1048576, 1049599),
     (4294966271, 4194302, 4294965248, 4294966271),
     (4294967295, 4194303, 4294966272, 4294967295),
-];
-
-// map_index -> (map_epoch, first_epoch_map(that epoch), last_epoch_map(that epoch)) (RANGE_TEST)
-pub const EPOCH_HELPERS_RANGE_TEST: &[(u32, u32, u32, u32)] = &[
-    (0, 0, 0, 0),
-    (1, 1, 1, 1),
-    (2, 2, 2, 2),
-    (7, 7, 7, 7),
-    (1024, 1024, 1024, 1024),
-    (4294967294, 4294967294, 4294967294, 4294967294),
-    (4294967295, 4294967295, 4294967295, 4294967295),
 ];
 
 // map_index -> (map_group_index, map_group_offset) (DEFAULT)
@@ -269,4 +222,3 @@ pub const MAP_GROUP_DEFAULT: &[(u32, u32, u32)] = &[
 ];
 
 // sanity DEFAULT:    base_row_length=8 map_height=65536 values_per_map=65536 maps_per_epoch=1024
-// sanity RANGE_TEST: base_row_length=1 map_height=16 values_per_map=1 maps_per_epoch=1

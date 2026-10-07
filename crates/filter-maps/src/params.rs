@@ -3,27 +3,23 @@
 use alloy_primitives::B256;
 use sha2::{Digest, Sha256};
 
-/// A recognized valid parameter set for the filter map structure.
+/// The parameter set of the filter map structure.
 ///
-/// Callers select one of the exported constants rather than construct arbitrary field
-/// combinations. Durable storage records [`ParamsId`] and rejects unknown identities; configuration
-/// must likewise avoid deserializing unchecked fields and treating [`validate`](Self::validate) as
-/// a complete checked constructor.
+/// Only [`DEFAULT_PARAMS`], the mainnet set, exists. The store records a format version instead of
+/// these fields, so a different parameter set would need a new version.
 ///
 /// Only the source fields are stored. Everything Geth caches in `deriveFields` — map height, maps
 /// per epoch, values per map, base row length — is recomputed by the `const fn` accessors below, so
 /// a `Params` value cannot be observed in a half-derived state.
 ///
 /// The mapping methods assume a sane parameter set, as Geth's do: `log_map_width` strictly greater
-/// than `log_values_per_map` and less than 32, and `log_maps_per_epoch` under 32. Both recognized
-/// sets satisfy this. Outside that range the shift widths go out of bounds, where Rust panics on
-/// debug assertions and Go would silently yield zero — a divergence from the oracle either way.
-/// [`validate`](Self::validate) deliberately checks only the two conditions checked by Geth's
-/// `sanitize`; it does not make arbitrary parameter combinations supported.
+/// than `log_values_per_map` and less than 32, and `log_maps_per_epoch` under 32. Outside that
+/// range the shift widths go out of bounds, where Rust panics on debug assertions and Go would
+/// silently yield zero.
 ///
 /// Fields are deliberately private: the derived values must stay formulas. Hardcoding
 /// [`base_row_length`](Self::base_row_length), in particular, is how a parameter set silently
-/// acquires rows that hold nothing (see [`RANGE_TEST_PARAMS`]).
+/// acquires rows that hold nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Params {
     /// The number of bits required to represent the map height.
@@ -120,21 +116,6 @@ impl Params {
             as u32
     }
 
-    /// Runs the two checks performed by Geth's `sanitize`.
-    ///
-    /// Unlike `sanitize` this is pure — there are no derived fields to fill in. Passing these
-    /// checks does not make an arbitrary field combination a supported parameter set; callers
-    /// currently use the recognized exported constants.
-    pub const fn validate(&self) -> Result<(), ParamsError> {
-        if !self.log_map_width.is_multiple_of(8) {
-            return Err(ParamsError::MapWidthNotMultipleOfEight(self.log_map_width))
-        }
-        if self.base_row_group_size == 0 || !self.base_row_group_size.is_power_of_two() {
-            return Err(ParamsError::BaseRowGroupSizeNotPowerOfTwo(self.base_row_group_size))
-        }
-        Ok(())
-    }
-
     /// Returns the row index in which the given log value should be marked on the given map and
     /// mapping layer.
     ///
@@ -212,10 +193,9 @@ impl Params {
     /// Returns the start index of the base row group containing the given map index.
     ///
     /// Base row groups never span an epoch, so deleting an epoch's complete key range removes
-    /// whole groups and nothing of a neighbouring epoch. Whenever maps per epoch is a multiple of
-    /// [`base_row_group_size`](Self::base_row_group_size), as for [`DEFAULT_PARAMS`], this is
-    /// exactly Geth's `mapGroupIndex`. For [`RANGE_TEST_PARAMS`], with one map per epoch, every map
-    /// is its own group where Geth would share one across 32 epochs.
+    /// whole groups and nothing of a neighbouring epoch. Maps per epoch is a multiple of
+    /// [`base_row_group_size`](Self::base_row_group_size), so this is exactly Geth's
+    /// `mapGroupIndex`.
     pub const fn map_group_index(&self, index: u32) -> u32 {
         index & !self.map_group_mask()
     }
@@ -261,98 +241,6 @@ pub const DEFAULT_PARAMS: Params = Params {
     log_layer_diff: 4,
 };
 
-/// The recognized range-test parameter set: one value-space slot per map and one map per epoch.
-///
-/// This gives block-exact tail unindexing in tests. The ratio of 16 is load-bearing rather than
-/// arbitrary: it holds `base_row_length` at
-/// `1 * 16 / 16 = 1`. The mainnet ratio of 8 would floor this map's base row length to zero —
-/// rows that hold nothing, and therefore a dead index.
-pub const RANGE_TEST_PARAMS: Params = Params {
-    log_map_height: 4,
-    log_map_width: 24,
-    log_maps_per_epoch: 0,
-    log_values_per_map: 0,
-    base_row_group_size: 32,
-    base_row_length_ratio: 16,
-    log_layer_diff: 4,
-};
-
-/// Recognized parameter-set identity.
-///
-/// Published coverage is meaningful only under a recognized parameter set, so persistence and
-/// coverage metadata store this identity rather than the numerical fields of [`Params`]. Decoding
-/// an unrecognized identity fails instead of reinterpreting rows under invented dimensions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(u8)]
-pub enum ParamsId {
-    /// [`DEFAULT_PARAMS`], the mainnet parameter set.
-    Default = 1,
-    /// [`RANGE_TEST_PARAMS`], the block-exact test parameter set.
-    RangeTest = 2,
-}
-
-impl ParamsId {
-    /// Returns the recognized parameter set named by this identity.
-    pub const fn params(self) -> Params {
-        match self {
-            Self::Default => DEFAULT_PARAMS,
-            Self::RangeTest => RANGE_TEST_PARAMS,
-        }
-    }
-
-    /// Returns the identity of a recognized parameter set, or `None` for any other field
-    /// combination.
-    pub fn of(params: &Params) -> Option<Self> {
-        [Self::Default, Self::RangeTest].into_iter().find(|id| id.params() == *params)
-    }
-}
-
-impl From<ParamsId> for u8 {
-    fn from(id: ParamsId) -> Self {
-        id as Self
-    }
-}
-
-impl TryFrom<u8> for ParamsId {
-    type Error = UnknownParamsId;
-
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            1 => Ok(Self::Default),
-            2 => Ok(Self::RangeTest),
-            value => Err(UnknownParamsId(value)),
-        }
-    }
-}
-
-/// Error returned when decoding a persisted parameter-set identity that is not recognized.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("unknown parameter-set identity {0}")]
-pub struct UnknownParamsId(u8);
-
-impl UnknownParamsId {
-    /// Creates an unknown-identity error for the rejected encoded value.
-    pub const fn new(value: u8) -> Self {
-        Self(value)
-    }
-
-    /// Returns the rejected encoded value.
-    pub const fn value(self) -> u8 {
-        self.0
-    }
-}
-
-/// Error returned by [`Params::validate`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum ParamsError {
-    /// The map width is not a whole number of bytes.
-    #[error("log_map_width ({0}) must be a multiple of 8")]
-    MapWidthNotMultipleOfEight(u32),
-    /// The base row group size is not a power of two, so group indices cannot be masked out.
-    #[error("base_row_group_size ({0}) must be a power of 2")]
-    BaseRowGroupSizeNotPowerOfTwo(u32),
-}
-
 /// The 64-bit FNV-1a hash used to derive column indices.
 ///
 /// Implemented inline rather than pulled in as a dependency: it is nine lines, and the column
@@ -397,15 +285,14 @@ mod tests {
 
     #[test]
     fn row_index_stays_within_the_map() {
-        for params in [DEFAULT_PARAMS, RANGE_TEST_PARAMS] {
-            for value in sample_values() {
-                for map_index in [0, 1, 5, 1023, 1024, 1025, 4095, u32::MAX] {
-                    for layer_index in 0..=6 {
-                        assert!(
-                            params.row_index(map_index, layer_index, value) < params.map_height(),
-                            "row_index({map_index}, {layer_index}) escaped the map"
-                        );
-                    }
+        let params = DEFAULT_PARAMS;
+        for value in sample_values() {
+            for map_index in [0, 1, 5, 1023, 1024, 1025, 4095, u32::MAX] {
+                for layer_index in 0..=6 {
+                    assert!(
+                        params.row_index(map_index, layer_index, value) < params.map_height(),
+                        "row_index({map_index}, {layer_index}) escaped the map"
+                    );
                 }
             }
         }
@@ -413,17 +300,16 @@ mod tests {
 
     #[test]
     fn column_index_packs_the_position_above_the_hashed_bits() {
-        for params in [DEFAULT_PARAMS, RANGE_TEST_PARAMS] {
-            for value in sample_values() {
-                for log_value_index in [0, 1, 65535, 65536, 65537, 131_072, 1_234_567, u64::MAX] {
-                    let column = params.column_index(log_value_index, value);
-                    assert!(column < params.map_width(), "column {column} escaped the map");
-                    assert_eq!(
-                        column >> params.hash_bits(),
-                        (log_value_index % params.values_per_map()) as u32,
-                        "column_index({log_value_index}) lost its position bits"
-                    );
-                }
+        let params = DEFAULT_PARAMS;
+        for value in sample_values() {
+            for log_value_index in [0, 1, 65535, 65536, 65537, 131_072, 1_234_567, u64::MAX] {
+                let column = params.column_index(log_value_index, value);
+                assert!(column < params.map_width(), "column {column} escaped the map");
+                assert_eq!(
+                    column >> params.hash_bits(),
+                    (log_value_index % params.values_per_map()) as u32,
+                    "column_index({log_value_index}) lost its position bits"
+                );
             }
         }
     }
@@ -432,26 +318,25 @@ mod tests {
     /// which differs from Geth's and would diverge the row layout from it.
     #[test]
     fn max_row_length_grows_by_the_configured_factor_then_clamps() {
-        for params in [DEFAULT_PARAMS, RANGE_TEST_PARAMS] {
-            // The first layer whose remap frequency has already reached once-per-map; growth stops
-            // there because a shorter epoch cannot be subdivided further.
-            let clamp_layer = params.log_maps_per_epoch().div_ceil(params.log_layer_diff());
+        let params = DEFAULT_PARAMS;
+        // The first layer whose remap frequency has already reached once-per-map; growth stops
+        // there because a shorter epoch cannot be subdivided further.
+        let clamp_layer = params.log_maps_per_epoch().div_ceil(params.log_layer_diff());
 
-            for layer_index in 0..clamp_layer {
-                assert_eq!(
-                    params.max_row_length(layer_index),
-                    params.base_row_length() << (layer_index * params.log_layer_diff()),
-                    "layer {layer_index} grew off the configured curve"
-                );
-            }
-            let clamped = params.base_row_length() << params.log_maps_per_epoch();
-            for layer_index in clamp_layer..clamp_layer + 4 {
-                assert_eq!(
-                    params.max_row_length(layer_index),
-                    clamped,
-                    "layer {layer_index} kept growing past the clamp"
-                );
-            }
+        for layer_index in 0..clamp_layer {
+            assert_eq!(
+                params.max_row_length(layer_index),
+                params.base_row_length() << (layer_index * params.log_layer_diff()),
+                "layer {layer_index} grew off the configured curve"
+            );
+        }
+        let clamped = params.base_row_length() << params.log_maps_per_epoch();
+        for layer_index in clamp_layer..clamp_layer + 4 {
+            assert_eq!(
+                params.max_row_length(layer_index),
+                clamped,
+                "layer {layer_index} kept growing past the clamp"
+            );
         }
     }
 
@@ -478,65 +363,19 @@ mod tests {
     /// two halves must always recombine into the index they came from, for every index.
     #[test]
     fn map_group_helpers_split_the_index_without_losing_it() {
-        for params in [DEFAULT_PARAMS, RANGE_TEST_PARAMS] {
-            for index in [0, 1, 31, 32, 35, 63, 1000, u32::MAX] {
-                assert_eq!(
-                    params.map_group_index(index) + params.map_group_offset(index),
-                    index,
-                    "map index {index} did not survive the split"
-                );
-                assert!(params.map_group_offset(index) < params.base_row_group_size());
-                assert_eq!(
-                    params.map_epoch(params.map_group_index(index)),
-                    params.map_epoch(index),
-                    "map index {index} shares a group across an epoch boundary"
-                );
-            }
+        let params = DEFAULT_PARAMS;
+        for index in [0, 1, 31, 32, 35, 63, 1000, u32::MAX] {
+            assert_eq!(
+                params.map_group_index(index) + params.map_group_offset(index),
+                index,
+                "map index {index} did not survive the split"
+            );
+            assert!(params.map_group_offset(index) < params.base_row_group_size());
+            assert_eq!(
+                params.map_epoch(params.map_group_index(index)),
+                params.map_epoch(index),
+                "map index {index} shares a group across an epoch boundary"
+            );
         }
-    }
-
-    #[test]
-    fn validate_rejects_a_map_width_that_is_not_a_whole_number_of_bytes() {
-        let mut params = DEFAULT_PARAMS;
-        params.log_map_width = 25;
-        assert_eq!(params.validate(), Err(ParamsError::MapWidthNotMultipleOfEight(25)));
-    }
-
-    #[test]
-    fn validate_rejects_a_base_row_group_size_that_cannot_be_masked() {
-        for size in [0, 3, 24] {
-            let mut params = DEFAULT_PARAMS;
-            params.base_row_group_size = size;
-            assert_eq!(params.validate(), Err(ParamsError::BaseRowGroupSizeNotPowerOfTwo(size)));
-        }
-    }
-
-    #[test]
-    fn params_id_round_trips_through_its_encoding() {
-        for id in [ParamsId::Default, ParamsId::RangeTest] {
-            assert_eq!(ParamsId::try_from(u8::from(id)), Ok(id));
-            assert_eq!(ParamsId::of(&id.params()), Some(id));
-        }
-    }
-
-    #[test]
-    fn params_id_rejects_unrecognized_encodings() {
-        for value in [0, 3, u8::MAX] {
-            assert_eq!(ParamsId::try_from(value), Err(UnknownParamsId(value)));
-        }
-    }
-
-    #[test]
-    fn arbitrary_params_have_no_identity() {
-        let mut params = DEFAULT_PARAMS;
-        params.log_maps_per_epoch = 9;
-        assert_eq!(params.validate(), Ok(()), "still passes Geth's sanitize checks");
-        assert_eq!(ParamsId::of(&params), None, "but is not a recognized parameter set");
-    }
-
-    #[test]
-    fn shipped_parameter_sets_validate() {
-        assert_eq!(DEFAULT_PARAMS.validate(), Ok(()));
-        assert_eq!(RANGE_TEST_PARAMS.validate(), Ok(()));
     }
 }

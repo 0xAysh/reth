@@ -2,8 +2,9 @@
 
 use crate::{
     args::{
-        DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, EngineArgs, JitArgs, NetworkArgs,
-        PayloadBuilderArgs, PruningArgs, RpcServerArgs, StaticFilesArgs, StorageArgs, TxPoolArgs,
+        DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, EngineArgs, FilterMapsArgs, JitArgs,
+        NetworkArgs, PayloadBuilderArgs, PruningArgs, RpcServerArgs, StaticFilesArgs, StorageArgs,
+        TxPoolArgs,
     },
     dirs::{ChainPath, DataDirPath},
     utils::get_single_header,
@@ -158,6 +159,9 @@ pub struct NodeConfig<ChainSpec> {
 
     /// All JIT related arguments with --jit prefix
     pub jit: JitArgs,
+
+    /// All `FilterMaps` related arguments with --filter-maps prefix.
+    pub filter_maps: FilterMapsArgs,
 }
 
 impl NodeConfig<ChainSpec> {
@@ -191,6 +195,7 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             static_files: StaticFilesArgs::default(),
             storage: StorageArgs::default(),
             jit: JitArgs::default(),
+            filter_maps: FilterMapsArgs::default(),
         }
     }
 
@@ -272,6 +277,7 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             static_files,
             storage,
             jit,
+            filter_maps,
             ..
         } = self;
         NodeConfig {
@@ -293,6 +299,7 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             static_files,
             storage,
             jit,
+            filter_maps,
         }
     }
 
@@ -592,6 +599,7 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             static_files: self.static_files,
             storage: self.storage,
             jit: self.jit,
+            filter_maps: self.filter_maps,
         }
     }
 
@@ -635,6 +643,7 @@ impl<ChainSpec> Clone for NodeConfig<ChainSpec> {
             static_files: self.static_files,
             storage: self.storage,
             jit: self.jit.clone(),
+            filter_maps: self.filter_maps,
         }
     }
 }

@@ -13,7 +13,6 @@ use serde::{Deserialize, Serialize};
 pub mod accounts;
 pub mod bal;
 pub mod blocks;
-pub mod filter_maps;
 pub mod integer_list;
 pub mod metadata;
 pub mod sharded_key;
@@ -23,7 +22,6 @@ pub mod storage_sharded_key;
 pub use accounts::*;
 pub use bal::*;
 pub use blocks::*;
-pub use filter_maps::*;
 pub use integer_list::IntegerList;
 pub use metadata::*;
 pub use reth_db_models::{
