@@ -435,13 +435,11 @@ fn decode_base_rows(value: &[u8], row_count: usize) -> Result<Vec<Vec<u32>>, Fil
 
 /// Decodes 3-byte little-endian columns (Geth's `ReadFilterMapExtRow`).
 fn decode_columns(value: &[u8]) -> Result<Vec<u32>, FilterMapsError> {
-    if !value.len().is_multiple_of(COLUMN_BYTES) {
+    let (columns, rest) = value.as_chunks::<COLUMN_BYTES>();
+    if !rest.is_empty() {
         return Err(FilterMapsError::Corrupt("row length".to_owned()))
     }
-    Ok(value
-        .chunks_exact(COLUMN_BYTES)
-        .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], 0]))
-        .collect())
+    Ok(columns.iter().map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], 0])).collect())
 }
 
 /// Encodes 3-byte little-endian columns (Geth's `WriteFilterMapExtRow`).

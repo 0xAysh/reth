@@ -31,7 +31,7 @@ sha2.workspace = true
 rocksdb.workspace = true
 
 # async
-tokio = { workspace = true, features = ["sync", "macros"] }
+tokio = { workspace = true, features = ["macros", "rt", "sync"] }
 
 # misc
 metrics.workspace = true
