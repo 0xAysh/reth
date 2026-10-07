@@ -15,10 +15,9 @@ use futures::{
 };
 use itertools::Itertools;
 use jsonrpsee::{core::RpcResult, server::IdProvider};
-use reth_errors::{ProviderError, ProviderResult};
-use reth_filter_maps::{FilterMapsReader, MatchPattern, TopicSelection};
+use reth_errors::ProviderError;
+use reth_filter_maps::{receipt_floor, FilterMapsReader, MatchPattern, TopicSelection};
 use reth_primitives_traits::{NodePrimitives, SealedHeader};
-use reth_prune_types::PruneSegment;
 use reth_rpc_eth_api::{
     helpers::{EthBlocks, LoadReceipt},
     EngineEthFilter, EthApiTypes, EthFilterApiServer, FullEthApiTypes, QueryLimits, RpcConvert,
@@ -31,7 +30,7 @@ use reth_rpc_eth_types::{
 use reth_rpc_server_types::{result::rpc_error_with_code, ToRpcResult};
 use reth_storage_api::{
     BlockHashReader, BlockIdReader, BlockNumReader, BlockReader, HeaderProvider, ProviderBlock,
-    ProviderReceipt, PruneCheckpointReader, ReceiptProvider,
+    ProviderHeader, ProviderReceipt, ReceiptProvider,
 };
 use reth_tasks::Runtime;
 use reth_transaction_pool::{NewSubpoolTransactionStream, PoolTransaction, TransactionPool};
@@ -756,11 +755,10 @@ where
         // In the blocks that FilterMaps indexes, the index names the candidate blocks. Everywhere
         // else, and for a filter without an address or topic, the header bloom does. One snapshot
         // serves the whole query, so every window sees the same index.
-        let index = self
-            .filter_maps
-            .get()
-            .map(|reader| (reader.snapshot(), match_pattern(filter)))
-            .filter(|(_, pattern)| pattern.has_searchable_values());
+        let index = self.filter_maps.get().and_then(|reader| {
+            let pattern = match_pattern(filter);
+            pattern.has_searchable_values().then(|| (reader.snapshot(), pattern))
+        });
         let indexed = match &index {
             Some((snapshot, _)) => {
                 indexed_window(snapshot.indexed_blocks(), receipt_floor(self.provider())?)
@@ -771,59 +769,27 @@ where
         // Scan the range window by window so that receipts are fetched while headers are still
         // being read: the log limit can end the query after the first window, memory is bounded by
         // one window, and a cancelled query stops at the next window.
-        for (from, to, in_index) in
-            log_windows(from_block..=to_block, indexed.as_ref(), self.max_headers_range)
-        {
+        for window in log_windows(from_block..=to_block, indexed.as_ref(), self.max_headers_range) {
             // reading headers is blocking, this gives the cancellation check a chance to run
             tokio::task::yield_now().await;
 
-            let candidates = index
-                .as_ref()
-                .filter(|_| in_index)
-                .map(|(snapshot, pattern)| snapshot.candidate_blocks(from..=to, pattern));
-            let mut matching_headers = Vec::new();
-            if let Some(Ok(candidates)) = candidates {
-                // read only the headers of the candidate blocks.
-                for number in candidates {
-                    let header = self
-                        .provider()
-                        .sealed_header(number)?
-                        .ok_or_else(|| ProviderError::HeaderNotFound(number.into()))?;
-                    if filter.matches_bloom(header.logs_bloom()) {
-                        matching_headers.push(header);
+            let candidates = match &index {
+                Some((snapshot, pattern)) if window.indexed => {
+                    match snapshot.candidate_blocks(window.from..=window.to, pattern) {
+                        Ok(candidates) => Some(candidates),
+                        // A failed lookup loses no log: the header bloom is complete.
+                        Err(error) => {
+                            warn!(target: "rpc::eth::filter", %error, from = window.from, to = window.to, "FilterMaps lookup failed, using the header bloom");
+                            None
+                        }
                     }
                 }
-            } else {
-                if let Some(Err(error)) = candidates {
-                    warn!(target: "rpc::eth::filter", %error, from, to, "FilterMaps lookup failed, using the header bloom");
-                }
-
-                // collect the headers of this window that match the bloom filter
-                let headers = self.provider().headers_range(from..=to)?;
-
-                let mut headers_iter = headers.into_iter().peekable();
-
-                while let Some(header) = headers_iter.next() {
-                    if !filter.matches_bloom(header.logs_bloom()) {
-                        continue
-                    }
-
-                    let current_number = header.number();
-
-                    let block_hash = match headers_iter.peek() {
-                        Some(next_header) if next_header.number() == current_number + 1 => {
-                            // Headers are consecutive, use the more efficient parent_hash
-                            next_header.parent_hash()
-                        }
-                        _ => {
-                            // Headers not consecutive or last header, calculate hash
-                            header.hash_slow()
-                        }
-                    };
-
-                    matching_headers.push(SealedHeader::new(header, block_hash));
-                }
-            }
+                _ => None,
+            };
+            let matching_headers = match candidates {
+                Some(candidates) => self.candidate_headers(filter, candidates)?,
+                None => self.bloom_headers(filter, window.from..=window.to)?,
+            };
 
             // initialize the appropriate range mode based on collected headers
             let mut range_mode = RangeMode::new(
@@ -883,6 +849,56 @@ where
         }
 
         Ok(all_logs)
+    }
+
+    /// Reads the headers of the candidate blocks and keeps the ones whose bloom matches `filter`.
+    fn candidate_headers(
+        &self,
+        filter: &Filter,
+        candidates: Vec<u64>,
+    ) -> Result<Vec<SealedHeader<ProviderHeader<Eth::Provider>>>, EthFilterError> {
+        let mut matching_headers = Vec::new();
+        for number in candidates {
+            let header = self
+                .provider()
+                .sealed_header(number)?
+                .ok_or_else(|| ProviderError::HeaderNotFound(number.into()))?;
+            if filter.matches_bloom(header.logs_bloom()) {
+                matching_headers.push(header);
+            }
+        }
+        Ok(matching_headers)
+    }
+
+    /// Reads the headers of `blocks` and keeps the ones whose bloom matches `filter`.
+    fn bloom_headers(
+        &self,
+        filter: &Filter,
+        blocks: RangeInclusive<u64>,
+    ) -> Result<Vec<SealedHeader<ProviderHeader<Eth::Provider>>>, EthFilterError> {
+        let mut matching_headers = Vec::new();
+        let mut headers_iter = self.provider().headers_range(blocks)?.into_iter().peekable();
+        while let Some(header) = headers_iter.next() {
+            if !filter.matches_bloom(header.logs_bloom()) {
+                continue
+            }
+
+            let current_number = header.number();
+
+            let block_hash = match headers_iter.peek() {
+                Some(next_header) if next_header.number() == current_number + 1 => {
+                    // Headers are consecutive, use the more efficient parent_hash
+                    next_header.parent_hash()
+                }
+                _ => {
+                    // Headers not consecutive or last header, calculate hash
+                    header.hash_slow()
+                }
+            };
+
+            matching_headers.push(SealedHeader::new(header, block_hash));
+        }
+        Ok(matching_headers)
     }
 }
 
@@ -1045,12 +1061,6 @@ fn match_pattern(filter: &Filter) -> MatchPattern {
     )
 }
 
-/// Returns the lowest block whose receipts the node still holds.
-fn receipt_floor(provider: &impl PruneCheckpointReader) -> ProviderResult<u64> {
-    let checkpoint = provider.get_prune_checkpoint(PruneSegment::Receipts)?;
-    Ok(checkpoint.and_then(|checkpoint| checkpoint.block_number).map_or(0, |block| block + 1))
-}
-
 /// Returns the indexed blocks whose receipts the node still holds.
 fn indexed_window(
     indexed: Option<RangeInclusive<u64>>,
@@ -1061,34 +1071,42 @@ fn indexed_window(
     (first <= last).then_some(first..=last)
 }
 
-/// Splits `blocks` at the edges of the `indexed` window, then into header windows. Returns each
-/// window and whether the index answers it.
+/// A run of blocks that one header read serves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LogWindow {
+    from: u64,
+    to: u64,
+    /// Whether the `FilterMaps` index names the candidate blocks of the window.
+    indexed: bool,
+}
+
+/// Splits `blocks` at the edges of the `indexed` window, then into header windows.
 fn log_windows(
     blocks: RangeInclusive<u64>,
     indexed: Option<&RangeInclusive<u64>>,
     max_headers_range: u64,
-) -> Vec<(u64, u64, bool)> {
+) -> Vec<LogWindow> {
     let (from, to) = blocks.into_inner();
     let parts = match indexed {
         Some(indexed) if from <= *indexed.end() && to >= *indexed.start() => {
             let (first, last) = (from.max(*indexed.start()), to.min(*indexed.end()));
             let mut parts = Vec::with_capacity(3);
             if from < first {
-                parts.push((from, first - 1, false));
+                parts.push(LogWindow { from, to: first - 1, indexed: false });
             }
-            parts.push((first, last, true));
+            parts.push(LogWindow { from: first, to: last, indexed: true });
             if last < to {
-                parts.push((last + 1, to, false));
+                parts.push(LogWindow { from: last + 1, to, indexed: false });
             }
             parts
         }
-        _ => vec![(from, to, false)],
+        _ => vec![LogWindow { from, to, indexed: false }],
     };
     parts
         .into_iter()
-        .flat_map(|(from, to, indexed)| {
-            BlockRangeInclusiveIter::new(from..=to, max_headers_range)
-                .map(move |(from, to)| (from, to, indexed))
+        .flat_map(|part| {
+            BlockRangeInclusiveIter::new(part.from..=part.to, max_headers_range)
+                .map(move |(from, to)| LogWindow { from, to, indexed: part.indexed })
         })
         .collect()
 }
@@ -1555,12 +1573,13 @@ mod tests {
     use crate::{eth::EthApi, EthApiBuilder};
     use alloy_consensus::TxLegacy;
     use alloy_network::Ethereum;
-    use alloy_primitives::{Address, Bloom, Bytes, FixedBytes, Log, LogData, Signature};
+    use alloy_primitives::{Address, Bloom, Bytes, FixedBytes, Log, LogData, Signature, B256};
     use rand::Rng;
     use reth_chainspec::{ChainSpec, ChainSpecProvider};
     use reth_db_api::models::StoredBlockBodyIndices;
     use reth_ethereum_primitives::{Block, BlockBody, Receipt, TransactionSigned, TxType};
     use reth_evm_ethereum::EthEvmConfig;
+    use reth_filter_maps::{FilterMaps, FilterMapsConfig};
     use reth_network_api::noop::NoopNetwork;
     use reth_provider::test_utils::MockEthProvider;
     use reth_rpc_convert::RpcConverter;
@@ -1603,14 +1622,23 @@ mod tests {
 
     #[test]
     fn log_windows_split_at_the_indexed_edges() {
+        let window = |from, to, indexed| LogWindow { from, to, indexed };
         let indexed = 1_000..=2_500;
         assert_eq!(
             log_windows(0..=3_000, Some(&indexed), 1_000),
-            [(0, 999, false), (1_000, 2_000, true), (2_001, 2_500, true), (2_501, 3_000, false),]
+            [
+                window(0, 999, false),
+                window(1_000, 2_000, true),
+                window(2_001, 2_500, true),
+                window(2_501, 3_000, false),
+            ]
         );
-        assert_eq!(log_windows(1_200..=1_300, Some(&indexed), 1_000), [(1_200, 1_300, true)]);
-        assert_eq!(log_windows(2_600..=2_700, Some(&indexed), 1_000), [(2_600, 2_700, false)]);
-        assert_eq!(log_windows(0..=500, None, 1_000), [(0, 500, false)]);
+        assert_eq!(log_windows(1_200..=1_300, Some(&indexed), 1_000), [window(1_200, 1_300, true)]);
+        assert_eq!(
+            log_windows(2_600..=2_700, Some(&indexed), 1_000),
+            [window(2_600, 2_700, false)]
+        );
+        assert_eq!(log_windows(0..=500, None, 1_000), [window(0, 500, false)]);
     }
 
     #[test]
@@ -2403,45 +2431,51 @@ mod tests {
         );
     }
 
+    /// Adds block `number` to the mock chain, with a bloom that covers `bloom_logs` and a receipt
+    /// of `logs` behind one transaction. Returns the block hash.
+    fn add_block_with_logs(
+        provider: &MockEthProvider,
+        number: u64,
+        parent_hash: B256,
+        bloom_logs: &[Log],
+        logs: Vec<Log>,
+    ) -> B256 {
+        let mut logs_bloom = Bloom::default();
+        for log in bloom_logs {
+            logs_bloom.accrue_log(log);
+        }
+        let header =
+            alloy_consensus::Header { number, parent_hash, logs_bloom, ..Default::default() };
+        let hash = header.hash_slow();
+        let tx = TransactionSigned::new_unhashed(
+            TxLegacy { chain_id: Some(1), gas_limit: 21_000, nonce: number, ..Default::default() }
+                .into(),
+            Signature::test_signature(),
+        );
+        let body = BlockBody { transactions: vec![tx], ..Default::default() };
+        provider.add_block(hash, Block { header, body });
+        provider.add_receipts(number, vec![Receipt { logs, success: true, ..Default::default() }]);
+        provider.add_block_body_indices(
+            number,
+            StoredBlockBodyIndices { first_tx_num: number, tx_count: 1 },
+        );
+        hash
+    }
+
+    /// Returns a log of `address` without topics or data.
+    fn log_of(address: Address) -> Log {
+        Log { address, data: LogData::new_unchecked(vec![], Bytes::new()) }
+    }
+
     /// Without a `FilterMaps` reader, an address filter takes the header bloom path.
     #[tokio::test]
     async fn logs_without_filter_maps_use_the_header_bloom() {
         let provider = MockEthProvider::default();
         let address = Address::repeat_byte(7);
-        let log = Log { address, data: LogData::new_unchecked(vec![], Bytes::new()) };
-        let mut bloom = Bloom::default();
-        bloom.accrue_log(&log);
-        let tx = TransactionSigned::new_unhashed(
-            TxLegacy { chain_id: Some(1), gas_limit: 21_000, ..Default::default() }.into(),
-            Signature::test_signature(),
-        );
-        let mut parent_hash = FixedBytes::default();
+        let mut parent_hash = B256::ZERO;
         for number in 0..=4u64 {
-            let matches = number % 2 == 1;
-            let header = alloy_consensus::Header {
-                number,
-                parent_hash,
-                logs_bloom: if matches { bloom } else { Bloom::default() },
-                ..Default::default()
-            };
-            parent_hash = header.hash_slow();
-            let transactions = if matches { vec![tx.clone()] } else { Vec::new() };
-            provider.add_block(
-                parent_hash,
-                Block { header, body: BlockBody { transactions, ..Default::default() } },
-            );
-            if matches {
-                let receipt =
-                    Receipt { logs: vec![log.clone()], success: true, ..Default::default() };
-                provider.add_receipts(number, vec![receipt]);
-                provider.add_block_body_indices(
-                    number,
-                    // Blocks 1 and 3 hold transactions 0 and 1.
-                    StoredBlockBodyIndices { first_tx_num: number / 2, tx_count: 1 },
-                );
-            } else {
-                provider.add_receipts(number, vec![]);
-            }
+            let logs = if number % 2 == 1 { vec![log_of(address)] } else { Vec::new() };
+            parent_hash = add_block_with_logs(&provider, number, parent_hash, &logs, logs.clone());
         }
 
         let eth_filter = EthFilter::new(
@@ -2458,6 +2492,51 @@ mod tests {
             .unwrap();
         let blocks = logs.iter().map(|log| log.block_number.unwrap()).collect::<Vec<_>>();
         assert_eq!(blocks, [1, 3]);
+    }
+
+    /// With a `FilterMaps` reader, the index names the candidate blocks of the blocks it covers.
+    /// Block 2 has a matching bloom, and matching logs that arrive after it was indexed, so only
+    /// the header bloom path would report it.
+    #[tokio::test]
+    async fn logs_in_the_indexed_window_come_from_the_index() {
+        let provider = MockEthProvider::default();
+        let address = Address::repeat_byte(7);
+        let mut parent_hash = B256::ZERO;
+        for number in 0..=4u64 {
+            let logs = if number % 2 == 1 { vec![log_of(address)] } else { Vec::new() };
+            let bloom_logs = if number == 2 { vec![log_of(address)] } else { logs.clone() };
+            parent_hash = add_block_with_logs(&provider, number, parent_hash, &bloom_logs, logs);
+        }
+        // Block 5 holds a whole filter map of unrelated five-slot logs, so map 0 finishes in it
+        // and the index covers blocks 0 to 4.
+        let filler = Log {
+            address: Address::repeat_byte(8),
+            data: LogData::new_unchecked(vec![B256::ZERO; 4], Bytes::new()),
+        };
+        add_block_with_logs(&provider, 5, parent_hash, &[], vec![filler; 13_200]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let filter_maps = FilterMaps::open(dir.path(), FilterMapsConfig { history: 0 }).unwrap();
+        filter_maps.indexer(provider.clone()).index_to(5, 5).unwrap();
+        let late = Receipt { logs: vec![log_of(address)], success: true, ..Default::default() };
+        provider.add_receipts(2, vec![late]);
+
+        let eth_filter = EthFilter::new(
+            build_test_eth_api(provider),
+            EthFilterConfig::default(),
+            Runtime::test(),
+        );
+        eth_filter.set_filter_maps(filter_maps.reader());
+        let indexed = eth_filter.filter_maps().unwrap().snapshot().indexed_blocks();
+        assert_eq!(indexed, Some(0..=4));
+        let logs = eth_filter
+            .inner
+            .clone()
+            .get_logs_in_block_range(Filter::new().address(address), 0, 4, QueryLimits::default())
+            .await
+            .unwrap();
+        let blocks = logs.iter().map(|log| log.block_number.unwrap()).collect::<Vec<_>>();
+        assert_eq!(blocks, [1, 3], "block 2 is no candidate of the index");
     }
 
     #[tokio::test]

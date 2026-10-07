@@ -9181,6 +9181,7 @@ name = "reth-filter-maps"
 version = "2.7.0"
 dependencies = [
  "alloy-consensus",
+ "alloy-eips",
  "alloy-primitives",
  "metrics",
  "proptest",
@@ -10099,7 +10100,6 @@ dependencies = [
  "reth-payload-primitives",
  "reth-primitives-traits",
  "reth-provider",
- "reth-prune-types",
  "reth-revm",
  "reth-rpc-api",
  "reth-rpc-convert",
@@ -10118,6 +10118,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tokio-stream",

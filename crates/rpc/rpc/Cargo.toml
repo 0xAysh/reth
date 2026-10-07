@@ -21,7 +21,6 @@ reth-engine-primitives.workspace = true
 reth-errors.workspace = true
 reth-filter-maps.workspace = true
 reth-metrics.workspace = true
-reth-prune-types.workspace = true
 reth-storage-api = { workspace = true, features = ["chain-state"] }
 reth-execution-types = { workspace = true, features = ["serde"] }
 reth-chain-state.workspace = true
@@ -103,6 +102,7 @@ reth-db-common.workspace = true
 reth-storage-overlay.workspace = true
 
 rand.workspace = true
+tempfile.workspace = true
 
 jsonrpsee = { workspace = true, features = ["client"] }
 
