@@ -80,5 +80,8 @@ pub use storage::{DefaultStorageValues, StorageArgs};
 mod jit;
 pub use jit::JitArgs;
 
+mod filter_maps;
+pub use filter_maps::FilterMapsArgs;
+
 mod error;
 pub mod types;
