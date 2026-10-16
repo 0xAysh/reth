@@ -2,8 +2,9 @@
 //!
 //! These are the crate's primary correctness gate. Every table in [`vectors`] was produced by
 //! running Geth's own unexported mapping functions over fixed inputs, so a passing run means the
-//! port agrees with the oracle rather than merely with itself. See the header of `vectors.rs` for
-//! the pinned Geth commit and the regeneration procedure.
+//! port agrees with the oracle rather than merely with itself. The header of `vectors.rs` pins the
+//! Geth commit; the generator and its regeneration procedure live in `tools/filtermaps-oracles` on
+//! the fork's `filter-maps-oracles` branch.
 
 use alloy_primitives::{Address, B256};
 use reth_filter_maps::{address_value, topic_value, DEFAULT_PARAMS};
