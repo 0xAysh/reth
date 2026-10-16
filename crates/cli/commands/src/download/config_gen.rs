@@ -82,22 +82,27 @@ where
                 } else {
                     SnapshotComponentType::StorageChangesets
                 };
-                let target = match selections.get(&component) {
-                    Some(ComponentSelection::All) => None,
-                    Some(ComponentSelection::Distance(distance)) => {
-                        snapshot_block.checked_sub(*distance)
-                    }
-                    Some(ComponentSelection::Since(block)) => {
-                        block.checked_sub(1).map(|target| target.min(snapshot_block))
-                    }
-                    Some(ComponentSelection::None) | None => Some(snapshot_block),
+                let selection = selections.get(&component);
+                let Some(block) =
+                    retained_window_checkpoint(tx, *segment, selection, snapshot_block)?
+                else {
+                    continue
                 };
-                let Some(target) = target else { continue };
-                // Downloading a wider range cannot restore history already pruned by the source.
-                let existing = tx
-                    .get::<tables::PruneCheckpoints>(*segment)?
-                    .and_then(|checkpoint| checkpoint.block_number);
-                (existing.map_or(target, |existing| existing.max(target)), None)
+                (block, None)
+            }
+            // Receipts downloaded as a tail are on disk below the snapshot block, so a checkpoint
+            // at the snapshot block would hide them from every reader of the receipt floor.
+            PruneSegment::Receipts => {
+                let selection = selections.get(&SnapshotComponentType::Receipts);
+                let Some(block) =
+                    retained_window_checkpoint(tx, *segment, selection, snapshot_block)?
+                else {
+                    continue
+                };
+                (
+                    block,
+                    tx.get::<tables::BlockBodyIndices>(block)?.map(|indices| indices.last_tx_num()),
+                )
             }
             _ => (snapshot_block, tx_number),
         };
@@ -116,9 +121,54 @@ where
             mode = ?prune_mode,
             "Set prune checkpoint"
         );
+
+        // The pruner writes both receipt checkpoints together, so ContractLogs is never below
+        // Receipts. A higher source ContractLogs checkpoint comes from a receipts log filter and
+        // stays: the source pruned receipts up to there.
+        if *segment == PruneSegment::Receipts &&
+            tx.get::<tables::PruneCheckpoints>(PruneSegment::ContractLogs)?
+                .and_then(|checkpoint| checkpoint.block_number)
+                .is_none_or(|existing| existing < block_number)
+        {
+            tx.put::<tables::PruneCheckpoints>(PruneSegment::ContractLogs, checkpoint)?;
+
+            info!(target: "reth::cli",
+                segment = %PruneSegment::ContractLogs,
+                block = block_number,
+                tx = ?tx_number,
+                mode = ?prune_mode,
+                "Set prune checkpoint"
+            );
+        }
     }
 
     Ok(())
+}
+
+/// Returns the block a prune checkpoint of `segment` records for a component downloaded with
+/// `selection`: the last block below the downloaded window, or `None` when the download holds the
+/// whole history, so nothing is pruned.
+///
+/// The result is never below the checkpoint the source node left in the snapshot's database:
+/// downloading a wider range cannot restore history already pruned by the source.
+fn retained_window_checkpoint<Tx: DbTx>(
+    tx: &Tx,
+    segment: PruneSegment,
+    selection: Option<&ComponentSelection>,
+    snapshot_block: u64,
+) -> eyre::Result<Option<u64>> {
+    let target = match selection {
+        Some(ComponentSelection::All) => None,
+        Some(ComponentSelection::Distance(distance)) => snapshot_block.checked_sub(*distance),
+        Some(ComponentSelection::Since(block)) => {
+            block.checked_sub(1).map(|target| target.min(snapshot_block))
+        }
+        Some(ComponentSelection::None) | None => Some(snapshot_block),
+    };
+    let Some(target) = target else { return Ok(None) };
+    let existing =
+        tx.get::<tables::PruneCheckpoints>(segment)?.and_then(|checkpoint| checkpoint.block_number);
+    Ok(Some(existing.map_or(target, |existing| existing.max(target))))
 }
 
 /// Stage IDs for index stages whose output is stored in RocksDB and is never
@@ -774,6 +824,75 @@ mod tests {
                     .ensure_unwind_target_unpruned(snapshot_block, boundary, &checkpoints,)
                     .is_ok());
             }
+        }
+    }
+
+    #[test]
+    fn receipt_checkpoints_start_at_the_retained_window() {
+        // The 2026-10-08 mainnet snapshot.
+        let snapshot_block = 26_148_736;
+        for (selection, seeded, expected_receipts, expected_contract_logs) in [
+            (Some(ComponentSelection::Distance(2_350_000)), None, 23_798_736, Some(23_798_736)),
+            // Paris.
+            (Some(ComponentSelection::Since(15_537_394)), None, 15_537_393, Some(15_537_393)),
+            (None, None, snapshot_block, Some(snapshot_block)),
+            (
+                Some(ComponentSelection::Distance(2_350_000)),
+                Some((PruneSegment::Receipts, 24_000_000)),
+                24_000_000,
+                Some(24_000_000),
+            ),
+            (
+                Some(ComponentSelection::Distance(2_350_000)),
+                Some((PruneSegment::ContractLogs, 26_138_672)),
+                23_798_736,
+                Some(26_138_672),
+            ),
+            (
+                Some(ComponentSelection::All),
+                Some((PruneSegment::Receipts, 24_000_000)),
+                24_000_000,
+                None,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let db =
+                reth_db::init_db(dir.path(), reth_db::mdbx::DatabaseArguments::default()).unwrap();
+            let mut selections = BTreeMap::from([
+                (SnapshotComponentType::State, ComponentSelection::All),
+                (SnapshotComponentType::Headers, ComponentSelection::All),
+            ]);
+            if let Some(selection) = selection {
+                selections.insert(SnapshotComponentType::Receipts, selection);
+            }
+            let config = config_for_selections(
+                &selections,
+                &empty_manifest(),
+                None,
+                None::<&reth_chainspec::ChainSpec>,
+            );
+            let tx = db.tx_mut().unwrap();
+            if let Some((segment, block)) = seeded {
+                tx.put::<tables::PruneCheckpoints>(
+                    segment,
+                    PruneCheckpoint {
+                        block_number: Some(block),
+                        tx_number: None,
+                        prune_mode: PruneMode::Distance(MINIMUM_UNWIND_SAFE_DISTANCE),
+                    },
+                )
+                .unwrap();
+            }
+
+            write_prune_checkpoints_tx(&tx, &config, &selections, snapshot_block).unwrap();
+
+            let block = |segment| {
+                tx.get::<tables::PruneCheckpoints>(segment)
+                    .unwrap()
+                    .and_then(|checkpoint| checkpoint.block_number)
+            };
+            assert_eq!(block(PruneSegment::Receipts), Some(expected_receipts), "{selection:?}");
+            assert_eq!(block(PruneSegment::ContractLogs), expected_contract_logs, "{selection:?}");
         }
     }
 
