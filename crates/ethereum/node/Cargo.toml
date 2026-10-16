@@ -84,6 +84,7 @@ reth-stages-types.workspace = true
 reth-downloaders.workspace = true
 reth-eth-wire-types.workspace = true
 reth-network-peers.workspace = true
+reth-prune-types.workspace = true
 tempfile.workspace = true
 jsonrpsee-core.workspace = true
 
@@ -160,4 +161,5 @@ test-utils = [
     "reth-consensus/test-utils",
     "reth-engine-tree/test-utils",
     "reth-stages-api/test-utils",
+    "reth-prune-types/test-utils",
 ]

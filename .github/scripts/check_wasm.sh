@@ -56,6 +56,7 @@ exclude_crates=(
   reth # all of the crates below
   reth-bb # binary-only, uses tokio features unsupported on wasm
   reth-storage-rpc-provider
+  reth-filter-maps # rocksdb
   reth-invalid-block-hooks # reth-provider
   reth-libmdbx # mdbx
   reth-mdbx-sys # mdbx
