@@ -444,3 +444,54 @@ fn a_failing_indexer_backs_off_between_steps() {
     });
     assert_eq!(metrics["filter_maps.failures"], DebugValue::Counter(3));
 }
+
+/// A progress line waits for the first stored map group, then comes at most every
+/// `PROGRESS_INTERVAL`, and reaching the target ends the catch-up.
+#[test]
+fn catch_up_progress_is_logged_at_most_every_interval() {
+    let provider = chain(0..=60);
+    let dir = tempfile::tempdir().unwrap();
+    let maps = open(dir.path(), 0);
+    let mut indexer = maps.indexer(&provider);
+    let start = Instant::now();
+    let progress = |indexer: &Indexer<_>| (indexer.progress_logged, indexer.blocks_since_progress);
+
+    indexer.log_progress(1_000, 999, 5_000, start);
+    indexer.log_progress(1_000, 1_999, 5_000, start + PROGRESS_INTERVAL);
+    assert_eq!(progress(&indexer), (Some(start), 2_000), "no index head yet");
+
+    indexer.sync_to(60, 0, 60).unwrap();
+    assert_eq!(progress(&indexer), (None, 0));
+    indexer.log_progress(1_000, 999, 5_000, start);
+    indexer.log_progress(1_000, 1_999, 5_000, start + PROGRESS_INTERVAL / 2);
+    assert_eq!(progress(&indexer), (Some(start), 2_000));
+    indexer.log_progress(1_000, 2_999, 5_000, start + PROGRESS_INTERVAL);
+    assert_eq!(progress(&indexer), (Some(start + PROGRESS_INTERVAL), 0));
+}
+
+#[test]
+fn the_catch_up_rate_counts_the_blocks_since_the_last_line() {
+    let secs = Duration::from_secs;
+    assert_eq!(catch_up_rate(2_000, secs(20), 10_000), (100, secs(100)));
+    assert_eq!(catch_up_rate(0, Duration::ZERO, 10), (1_000, Duration::from_millis(10)));
+}
+
+/// A tail drop logs on its own timer, so it does not shorten the next progress interval.
+#[test]
+fn a_tail_drop_leaves_the_progress_line_alone() {
+    let provider = chain(100..=200);
+    let dir = tempfile::tempdir().unwrap();
+    let maps = open(dir.path(), 0);
+    start_at(&maps, 100, 1021 << 16);
+    let mut indexer = maps.indexer(&provider);
+    indexer.sync_to(200, 100, 200).unwrap();
+    let last_block = maps.store.snapshot().last_block_of_map(1023).unwrap().number;
+    let progress = (Some(Instant::now()), 7);
+    (indexer.progress_logged, indexer.blocks_since_progress) = progress;
+
+    indexer.config.history = 200 - last_block;
+    indexer.drop_tail(100, 200).unwrap();
+    assert_eq!(range(&maps).first_map, 1024, "epoch 0 is dropped");
+    assert_eq!((indexer.progress_logged, indexer.blocks_since_progress), progress);
+    assert!(indexer.tail_drop_logged.is_some());
+}

@@ -26,7 +26,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 /// The number of blocks that [`Indexer::run`] renders between two checks for shutdown, and whose
 /// hashes are read at once.
@@ -37,6 +37,9 @@ const MIN_BACKOFF: Duration = Duration::from_secs(1);
 
 /// The longest delay between two retries.
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
+
+/// The shortest interval between two progress lines, as Geth's `logFrequency`.
+const PROGRESS_INTERVAL: Duration = Duration::from_secs(20);
 
 /// Indexes finalized blocks into the `FilterMaps` store.
 ///
@@ -50,6 +53,12 @@ pub struct Indexer<P> {
     state: Option<RenderState>,
     /// The delay before the last retry, while steps keep failing.
     backoff: Option<Duration>,
+    /// When the last progress line was logged, or catch-up started.
+    progress_logged: Option<Instant>,
+    /// The blocks rendered since the last progress line.
+    blocks_since_progress: u64,
+    /// When the last tail drop line was logged.
+    tail_drop_logged: Option<Instant>,
     metrics: IndexerMetrics,
 }
 
@@ -61,6 +70,9 @@ impl<P> Indexer<P> {
             provider,
             state: None,
             backoff: None,
+            progress_logged: None,
+            blocks_since_progress: 0,
+            tail_drop_logged: None,
             metrics: IndexerMetrics::default(),
         }
     }
@@ -212,10 +224,45 @@ where
             self.metrics.record(self.state.as_ref().map(|state| &state.range));
         }
         let Some(state) = self.state.as_ref() else { return Ok(true) };
-        let last = target.min(state.next_block.saturating_add(max_blocks - 1));
+        let first = state.next_block;
+        let last = target.min(first.saturating_add(max_blocks - 1));
         self.render(last, last == target)?;
+        self.log_progress(
+            last.saturating_add(1).saturating_sub(first),
+            last,
+            target,
+            Instant::now(),
+        );
         self.drop_tail(floor, finalized)?;
         Ok(last == target)
+    }
+
+    /// Logs the catch-up progress at most every [`PROGRESS_INTERVAL`] while a step that rendered
+    /// `rendered` blocks up to `last`, done at `now`, leaves the index more than one step behind
+    /// `target`. In steady state every step reaches the target, so it logs nothing.
+    fn log_progress(&mut self, rendered: u64, last: u64, target: u64, now: Instant) {
+        if last == target {
+            self.progress_logged = None;
+            self.blocks_since_progress = 0;
+            return
+        }
+        self.blocks_since_progress += rendered;
+        let Some(logged) = self.progress_logged else {
+            self.progress_logged = Some(now);
+            return
+        };
+        let elapsed = now.duration_since(logged);
+        // The index head moves a map group at a time, so a line waits for the first stored group.
+        if elapsed >= PROGRESS_INTERVAL &&
+            let Some(indexed) =
+                self.state.as_ref().and_then(|state| state.range.indexed_blocks())
+        {
+            let (blocks_per_sec, eta) =
+                catch_up_rate(self.blocks_since_progress, elapsed, target - last);
+            info!(target: "filter_maps", indexed = *indexed.end(), target, blocks_per_sec, ?eta, "Indexing logs");
+            self.progress_logged = Some(now);
+            self.blocks_since_progress = 0;
+        }
     }
 
     /// Checks the store against the chain and returns where rendering resumes, or `None` while
@@ -339,6 +386,10 @@ where
             if last_block >= cutoff {
                 break
             }
+            if self.tail_drop_logged.is_none_or(|logged| logged.elapsed() >= PROGRESS_INTERVAL) {
+                info!(target: "filter_maps", epoch, cutoff, "Dropping old FilterMaps epochs");
+                self.tail_drop_logged = Some(Instant::now());
+            }
             state.range = self.store.drop_epoch(&state.range, epoch)?;
             self.metrics.record(Some(&state.range));
         }
@@ -461,6 +512,15 @@ fn panic_message(payload: &(dyn Any + Send)) -> &str {
         .map(String::as_str)
         .or_else(|| payload.downcast_ref::<&str>().copied())
         .unwrap_or("unknown panic")
+}
+
+/// Returns the blocks rendered per second, and the time left for `remaining` blocks at that rate,
+/// after rendering `blocks` blocks took `elapsed`.
+fn catch_up_rate(blocks: u64, elapsed: Duration, remaining: u64) -> (u64, Duration) {
+    let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX).max(1);
+    let blocks = blocks.max(1);
+    let eta = Duration::from_millis(remaining.saturating_mul(elapsed_ms) / blocks);
+    (blocks.saturating_mul(1_000) / elapsed_ms, eta)
 }
 
 #[cfg(test)]
