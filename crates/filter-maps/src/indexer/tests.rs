@@ -10,7 +10,7 @@ use alloy_primitives::{Address, Log, B256};
 use reth_ethereum_primitives::Receipt;
 use reth_provider::test_utils::MockEthProvider;
 use reth_storage_errors::provider::ProviderError;
-use std::{ops::RangeInclusive, path::Path};
+use std::{ops::RangeInclusive, path::Path, time::Duration};
 
 /// Logs per synthetic block. Each takes five slots, so a map takes about 13 blocks.
 const LOGS: usize = 1000;
@@ -208,18 +208,103 @@ fn missing_receipts_reset_below_the_floor_and_fail_above_it() {
 }
 
 /// The pruner deletes receipts before it commits the checkpoint that raises the receipt floor, so
-/// a step retries missing receipts once before it fails.
+/// a step retries missing receipts until a fresh floor read passes them.
 #[test]
-fn missing_receipts_are_retried_once() {
+fn missing_receipts_are_retried_until_the_floor_passes_them() {
+    let provider = chain(0..=90);
+    provider.receipts.lock().retain(|number, _| *number >= 70);
+    let dir = tempfile::tempdir().unwrap();
+    let maps = open(dir.path(), 0);
+    let mut indexer = maps.indexer(&provider);
+
+    for delay in [1, 2] {
+        assert_eq!(
+            indexer.step_or_retry(|indexer| indexer.sync(90, 0, 90, STEP)),
+            Next::Retry(Duration::from_secs(delay))
+        );
+        assert_eq!(maps.reader().snapshot().indexed_blocks(), None);
+    }
+
+    assert_eq!(indexer.step_or_retry(|indexer| indexer.sync(90, 70, 90, STEP)), Next::Wait);
+    assert_eq!(range(&maps).origin, BlockRef { number: 70, hash: block_hash(70), pointer: 0 });
+}
+
+#[test]
+fn the_backoff_doubles_up_to_a_minute() {
+    let secs = Duration::from_secs;
+    assert_eq!(next_backoff(None), secs(1));
+    assert_eq!(next_backoff(Some(secs(1))), secs(2));
+    assert_eq!(next_backoff(Some(secs(32))), secs(60));
+    assert_eq!(next_backoff(Some(secs(60))), secs(60));
+}
+
+#[test]
+fn a_failed_step_is_retried_with_a_growing_backoff() {
     let provider = chain(0..=90);
     provider.receipts.lock().remove(&70);
     let dir = tempfile::tempdir().unwrap();
     let maps = open(dir.path(), 0);
     let mut indexer = maps.indexer(&provider);
 
-    assert!(indexer.index_step(90, 90).unwrap(), "the first miss waits for the next call");
-    assert!(matches!(
-        indexer.index_step(90, 90),
-        Err(FilterMapsError::Provider(ProviderError::ReceiptNotFound(block))) if block == 70.into()
-    ));
+    for delay in [1, 2, 4] {
+        assert_eq!(
+            indexer.step_or_retry(|indexer| indexer.index_step(90, 90)),
+            Next::Retry(Duration::from_secs(delay))
+        );
+        assert_eq!(indexer.state.as_ref().map(|state| state.next_block), Some(70));
+    }
+
+    set_block(&provider, 70, block_hash(70), synthetic_logs(70, LOGS));
+    assert_eq!(indexer.step_or_retry(|indexer| indexer.index_step(90, 90)), Next::Wait);
+    let fresh_dir = tempfile::tempdir().unwrap();
+    let fresh = open(fresh_dir.path(), 0);
+    fresh.indexer(&provider).index_to(90, 90).unwrap();
+    assert_same_index(&maps, &fresh);
+
+    // The success reset the backoff.
+    set_block(&provider, 91, block_hash(91), Vec::new());
+    provider.receipts.lock().remove(&91);
+    assert_eq!(
+        indexer.step_or_retry(|indexer| indexer.index_step(91, 91)),
+        Next::Retry(Duration::from_secs(1))
+    );
+}
+
+#[test]
+fn a_panicked_step_is_retried_from_the_store() {
+    let provider = chain(0..=60);
+    let dir = tempfile::tempdir().unwrap();
+    let maps = open(dir.path(), 0);
+    let mut indexer = maps.indexer(&provider);
+    assert_eq!(indexer.step_or_retry(|indexer| indexer.index_step(60, 60)), Next::Wait);
+    let indexed = range(&maps);
+
+    assert_eq!(indexer.step_or_retry(|_| panic!("boom")), Next::Retry(Duration::from_secs(1)));
+    assert!(indexer.state.is_none());
+    assert_eq!(indexer.step_or_retry(|indexer| indexer.index_step(60, 60)), Next::Wait);
+    assert_eq!(range(&maps), indexed);
+}
+
+#[test]
+fn a_failure_other_than_missing_receipts_resumes_from_the_store() {
+    let provider = chain(0..=90);
+    let dir = tempfile::tempdir().unwrap();
+    let maps = open(dir.path(), 0);
+    let mut indexer = maps.indexer(&provider);
+    assert_eq!(indexer.step_or_retry(|indexer| indexer.index_step(60, 60)), Next::Wait);
+
+    // Block 70 has no hash.
+    provider.headers.lock().retain(|_, header| header.number != 70);
+    assert_eq!(
+        indexer.step_or_retry(|indexer| indexer.index_step(90, 90)),
+        Next::Retry(Duration::from_secs(1))
+    );
+    assert!(indexer.state.is_none());
+
+    set_block(&provider, 70, block_hash(70), synthetic_logs(70, LOGS));
+    assert_eq!(indexer.step_or_retry(|indexer| indexer.index_step(90, 90)), Next::Wait);
+    let fresh_dir = tempfile::tempdir().unwrap();
+    let fresh = open(fresh_dir.path(), 0);
+    fresh.indexer(&provider).index_to(90, 90).unwrap();
+    assert_same_index(&maps, &fresh);
 }

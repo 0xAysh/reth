@@ -19,12 +19,23 @@ use reth_metrics::{
 };
 use reth_storage_api::{BlockHashReader, PruneCheckpointReader, ReceiptProvider};
 use reth_storage_errors::provider::ProviderError;
-use std::sync::Arc;
+use std::{
+    any::Any,
+    panic::{catch_unwind, AssertUnwindSafe},
+    sync::Arc,
+    time::Duration,
+};
 use tracing::{debug, error, warn};
 
 /// The number of blocks that [`Indexer::run`] renders between two checks for shutdown, and whose
 /// hashes are read at once.
 const STEP: u64 = 1_000;
+
+/// The delay before the first retry of a failed step.
+const MIN_BACKOFF: Duration = Duration::from_secs(1);
+
+/// The longest delay between two retries.
+const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
 /// Indexes finalized blocks into the `FilterMaps` store.
 ///
@@ -36,8 +47,8 @@ pub struct Indexer<P> {
     provider: P,
     /// The rendering state, once the store is checked against the chain.
     state: Option<RenderState>,
-    /// The block whose receipts the last step found missing.
-    missing_receipt_block: Option<u64>,
+    /// The delay before the last retry, while steps keep failing.
+    backoff: Option<Duration>,
     metrics: IndexerMetrics,
 }
 
@@ -48,9 +59,42 @@ impl<P> Indexer<P> {
             config,
             provider,
             state: None,
-            missing_receipt_block: None,
+            backoff: None,
             metrics: IndexerMetrics::default(),
         }
+    }
+
+    /// Runs one indexing step and turns a failure or a panic into a retry after a backoff: the
+    /// index is advisory, and nothing restarts a stopped indexer.
+    ///
+    /// Missing receipts keep the rendering state, since the receipts are read before their block
+    /// is pushed. Every other failure resumes from the store, because a failed group write has
+    /// already taken the group from the renderer.
+    fn step_or_retry(
+        &mut self,
+        step: impl FnOnce(&mut Self) -> Result<bool, FilterMapsError>,
+    ) -> Next {
+        let delay = next_backoff(self.backoff);
+        match catch_unwind(AssertUnwindSafe(|| step(self))) {
+            Ok(Ok(caught_up)) => {
+                self.backoff = None;
+                return if caught_up { Next::Wait } else { Next::Continue }
+            }
+            Ok(Err(error @ FilterMapsError::Provider(ProviderError::ReceiptNotFound(_)))) => {
+                warn!(target: "filter_maps", %error, retry_in = ?delay, "Receipts are missing, retrying later");
+            }
+            Ok(Err(error)) => {
+                error!(target: "filter_maps", %error, retry_in = ?delay, "FilterMaps indexing failed, retrying later");
+                self.state = None;
+            }
+            Err(payload) => {
+                error!(target: "filter_maps", panic = %panic_message(&*payload), retry_in = ?delay, "FilterMaps indexer panicked");
+                self.state = None;
+            }
+        }
+        self.metrics.failures.increment(1);
+        self.backoff = Some(delay);
+        Next::Retry(delay)
     }
 }
 
@@ -65,10 +109,12 @@ where
     /// Indexes up to min(finalized, persisted) whenever either moves.
     ///
     /// It renders 1,000 blocks at a time and yields in between, so a shutdown does not wait for a
-    /// long catch-up. A step that misses receipts waits for the next update before it retries. On
-    /// an error, a second miss of the same block included, it logs and returns. The stored range
-    /// stays correct, so queries keep using it.
+    /// long catch-up. A step that fails or panics is retried after a backoff that starts at one
+    /// second and doubles up to a minute, so the indexer never stops for good. The stored range
+    /// stays correct meanwhile, so queries keep using it. It returns only when a chain
+    /// notification channel closes.
     pub async fn run(mut self) {
+        self.metrics.running.set(1);
         let mut finalized_blocks = self.provider.subscribe_finalized_block();
         let mut persisted_blocks = self.provider.subscribe_persisted_block();
         loop {
@@ -77,23 +123,28 @@ where
                 finalized_blocks.borrow_and_update().as_ref().map(|header| header.number());
             let persisted = persisted_blocks.borrow_and_update().map(|block| block.number);
             if let (Some(finalized), Some(persisted)) = (finalized, persisted) {
-                match self.index_step(finalized.min(persisted), finalized) {
-                    Ok(true) => {}
-                    Ok(false) => {
+                match self.step_or_retry(|indexer| {
+                    indexer.index_step(finalized.min(persisted), finalized)
+                }) {
+                    Next::Wait => {}
+                    Next::Continue => {
                         tokio::task::yield_now().await;
                         continue
                     }
-                    Err(error) => {
-                        error!(target: "filter_maps", %error, "FilterMaps indexer stopped");
-                        return
+                    // Not raced against the channels: the persisted block moves every few
+                    // seconds and would cut every longer backoff short.
+                    Next::Retry(delay) => {
+                        tokio::time::sleep(delay).await;
+                        continue
                     }
                 }
             }
             tokio::select! {
-                changed = finalized_blocks.changed() => if changed.is_err() { return },
-                changed = persisted_blocks.changed() => if changed.is_err() { return },
+                changed = finalized_blocks.changed() => if changed.is_err() { break },
+                changed = persisted_blocks.changed() => if changed.is_err() { break },
             }
         }
+        self.metrics.running.set(0);
     }
 }
 
@@ -109,30 +160,15 @@ where
         self.sync(target, floor, finalized, u64::MAX).map(drop)
     }
 
-    /// Indexes up to [`STEP`] blocks towards `target` and returns whether the index caught up.
+    /// Reads the receipt floor, then indexes up to [`STEP`] blocks towards `target` and returns
+    /// whether the index caught up.
     ///
-    /// Missing receipts are retried once, at the next call: the pruner deletes receipts before it
-    /// commits the checkpoint that raises the receipt floor, so the floor read for this step can
-    /// be stale. If the next call still misses the same block, it fails.
+    /// The pruner deletes receipts before it commits the checkpoint that raises the receipt floor,
+    /// so this step can miss receipts above a stale floor. Each retry reads the floor again, and
+    /// once it passes the missing block the store starts a new origin there.
     fn index_step(&mut self, target: u64, finalized: u64) -> Result<bool, FilterMapsError> {
         let floor = receipt_floor(&self.provider)?;
-        let result = self.sync(target, floor, finalized, STEP);
-        let next_block = self.state.as_ref().map(|state| state.next_block);
-        match result {
-            Err(FilterMapsError::Provider(ProviderError::ReceiptNotFound(_)))
-                if next_block.is_some() && self.missing_receipt_block != next_block =>
-            {
-                warn!(target: "filter_maps", ?next_block, "Receipts are missing, retrying later");
-                self.missing_receipt_block = next_block;
-                Ok(true)
-            }
-            result => {
-                if result.is_ok() {
-                    self.missing_receipt_block = None;
-                }
-                result
-            }
-        }
+        self.sync(target, floor, finalized, STEP)
     }
 }
 
@@ -339,6 +375,17 @@ impl RenderState {
     }
 }
 
+/// What [`Indexer::run`] does after a step.
+#[derive(Debug, PartialEq, Eq)]
+enum Next {
+    /// The index caught up: wait for the chain to move.
+    Wait,
+    /// More blocks are ready: step again after a yield.
+    Continue,
+    /// The step failed: step again after the delay.
+    Retry(Duration),
+}
+
 #[derive(Metrics)]
 #[metrics(scope = "filter_maps")]
 struct IndexerMetrics {
@@ -348,6 +395,10 @@ struct IndexerMetrics {
     last_indexed_block: Gauge,
     /// The number of maps written to the store.
     maps_written: Counter,
+    /// The number of failed or panicked indexing steps. Each one is retried after a backoff.
+    failures: Counter,
+    /// 1 while the indexer task runs.
+    running: Gauge,
 }
 
 impl IndexerMetrics {
@@ -372,6 +423,21 @@ fn write_group(
     metrics.record(&written);
     *range = written;
     Ok(())
+}
+
+/// Returns the delay before the next retry: [`MIN_BACKOFF`] after a success, then doubling up to
+/// [`MAX_BACKOFF`].
+fn next_backoff(previous: Option<Duration>) -> Duration {
+    previous.map_or(MIN_BACKOFF, |previous| previous.saturating_mul(2).min(MAX_BACKOFF))
+}
+
+/// Returns the message of a panic payload, read as `reth-tasks` reads it for a panicked task.
+fn panic_message(payload: &(dyn Any + Send)) -> &str {
+    payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("unknown panic")
 }
 
 #[cfg(test)]

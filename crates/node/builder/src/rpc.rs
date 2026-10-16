@@ -1167,7 +1167,8 @@ where
         });
 
         // FilterMaps indexes finalized blocks in the background. The RPC serves eth_getLogs from
-        // it once the registry below exists. A failed indexer stops alone: the node keeps running.
+        // it once the registry below exists. The indexer retries its failures and panics itself,
+        // so it never stops the node.
         let filter_maps = if config.filter_maps.enabled {
             // The CLI rejects a receipts log filter next to --filter-maps, but reth.toml can set
             // one.
