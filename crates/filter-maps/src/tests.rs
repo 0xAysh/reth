@@ -1,7 +1,7 @@
-//! The index never misses a block with a matching log.
+//! The index never misses a block with a matching log, and the receipt floor.
 //!
-//! Each case renders a random chain from an index origin just before a map, group, or epoch
-//! boundary, with mainnet parameters, and matches random filters over the finished maps.
+//! Each property case renders a random chain from an index origin just before a map, group, or
+//! epoch boundary, with mainnet parameters, and matches random filters over the finished maps.
 
 use super::*;
 use crate::{
@@ -11,6 +11,9 @@ use crate::{
 };
 use alloy_primitives::{Address, Bytes, Log, B256};
 use proptest::prelude::*;
+use reth_provider::test_utils::create_test_provider_factory;
+use reth_prune_types::{PruneCheckpoint, PruneMode};
+use reth_storage_api::{DatabaseProviderFactory, PruneCheckpointWriter};
 
 /// Four addresses for a whole map of logs, so their rows overflow to higher mapping layers.
 const ADDRESSES: u8 = 4;
@@ -79,6 +82,46 @@ proptest! {
             prop_assert_eq!(filtered.collect::<Vec<_>>(), exact);
             prop_assert!(candidates.iter().all(|block| indexed.contains(block)));
         }
+    }
+}
+
+#[test]
+fn the_receipt_floor_is_above_both_receipt_checkpoints() {
+    // `--prune.receipts.pre-merge`.
+    let receipts = PruneCheckpoint {
+        block_number: Some(15_537_393),
+        tx_number: None,
+        prune_mode: PruneMode::Before(15_537_394),
+    };
+    // What a receipts log filter writes at head 26,148,736.
+    let contract_logs = PruneCheckpoint {
+        block_number: Some(26_138_672),
+        tx_number: None,
+        prune_mode: PruneMode::Distance(10_064),
+    };
+    for (checkpoints, floor) in [
+        (
+            vec![(PruneSegment::Receipts, receipts), (PruneSegment::ContractLogs, contract_logs)],
+            26_138_673,
+        ),
+        (vec![(PruneSegment::Receipts, receipts)], 15_537_394),
+        (
+            vec![
+                (PruneSegment::Receipts, receipts),
+                (
+                    PruneSegment::ContractLogs,
+                    PruneCheckpoint { block_number: None, ..contract_logs },
+                ),
+            ],
+            15_537_394,
+        ),
+        (vec![], 0),
+    ] {
+        let provider = create_test_provider_factory().database_provider_rw().unwrap();
+        for (segment, checkpoint) in checkpoints {
+            provider.save_prune_checkpoint(segment, checkpoint).unwrap();
+        }
+        assert_eq!(receipt_floor(&provider).unwrap(), floor);
     }
 }
 

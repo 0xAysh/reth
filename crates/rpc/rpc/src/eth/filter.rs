@@ -15,7 +15,7 @@ use futures::{
 };
 use itertools::Itertools;
 use jsonrpsee::{core::RpcResult, server::IdProvider};
-use reth_errors::ProviderError;
+use reth_errors::{ProviderError, ProviderResult};
 use reth_filter_maps::{receipt_floor, FilterMapsReader, MatchPattern, TopicSelection};
 use reth_primitives_traits::{NodePrimitives, SealedHeader};
 use reth_rpc_eth_api::{
@@ -752,7 +752,7 @@ where
         });
         let indexed = match &index {
             Some((snapshot, _)) => {
-                indexed_window(snapshot.indexed_blocks(), receipt_floor(self.provider())?)
+                indexed_window(snapshot.indexed_blocks(), receipt_floor(self.provider()))
             }
             None => None,
         };
@@ -1053,11 +1053,20 @@ fn match_pattern(filter: &Filter) -> MatchPattern {
 }
 
 /// Returns the indexed blocks whose receipts the node still holds.
+///
+/// A floor that cannot be read leaves every block on the header bloom, which is complete.
 fn indexed_window(
     indexed: Option<RangeInclusive<u64>>,
-    receipt_floor: u64,
+    receipt_floor: ProviderResult<u64>,
 ) -> Option<RangeInclusive<u64>> {
     let (first, last) = indexed?.into_inner();
+    let receipt_floor = match receipt_floor {
+        Ok(receipt_floor) => receipt_floor,
+        Err(error) => {
+            warn!(target: "rpc::eth::filter", %error, "Failed to read the receipt floor, using the header bloom");
+            return None
+        }
+    };
     let first = first.max(receipt_floor);
     (first <= last).then_some(first..=last)
 }
@@ -1609,11 +1618,17 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_floor_read_leaves_every_block_on_the_header_bloom() {
+        assert_eq!(indexed_window(Some(10..=20), Err(ProviderError::UnsupportedProvider)), None);
+        assert_eq!(indexed_window(Some(10..=20), Ok(15)), Some(15..=20));
+    }
+
+    #[test]
     fn the_indexed_window_starts_at_the_receipt_floor() {
-        assert_eq!(indexed_window(Some(100..=500), 0), Some(100..=500));
-        assert_eq!(indexed_window(Some(100..=500), 300), Some(300..=500));
-        assert_eq!(indexed_window(Some(100..=500), 501), None);
-        assert_eq!(indexed_window(None, 0), None);
+        assert_eq!(indexed_window(Some(100..=500), Ok(0)), Some(100..=500));
+        assert_eq!(indexed_window(Some(100..=500), Ok(300)), Some(300..=500));
+        assert_eq!(indexed_window(Some(100..=500), Ok(501)), None);
+        assert_eq!(indexed_window(None, Ok(0)), None);
     }
 
     // Helper function to create a test EthApi instance

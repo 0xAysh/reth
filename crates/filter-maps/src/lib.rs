@@ -173,12 +173,23 @@ pub enum FilterMapsError {
     },
 }
 
-/// Returns the receipt floor: the lowest block whose receipts the node still holds. It is genesis
-/// on an archive node.
+/// Returns the receipt floor: the lowest block above both the `Receipts` and the `ContractLogs`
+/// prune checkpoints, from which the node holds every receipt. It is genesis on an archive node.
+///
+/// The two checkpoints are equal on a node that prunes receipts by distance; `ContractLogs` is
+/// higher only after pruning with a receipts log filter. `eth_capabilities` applies the same rule
+/// (`effective_resource` in `reth-rpc-eth-api`, which this crate must not depend on).
 ///
 /// The indexer starts a fresh store here, and `eth_getLogs` answers from the index only from here
 /// on, since the receipts of a candidate block are what it serves.
 pub fn receipt_floor(provider: &impl PruneCheckpointReader) -> ProviderResult<u64> {
-    let checkpoint = provider.get_prune_checkpoint(PruneSegment::Receipts)?;
-    Ok(checkpoint.and_then(|checkpoint| checkpoint.block_number).map_or(0, |block| block + 1))
+    let mut floor = 0;
+    for segment in [PruneSegment::Receipts, PruneSegment::ContractLogs] {
+        if let Some(block) =
+            provider.get_prune_checkpoint(segment)?.and_then(|checkpoint| checkpoint.block_number)
+        {
+            floor = floor.max(block.saturating_add(1));
+        }
+    }
+    Ok(floor)
 }
