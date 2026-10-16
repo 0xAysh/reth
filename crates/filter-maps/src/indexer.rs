@@ -14,16 +14,17 @@ use crate::{
 use alloy_consensus::{BlockHeader, TxReceipt};
 use reth_chain_state::{ForkChoiceSubscriptions, PersistedBlockSubscriptions};
 use reth_metrics::{
-    metrics::{Counter, Gauge},
+    metrics::{Counter, Gauge, Histogram},
     Metrics,
 };
 use reth_storage_api::{BlockHashReader, PruneCheckpointReader, ReceiptProvider};
 use reth_storage_errors::provider::ProviderError;
 use std::{
     any::Any,
+    ops::RangeInclusive,
     panic::{catch_unwind, AssertUnwindSafe},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tracing::{debug, error, warn};
 
@@ -167,8 +168,14 @@ where
     /// so this step can miss receipts above a stale floor. Each retry reads the floor again, and
     /// once it passes the missing block the store starts a new origin there.
     fn index_step(&mut self, target: u64, finalized: u64) -> Result<bool, FilterMapsError> {
-        let floor = receipt_floor(&self.provider)?;
-        self.sync(target, floor, finalized, STEP)
+        let started = Instant::now();
+        self.metrics.store_target.set(target as f64);
+        let result = match receipt_floor(&self.provider) {
+            Ok(floor) => self.sync(target, floor, finalized, STEP),
+            Err(error) => Err(error.into()),
+        };
+        self.metrics.step_duration_seconds.record(started.elapsed());
+        result
     }
 }
 
@@ -201,6 +208,8 @@ where
         }
         if self.state.is_none() {
             self.state = self.start(target, floor)?;
+            // A restart may have nothing to write for a while, so report the checked range now.
+            self.metrics.record(self.state.as_ref().map(|state| &state.range));
         }
         let Some(state) = self.state.as_ref() else { return Ok(true) };
         let last = target.min(state.next_block.saturating_add(max_blocks - 1));
@@ -295,6 +304,7 @@ where
                     .ok_or_else(|| ProviderError::ReceiptNotFound(number.into()))?;
                 state.renderer.push_block(number, hash, receipts.iter().flat_map(TxReceipt::logs));
                 state.next_block = number + 1;
+                self.metrics.blocks_rendered.increment(1);
                 while let Some(group) = state.renderer.take_full_group() {
                     write_group(&self.store, &self.metrics, &mut state.range, &group)?;
                     state.written_maps = 0;
@@ -330,7 +340,7 @@ where
                 break
             }
             state.range = self.store.drop_epoch(&state.range, epoch)?;
-            self.metrics.record(&state.range);
+            self.metrics.record(Some(&state.range));
         }
         Ok(())
     }
@@ -389,12 +399,21 @@ enum Next {
 #[derive(Metrics)]
 #[metrics(scope = "filter_maps")]
 struct IndexerMetrics {
-    /// The first block whose log values are all in stored maps.
+    /// The first block whose log values are all in stored maps, 0 while the index covers no block.
     first_indexed_block: Gauge,
-    /// The index head: the last block whose log values are all in stored maps.
+    /// The index head: the last block whose log values are all in stored maps, 0 while the index
+    /// covers no block.
     last_indexed_block: Gauge,
     /// The number of maps written to the store.
     maps_written: Counter,
+    /// The block the indexer indexes towards: min(finalized, persisted).
+    store_target: Gauge,
+    /// The number of blocks rendered into maps.
+    blocks_rendered: Counter,
+    /// The duration of one indexing step, in seconds.
+    step_duration_seconds: Histogram,
+    /// The duration of one map group write, in seconds.
+    write_duration_seconds: Histogram,
     /// The number of failed or panicked indexing steps. Each one is retried after a backoff.
     failures: Counter,
     /// 1 while the indexer task runs.
@@ -402,11 +421,13 @@ struct IndexerMetrics {
 }
 
 impl IndexerMetrics {
-    fn record(&self, range: &RangeRecord) {
-        if let Some(blocks) = range.indexed_blocks() {
-            self.first_indexed_block.set(*blocks.start() as f64);
-            self.last_indexed_block.set(*blocks.end() as f64);
-        }
+    /// Sets the indexed-block gauges to the blocks of `range`, or both to 0 when it covers no
+    /// block: the store is empty, was wiped, or holds no finished map yet.
+    fn record(&self, range: Option<&RangeRecord>) {
+        let (first, last) =
+            range.and_then(RangeRecord::indexed_blocks).map_or((0, 0), RangeInclusive::into_inner);
+        self.first_indexed_block.set(first as f64);
+        self.last_indexed_block.set(last as f64);
     }
 }
 
@@ -417,10 +438,12 @@ fn write_group(
     range: &mut RangeRecord,
     group: &[FinishedMap],
 ) -> Result<(), FilterMapsError> {
+    let started = Instant::now();
     let written = store.write_group(range, group)?;
+    metrics.write_duration_seconds.record(started.elapsed());
     let new_maps = written.after_last_map.saturating_sub(range.after_last_map);
     metrics.maps_written.increment(u64::from(new_maps));
-    metrics.record(&written);
+    metrics.record(Some(&written));
     *range = written;
     Ok(())
 }

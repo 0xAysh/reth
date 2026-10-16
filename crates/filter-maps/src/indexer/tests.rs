@@ -6,11 +6,17 @@ use crate::{
     FilterMaps, MatchPattern, DEFAULT_PARAMS,
 };
 use alloy_consensus::Header;
+use alloy_eips::BlockNumHash;
 use alloy_primitives::{Address, Log, B256};
+use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 use reth_ethereum_primitives::Receipt;
-use reth_provider::test_utils::MockEthProvider;
+use reth_primitives_traits::SealedHeader;
+use reth_provider::{
+    providers::BlockchainProvider,
+    test_utils::{create_test_provider_factory, MockEthProvider, NoopProvider},
+};
 use reth_storage_errors::provider::ProviderError;
-use std::{ops::RangeInclusive, path::Path, time::Duration};
+use std::{collections::HashMap, ops::RangeInclusive, path::Path, time::Duration};
 
 /// Logs per synthetic block. Each takes five slots, so a map takes about 13 blocks.
 const LOGS: usize = 1000;
@@ -42,6 +48,28 @@ fn range(maps: &FilterMaps) -> RangeRecord {
 /// Starts the store at a test origin instead of the receipt floor.
 fn start_at(maps: &FilterMaps, number: u64, pointer: u64) {
     maps.store.init(BlockRef { number, hash: block_hash(number), pointer }).unwrap();
+}
+
+/// Runs `f` with a local metrics recorder and returns the value of every metric it recorded.
+///
+/// Build the first indexer of the test inside `f`: `IndexerMetrics::default` registers its
+/// handles with the current recorder once per process and clones them afterwards. Nextest runs
+/// every test in its own process.
+fn recorded(f: impl FnOnce(&Snapshotter)) -> HashMap<String, DebugValue> {
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, || f(&snapshotter));
+    metric_values(&snapshotter)
+}
+
+/// Takes a snapshot, which resets every value, and returns the values by metric name.
+fn metric_values(snapshotter: &Snapshotter) -> HashMap<String, DebugValue> {
+    let snapshot = snapshotter.snapshot().into_vec();
+    snapshot.into_iter().map(|(key, _, _, value)| (key.key().name().to_string(), value)).collect()
+}
+
+fn gauge(value: u64) -> DebugValue {
+    DebugValue::Gauge((value as f64).into())
 }
 
 /// Asserts that two stores hold the same index: range, every row of every stored map, the last
@@ -244,30 +272,34 @@ fn a_failed_step_is_retried_with_a_growing_backoff() {
     provider.receipts.lock().remove(&70);
     let dir = tempfile::tempdir().unwrap();
     let maps = open(dir.path(), 0);
-    let mut indexer = maps.indexer(&provider);
+    let metrics = recorded(|_| {
+        let mut indexer = maps.indexer(&provider);
+        for delay in [1, 2, 4] {
+            assert_eq!(
+                indexer.step_or_retry(|indexer| indexer.index_step(90, 90)),
+                Next::Retry(Duration::from_secs(delay))
+            );
+            assert_eq!(indexer.state.as_ref().map(|state| state.next_block), Some(70));
+        }
 
-    for delay in [1, 2, 4] {
+        set_block(&provider, 70, block_hash(70), synthetic_logs(70, LOGS));
+        assert_eq!(indexer.step_or_retry(|indexer| indexer.index_step(90, 90)), Next::Wait);
+
+        // The success reset the backoff.
+        set_block(&provider, 91, block_hash(91), Vec::new());
+        provider.receipts.lock().remove(&91);
         assert_eq!(
-            indexer.step_or_retry(|indexer| indexer.index_step(90, 90)),
-            Next::Retry(Duration::from_secs(delay))
+            indexer.step_or_retry(|indexer| indexer.index_step(91, 91)),
+            Next::Retry(Duration::from_secs(1))
         );
-        assert_eq!(indexer.state.as_ref().map(|state| state.next_block), Some(70));
-    }
+    });
+    assert_eq!(metrics["filter_maps.failures"], DebugValue::Counter(4));
 
-    set_block(&provider, 70, block_hash(70), synthetic_logs(70, LOGS));
-    assert_eq!(indexer.step_or_retry(|indexer| indexer.index_step(90, 90)), Next::Wait);
+    provider.receipts.lock().remove(&91);
     let fresh_dir = tempfile::tempdir().unwrap();
     let fresh = open(fresh_dir.path(), 0);
     fresh.indexer(&provider).index_to(90, 90).unwrap();
     assert_same_index(&maps, &fresh);
-
-    // The success reset the backoff.
-    set_block(&provider, 91, block_hash(91), Vec::new());
-    provider.receipts.lock().remove(&91);
-    assert_eq!(
-        indexer.step_or_retry(|indexer| indexer.index_step(91, 91)),
-        Next::Retry(Duration::from_secs(1))
-    );
 }
 
 #[test]
@@ -275,14 +307,17 @@ fn a_panicked_step_is_retried_from_the_store() {
     let provider = chain(0..=60);
     let dir = tempfile::tempdir().unwrap();
     let maps = open(dir.path(), 0);
-    let mut indexer = maps.indexer(&provider);
-    assert_eq!(indexer.step_or_retry(|indexer| indexer.index_step(60, 60)), Next::Wait);
-    let indexed = range(&maps);
+    let metrics = recorded(|_| {
+        let mut indexer = maps.indexer(&provider);
+        assert_eq!(indexer.step_or_retry(|indexer| indexer.index_step(60, 60)), Next::Wait);
+        let indexed = range(&maps);
 
-    assert_eq!(indexer.step_or_retry(|_| panic!("boom")), Next::Retry(Duration::from_secs(1)));
-    assert!(indexer.state.is_none());
-    assert_eq!(indexer.step_or_retry(|indexer| indexer.index_step(60, 60)), Next::Wait);
-    assert_eq!(range(&maps), indexed);
+        assert_eq!(indexer.step_or_retry(|_| panic!("boom")), Next::Retry(Duration::from_secs(1)));
+        assert!(indexer.state.is_none());
+        assert_eq!(indexer.step_or_retry(|indexer| indexer.index_step(60, 60)), Next::Wait);
+        assert_eq!(range(&maps), indexed);
+    });
+    assert_eq!(metrics["filter_maps.failures"], DebugValue::Counter(1));
 }
 
 #[test]
@@ -307,4 +342,105 @@ fn a_failure_other_than_missing_receipts_resumes_from_the_store() {
     let fresh = open(fresh_dir.path(), 0);
     fresh.indexer(&provider).index_to(90, 90).unwrap();
     assert_same_index(&maps, &fresh);
+}
+
+#[test]
+fn the_running_gauge_is_set_while_the_indexer_runs() {
+    let provider =
+        BlockchainProvider::with_latest(create_test_provider_factory(), SealedHeader::default())
+            .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let maps = open(dir.path(), 0);
+    let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    let metrics = recorded(|_| {
+        runtime.block_on(async {
+            // The indexer waits for the first finalized block, so the yield ends the select.
+            tokio::select! {
+                biased;
+                () = maps.indexer(provider).run() => panic!("the indexer stopped"),
+                () = tokio::task::yield_now() => {}
+            }
+        })
+    });
+    assert_eq!(metrics["filter_maps.running"], gauge(1));
+}
+
+/// The stored range ends with map group 0, so a restart resumes at group 32 and has nothing to
+/// write before the chain moves.
+#[test]
+fn a_restarted_indexer_reports_its_range_before_it_writes() {
+    let provider = chain(0..=60);
+    let (scratch_dir, dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (scratch, maps) = (open(scratch_dir.path(), 0), open(dir.path(), 0));
+    let metrics = recorded(|snapshotter| {
+        start_at(&scratch, 0, 30 << 16);
+        scratch.indexer(&provider).sync_to(60, 0, 60).unwrap();
+        let target = scratch.store.snapshot().last_block_of_map(31).unwrap().number;
+
+        start_at(&maps, 0, 30 << 16);
+        maps.indexer(&provider).index_to(target, target).unwrap();
+        assert_eq!(range(&maps).after_last_map, 32);
+        metric_values(snapshotter);
+        maps.indexer(&provider).index_to(target, target).unwrap();
+    });
+    let indexed = maps.reader().snapshot().indexed_blocks().unwrap();
+    assert_eq!(metrics["filter_maps.first_indexed_block"], gauge(*indexed.start()));
+    assert_eq!(metrics["filter_maps.last_indexed_block"], gauge(*indexed.end()));
+    assert_eq!(metrics["filter_maps.maps_written"], DebugValue::Counter(0));
+}
+
+/// A finality stall let the receipt floor pass the target, so the store is wiped.
+#[test]
+fn a_wiped_store_reports_no_indexed_block() {
+    let provider = chain(0..=150);
+    let dir = tempfile::tempdir().unwrap();
+    let maps = open(dir.path(), 0);
+    let metrics = recorded(|_| {
+        let mut indexer = maps.indexer(&provider);
+        indexer.sync_to(120, 10, 120).unwrap();
+        assert_eq!(range(&maps).origin.number, 10);
+
+        indexer.sync_to(140, 150, 140).unwrap();
+    });
+    assert_eq!(maps.store.snapshot().range().unwrap(), None);
+    assert_eq!(metrics["filter_maps.first_indexed_block"], gauge(0));
+    assert_eq!(metrics["filter_maps.last_indexed_block"], gauge(0));
+}
+
+#[test]
+fn the_running_gauge_is_cleared_when_the_indexer_stops() {
+    let dir = tempfile::tempdir().unwrap();
+    let maps = open(dir.path(), 0);
+    let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    // The chain notification channels of the noop provider are closed.
+    let metrics = recorded(|_| runtime.block_on(maps.indexer(NoopProvider::default()).run()));
+    assert_eq!(metrics["filter_maps.running"], gauge(0));
+}
+
+#[test]
+fn a_failing_indexer_backs_off_between_steps() {
+    let provider =
+        BlockchainProvider::with_latest(create_test_provider_factory(), SealedHeader::default())
+            .unwrap();
+    // The database has no block, so every step fails on the hash of block 0.
+    let chain_state = provider.canonical_in_memory_state();
+    chain_state.set_finalized(SealedHeader::default());
+    chain_state.set_persisted(BlockNumHash::default());
+    let dir = tempfile::tempdir().unwrap();
+    let maps = open(dir.path(), 0);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    let metrics = recorded(|_| {
+        runtime.block_on(async {
+            tokio::select! {
+                () = maps.indexer(provider).run() => panic!("the indexer stopped"),
+                // Steps at 0, 1 and 3 seconds; the next one is due at 7.
+                () = tokio::time::sleep(Duration::from_secs(6)) => {}
+            }
+        })
+    });
+    assert_eq!(metrics["filter_maps.failures"], DebugValue::Counter(3));
 }
