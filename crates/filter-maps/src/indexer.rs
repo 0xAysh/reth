@@ -26,7 +26,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 /// The number of blocks that [`Indexer::run`] renders between two checks for shutdown, and whose
 /// hashes are read at once.
@@ -213,8 +213,13 @@ where
         max_blocks: u64,
     ) -> Result<bool, FilterMapsError> {
         // A gap reset: the next block's receipts are pruned, so the store cannot continue.
-        if self.state.as_ref().is_some_and(|state| state.next_block < floor) {
-            debug!(target: "filter_maps", floor, "Receipt floor passed the index, starting over");
+        if let Some(state) = &self.state &&
+            state.next_block < floor
+        {
+            // Warn only when stored maps are discarded, as at a start.
+            if state.range.after_last_map > state.range.first_map {
+                warn!(target: "filter_maps", floor, "Receipt floor passed the index, starting over");
+            }
             self.state = None;
             self.store.wipe()?;
         }
@@ -286,19 +291,27 @@ where
             self.trim(&snapshot, stored, target)?;
             if stored.after_last_map != maps {
                 if stored.after_last_map == stored.first_map {
+                    warn!(target: "filter_maps", target, "Every stored FilterMaps map ends above the target or in a non-canonical block, starting over");
                     range = None;
                 } else {
                     self.store.set_range(stored)?;
                 }
             }
         }
-        if let Some(range) = range &&
-            range.origin.number <= cutoff &&
-            range.after_last_block >= cutoff
-        {
-            let state = RenderState::resume(&snapshot, range)?;
-            if state.next_block >= floor {
-                return Ok(Some(state))
+        if let Some(range) = range {
+            // Warn only when stored maps are discarded: a floor above the target would otherwise
+            // log on every finalized update.
+            let has_maps = range.after_last_map > range.first_map;
+            if range.origin.number <= cutoff && range.after_last_block >= cutoff {
+                let state = RenderState::resume(&snapshot, range)?;
+                if state.next_block >= floor {
+                    return Ok(Some(state))
+                }
+                if has_maps {
+                    warn!(target: "filter_maps", floor, next_block = state.next_block, "Receipt floor passed the index, starting over");
+                }
+            } else if has_maps {
+                warn!(target: "filter_maps", origin = range.origin.number, cutoff, "FilterMaps store is outside the history window, starting over");
             }
         }
 

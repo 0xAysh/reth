@@ -1291,7 +1291,7 @@ FilterMaps:
       --filter-maps
           Index finalized blocks with `FilterMaps` and serve `eth_getLogs` from the index.
 
-          The index needs every log of a block, so it cannot run with `--minimal` or `--prune.receiptslogfilter`.
+          The index needs the receipts of every finalized block, so it cannot run with `--minimal` (it keeps receipts for 64 blocks), `--prune.receipts.full` or `--prune.receiptslogfilter`. At launch it also refuses a receipts distance below 10,064 blocks.
 
       --filter-maps.history <BLOCKS>
           Number of blocks up to the finalized block to keep indexed. 0 keeps every block with receipts

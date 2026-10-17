@@ -116,8 +116,9 @@ async fn filter_maps_pruned_node_starts_at_receipt_floor() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
     let (mut node, wallet) = filter_maps_setup()
+        // --filter-maps refuses a receipts distance below 10,064 blocks, so prune before a block.
         .with_pruning(PruningArgs {
-            receipts_distance: Some(32),
+            receipts_before: Some(16),
             minimum_distance: Some(32),
             block_interval: Some(1),
             ..Default::default()
@@ -133,9 +134,9 @@ async fn filter_maps_pruned_node_starts_at_receipt_floor() -> eyre::Result<()> {
     let mut chain = Chain::deploy(&mut node, wallet.account(0)).await?;
     chain.mine_light(&mut node, 45).await?;
     chain.mine_heavy(&mut node, 2).await?;
-    // The pruner keeps the last 32 blocks. With storage v2 it deletes whole static files of 8
-    // blocks, so the floor moves in steps of 8.
-    node.wait_for_prune_checkpoint(PruneSegment::Receipts, chain.head - 33).await?;
+    // The pruner prunes the blocks before 16 once the head is 32 blocks past them. With storage
+    // v2 it deletes whole static files of 8 blocks, so the floor moves in steps of 8.
+    node.wait_for_prune_checkpoint(PruneSegment::Receipts, 15).await?;
     let floor = node.receipt_floor()?;
     assert!(floor > 1, "receipts are pruned");
 
