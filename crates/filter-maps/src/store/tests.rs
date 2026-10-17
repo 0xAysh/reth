@@ -85,6 +85,38 @@ fn row_keys_follow_the_geth_formula() {
     assert_eq!(store.db.get(hex!("666d2d72000000000215cfff")).unwrap(), None, "no overflow");
 }
 
+/// The value bytes of every key space, as Geth's encoders write them at the pinned revision.
+#[test]
+fn stored_values_follow_the_geth_encoding() {
+    let corpus = manifest::load_and_validate_corpus().unwrap();
+    let (_, fixture) =
+        corpus.iter().find(|(_, fixture)| fixture.scenario == "epoch-boundary").unwrap();
+    let maps = take_finished_maps(&mut render_fixture(fixture));
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let range = store.init(fixture_start(fixture)).unwrap();
+    store.write_group(&range, &maps).unwrap();
+
+    // `WriteFilterMapBaseRows`: header bits, then 3-byte little-endian columns.
+    assert_eq!(
+        store.db.get(hex!("666d2d72000000000215cfe000")).unwrap().unwrap(),
+        hex!("00000080c1ffff")
+    );
+    // `WriteFilterMapLastBlock`: the big-endian block number, then the block hash.
+    assert_eq!(
+        store.db.get(hex!("666d2d62000003ff")).unwrap().unwrap(),
+        hex!(
+            "0000000000000046"
+            "51809dcd8b3c616ed1438f2cc91d099310d91f9d229083722823427012034408"
+        )
+    );
+    // `WriteBlockLvPointer`: the big-endian pointer.
+    assert_eq!(
+        store.db.get(hex!("666d2d700000000000000046")).unwrap().unwrap(),
+        hex!("0000000003ffffff")
+    );
+}
+
 /// A row with nine columns stores one in its extended row. Rewritten with eight, the base part is
 /// still full, so the stale extended row must be deleted.
 #[test]

@@ -1730,13 +1730,14 @@ mod tests {
     use reth_filter_maps::{FilterMaps, FilterMapsConfig};
     use reth_network_api::noop::NoopNetwork;
     use reth_provider::test_utils::MockEthProvider;
+    use reth_prune_types::{PruneCheckpoint, PruneSegment};
     use reth_rpc_convert::RpcConverter;
     use reth_rpc_eth_api::node::RpcNodeCoreAdapter;
     use reth_rpc_eth_types::receipt::EthReceiptConverter;
     use reth_tasks::Runtime;
     use reth_testing_utils::generators;
     use reth_transaction_pool::test_utils::{testing_pool, TestPool};
-    use std::{collections::VecDeque, sync::Arc};
+    use std::{collections::VecDeque, path::Path, sync::Arc};
 
     #[test]
     fn receipts_unavailable_error_matches_geth() {
@@ -2790,6 +2791,180 @@ mod tests {
         );
         assert_eq!(stats.bloom, PathStats::default());
         assert!(stats.match_duration.is_some());
+    }
+
+    /// Builds the chain of `logs_in_the_indexed_window_come_from_the_index` and indexes it into a
+    /// store at `path`: the index covers blocks 0 to 4, and block 2 gets matching logs after it
+    /// was indexed, so only the header bloom path reports it.
+    fn index_chain_with_a_late_receipt(address: Address, path: &Path) -> MockEthProvider {
+        let provider = MockEthProvider::default();
+        let mut parent_hash = B256::ZERO;
+        for number in 0..=4u64 {
+            let logs = if number % 2 == 1 { vec![log_of(address)] } else { Vec::new() };
+            let bloom_logs = if number == 2 { vec![log_of(address)] } else { logs.clone() };
+            parent_hash = add_block_with_logs(&provider, number, parent_hash, &bloom_logs, logs);
+        }
+        let filler = Log {
+            address: Address::repeat_byte(8),
+            data: LogData::new_unchecked(vec![B256::ZERO; 4], Bytes::new()),
+        };
+        add_block_with_logs(&provider, 5, parent_hash, &[], vec![filler; 13_200]);
+        let filter_maps = FilterMaps::open(path, FilterMapsConfig { history: 0 }).unwrap();
+        filter_maps.indexer(provider.clone()).index_to(5, 5).unwrap();
+        let late = Receipt { logs: vec![log_of(address)], success: true, ..Default::default() };
+        provider.add_receipts(2, vec![late]);
+        provider
+    }
+
+    /// The filter of [`build_test_eth_api`].
+    type TestEthFilter = EthFilter<
+        EthApi<
+            RpcNodeCoreAdapter<MockEthProvider, TestPool, NoopNetwork, EthEvmConfig>,
+            RpcConverter<Ethereum, EthEvmConfig, EthReceiptConverter<ChainSpec>>,
+        >,
+    >;
+
+    /// Runs an address query over blocks 0 to 4 and returns the blocks of its logs and its stats.
+    async fn query_blocks_0_to_4(
+        eth_filter: &TestEthFilter,
+        address: Address,
+    ) -> (Vec<u64>, LogQueryStats) {
+        let mut stats = LogQueryStats::default();
+        let logs = eth_filter
+            .inner
+            .clone()
+            .get_logs_in_block_range_inner(
+                &Filter::new().address(address),
+                0,
+                4,
+                QueryLimits::default(),
+                &mut stats,
+            )
+            .await
+            .unwrap();
+        (logs.iter().map(|log| log.block_number.unwrap()).collect(), stats)
+    }
+
+    #[tokio::test]
+    async fn a_failed_index_lookup_falls_back_to_the_header_bloom() {
+        let address = Address::repeat_byte(7);
+        let dir = tempfile::tempdir().unwrap();
+        let provider = index_chain_with_a_late_receipt(address, dir.path());
+        // The lookup reads the pointer of the block after the window first.
+        {
+            let db = rocksdb::DB::open_default(dir.path()).unwrap();
+            db.delete([&b"fm-p"[..], &5u64.to_be_bytes()].concat()).unwrap();
+        }
+        let filter_maps = FilterMaps::open(dir.path(), FilterMapsConfig { history: 0 }).unwrap();
+        let eth_filter = EthFilter::new(
+            build_test_eth_api(provider),
+            EthFilterConfig::default(),
+            Runtime::test(),
+        );
+        eth_filter.set_filter_maps(filter_maps.reader());
+        let indexed = eth_filter.filter_maps().unwrap().snapshot().unwrap().indexed_blocks();
+        assert_eq!(indexed, Some(0..=4));
+
+        let (blocks, stats) = query_blocks_0_to_4(&eth_filter, address).await;
+        assert_eq!(blocks, [1, 2, 3], "block 2 comes from the header bloom");
+        assert_eq!(stats.fallbacks, 1);
+        assert_eq!(
+            stats.bloom,
+            PathStats {
+                windows: 1,
+                headers_read: 5,
+                receipt_sets_read: 3,
+                matching_blocks: 3,
+                logs: 3
+            }
+        );
+        assert_eq!(stats.index, PathStats::default());
+    }
+
+    #[tokio::test]
+    async fn logs_below_the_receipt_floor_come_from_the_header_bloom() {
+        let address = Address::repeat_byte(7);
+        for segment in [PruneSegment::Receipts, PruneSegment::ContractLogs] {
+            let dir = tempfile::tempdir().unwrap();
+            let provider = index_chain_with_a_late_receipt(address, dir.path());
+            // The receipt floor is block 3.
+            provider.add_prune_checkpoint(segment, PruneCheckpoint::pruned_through(2));
+            let filter_maps =
+                FilterMaps::open(dir.path(), FilterMapsConfig { history: 0 }).unwrap();
+            let eth_filter = EthFilter::new(
+                build_test_eth_api(provider),
+                EthFilterConfig::default(),
+                Runtime::test(),
+            );
+            eth_filter.set_filter_maps(filter_maps.reader());
+
+            let (blocks, stats) = query_blocks_0_to_4(&eth_filter, address).await;
+            assert_eq!(blocks, [1, 2, 3], "{segment}");
+            assert_eq!(stats.bloom.headers_read, 3, "{segment}");
+            assert_eq!(stats.index.headers_read, 1, "{segment}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_floor_read_serves_the_query_from_the_header_bloom() {
+        let address = Address::repeat_byte(7);
+        let dir = tempfile::tempdir().unwrap();
+        let provider = index_chain_with_a_late_receipt(address, dir.path());
+        provider.set_prune_checkpoint_reads_fail(true);
+        let filter_maps = FilterMaps::open(dir.path(), FilterMapsConfig { history: 0 }).unwrap();
+        let eth_filter = EthFilter::new(
+            build_test_eth_api(provider),
+            EthFilterConfig::default(),
+            Runtime::test(),
+        );
+        eth_filter.set_filter_maps(filter_maps.reader());
+
+        let (blocks, stats) = query_blocks_0_to_4(&eth_filter, address).await;
+        assert_eq!(blocks, [1, 2, 3], "block 2 comes from the header bloom");
+        assert_eq!(stats.fallbacks, 1);
+        assert_eq!(stats.bloom.headers_read, 5);
+        assert_eq!(stats.index, PathStats::default());
+    }
+
+    #[tokio::test]
+    async fn filter_changes_come_from_the_index_in_the_indexed_window() {
+        let provider = MockEthProvider::default();
+        let address = Address::repeat_byte(7);
+        let mut parent_hash = add_block_with_logs(&provider, 0, B256::ZERO, &[], Vec::new());
+        let eth_filter = EthFilter::new(
+            build_test_eth_api(provider.clone()),
+            EthFilterConfig::default(),
+            Runtime::test(),
+        );
+        let id = eth_filter
+            .inner
+            .install_filter(FilterKind::Log(Box::new(Filter::new().address(address))))
+            .await
+            .unwrap();
+
+        for number in 1..=4u64 {
+            let logs = if number % 2 == 1 { vec![log_of(address)] } else { Vec::new() };
+            let bloom_logs = if number == 2 { vec![log_of(address)] } else { logs.clone() };
+            parent_hash = add_block_with_logs(&provider, number, parent_hash, &bloom_logs, logs);
+        }
+        let filler = Log {
+            address: Address::repeat_byte(8),
+            data: LogData::new_unchecked(vec![B256::ZERO; 4], Bytes::new()),
+        };
+        add_block_with_logs(&provider, 5, parent_hash, &[], vec![filler; 13_200]);
+        let dir = tempfile::tempdir().unwrap();
+        let filter_maps = FilterMaps::open(dir.path(), FilterMapsConfig { history: 0 }).unwrap();
+        filter_maps.indexer(provider.clone()).index_to(5, 5).unwrap();
+        let late = Receipt { logs: vec![log_of(address)], success: true, ..Default::default() };
+        provider.add_receipts(2, vec![late]);
+        eth_filter.set_filter_maps(filter_maps.reader());
+
+        let FilterChanges::Logs(logs) = eth_filter.filter_changes(id.clone()).await.unwrap() else {
+            panic!("a log filter returns logs")
+        };
+        let blocks = logs.iter().map(|log| log.block_number.unwrap()).collect::<Vec<_>>();
+        assert_eq!(blocks, [1, 3], "block 2 is no candidate of the index");
+        assert!(matches!(eth_filter.filter_changes(id).await.unwrap(), FilterChanges::Empty));
     }
 
     #[tokio::test]

@@ -76,6 +76,10 @@ pub struct MockEthProvider<T: NodePrimitives = EthPrimitives, ChainSpec = reth_c
     pub block_body_indices: Arc<Mutex<HashMap<BlockNumber, StoredBlockBodyIndices>>>,
     /// Local stage checkpoints
     stage_checkpoints: Arc<Mutex<HashMap<StageId, StageCheckpoint>>>,
+    /// Local prune checkpoints
+    prune_checkpoints: Arc<Mutex<HashMap<PruneSegment, PruneCheckpoint>>>,
+    /// Whether prune checkpoint reads fail.
+    prune_checkpoint_reads_fail: Arc<AtomicBool>,
     /// The engine's pending block, if any
     pending_block_num_hash: Arc<Mutex<Option<BlockNumHash>>>,
     /// Local BAL store handle
@@ -133,6 +137,8 @@ where
             state_roots: self.state_roots.clone(),
             block_body_indices: self.block_body_indices.clone(),
             stage_checkpoints: self.stage_checkpoints.clone(),
+            prune_checkpoints: self.prune_checkpoints.clone(),
+            prune_checkpoint_reads_fail: self.prune_checkpoint_reads_fail.clone(),
             pending_block_num_hash: self.pending_block_num_hash.clone(),
             bal_store: self.bal_store.clone(),
             database_provider_available: self.database_provider_available.clone(),
@@ -163,6 +169,8 @@ impl<T: NodePrimitives> MockEthProvider<T, reth_chainspec::ChainSpec> {
             state_roots: Default::default(),
             block_body_indices: Default::default(),
             stage_checkpoints: Default::default(),
+            prune_checkpoints: Default::default(),
+            prune_checkpoint_reads_fail: Default::default(),
             pending_block_num_hash: Default::default(),
             bal_store: Default::default(),
             database_provider_available: Default::default(),
@@ -319,6 +327,16 @@ impl<T: NodePrimitives, ChainSpec> MockEthProvider<T, ChainSpec> {
         self.stage_checkpoints.lock().insert(id, checkpoint);
     }
 
+    /// Adds a prune checkpoint to the local store.
+    pub fn add_prune_checkpoint(&self, segment: PruneSegment, checkpoint: PruneCheckpoint) {
+        self.prune_checkpoints.lock().insert(segment, checkpoint);
+    }
+
+    /// Makes `get_prune_checkpoint` return a provider error when `fail` is true.
+    pub fn set_prune_checkpoint_reads_fail(&self, fail: bool) {
+        self.prune_checkpoint_reads_fail.store(fail, Ordering::Relaxed);
+    }
+
     /// Sets the pending block the engine holds
     pub fn set_pending_block_num_hash(&self, num_hash: Option<BlockNumHash>) {
         *self.pending_block_num_hash.lock() = num_hash;
@@ -340,6 +358,8 @@ impl<T: NodePrimitives, ChainSpec> MockEthProvider<T, ChainSpec> {
             state_roots: self.state_roots,
             block_body_indices: self.block_body_indices,
             stage_checkpoints: self.stage_checkpoints,
+            prune_checkpoints: self.prune_checkpoints,
+            prune_checkpoint_reads_fail: self.prune_checkpoint_reads_fail,
             pending_block_num_hash: self.pending_block_num_hash,
             bal_store: self.bal_store,
             database_provider_available: self.database_provider_available,
@@ -1064,13 +1084,21 @@ impl<T: NodePrimitives, ChainSpec: Send + Sync> PruneCheckpointReader
 {
     fn get_prune_checkpoint(
         &self,
-        _segment: PruneSegment,
+        segment: PruneSegment,
     ) -> ProviderResult<Option<PruneCheckpoint>> {
-        Ok(None)
+        if self.prune_checkpoint_reads_fail.load(Ordering::Relaxed) {
+            return Err(ProviderError::UnsupportedProvider)
+        }
+        Ok(self.prune_checkpoints.lock().get(&segment).copied())
     }
 
     fn get_prune_checkpoints(&self) -> ProviderResult<Vec<(PruneSegment, PruneCheckpoint)>> {
-        Ok(vec![])
+        Ok(self
+            .prune_checkpoints
+            .lock()
+            .iter()
+            .map(|(segment, checkpoint)| (*segment, *checkpoint))
+            .collect())
     }
 }
 

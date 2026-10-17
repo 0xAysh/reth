@@ -233,6 +233,124 @@ fn a_tail_drop_of_an_inconsistent_store_wipes_it_once() {
     assert_same_index(&maps, &fresh);
 }
 
+/// Each step renders at most 1,000 blocks, and only the step that reaches the target writes the
+/// unfinished group.
+#[test]
+fn catching_up_renders_a_thousand_blocks_per_step() {
+    let provider = MockEthProvider::default();
+    // 30 logs take 151 slots per block, so 2,500 blocks fill about five maps.
+    for number in 0..=2_500 {
+        set_block(&provider, number, block_hash(number), synthetic_logs(number, 30));
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let maps = open(dir.path(), 0);
+    let mut indexer = maps.indexer(&provider);
+
+    for (caught_up, next_block) in [(false, 1_000), (false, 2_000), (true, 2_501)] {
+        assert_eq!(indexer.index_step(2_500, 2_500).unwrap(), caught_up);
+        assert_eq!(indexer.state.as_ref().unwrap().next_block, next_block);
+        if !caught_up {
+            assert_eq!(range(&maps).after_last_map, 0);
+            assert_eq!(maps.reader().snapshot().unwrap().indexed_blocks(), None);
+        }
+    }
+
+    let one_shot_dir = tempfile::tempdir().unwrap();
+    let one_shot = open(one_shot_dir.path(), 0);
+    one_shot.indexer(&provider).index_to(2_500, 2_500).unwrap();
+    assert_eq!(range(&one_shot).after_last_map, 5);
+    assert_same_index(&maps, &one_shot);
+}
+
+/// Starts at map 30, so the maps span groups 0 and 32 and a broken trim is not hidden by the
+/// group rewrite.
+#[test]
+fn a_target_below_the_stored_head_trims_the_maps_above_it() {
+    let provider = chain(0..=60);
+    let stored = |dir: &Path| {
+        let maps = open(dir, 0);
+        start_at(&maps, 0, 30 << 16);
+        maps.indexer(&provider).sync_to(60, 0, 60).unwrap();
+        assert!(range(&maps).after_last_map > 33);
+        maps
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let maps = stored(dir.path());
+    let target = maps.store.snapshot().last_block_of_map(30).unwrap().number;
+    maps.indexer(&provider).sync_to(target, 0, target).unwrap();
+    assert_eq!(range(&maps).after_last_map, 31);
+    let fresh_dir = tempfile::tempdir().unwrap();
+    let fresh = open(fresh_dir.path(), 0);
+    start_at(&fresh, 0, 30 << 16);
+    fresh.indexer(&provider).sync_to(target, 0, target).unwrap();
+    assert_same_index(&maps, &fresh);
+
+    // A target below the first map's last block trims every map.
+    let dir = tempfile::tempdir().unwrap();
+    let maps = stored(dir.path());
+    maps.indexer(&provider).sync_to(5, 0, 5).unwrap();
+    let trimmed = range(&maps);
+    assert_eq!(trimmed.origin, BlockRef { number: 0, hash: block_hash(0), pointer: 0 });
+    assert_eq!(trimmed.after_last_map, 0);
+    assert_eq!(maps.reader().snapshot().unwrap().indexed_blocks(), None);
+}
+
+#[test]
+fn a_reopened_store_resumes_only_above_the_receipt_floor() {
+    let reference = chain(0..=90);
+    let resume = {
+        let dir = tempfile::tempdir().unwrap();
+        let maps = open(dir.path(), 0);
+        start_at(&maps, 0, 30 << 16);
+        maps.indexer(&reference).sync_to(60, 0, 60).unwrap();
+        maps.store.snapshot().last_block_of_map(31).unwrap().number
+    };
+    let stored = |dir: &Path, provider: &MockEthProvider| {
+        let maps = open(dir, 0);
+        start_at(&maps, 0, 30 << 16);
+        maps.indexer(provider).sync_to(60, 0, 60).unwrap();
+        maps
+    };
+
+    // The resume block's receipts are kept.
+    let provider = chain(0..=90);
+    let dir = tempfile::tempdir().unwrap();
+    let maps = stored(dir.path(), &provider);
+    provider.receipts.lock().retain(|number, _| *number >= resume);
+    maps.indexer(&provider).sync_to(90, resume, 90).unwrap();
+    assert_eq!(range(&maps).origin, BlockRef { number: 0, hash: block_hash(0), pointer: 30 << 16 });
+    let uninterrupted_dir = tempfile::tempdir().unwrap();
+    let uninterrupted = open(uninterrupted_dir.path(), 0);
+    start_at(&uninterrupted, 0, 30 << 16);
+    uninterrupted.indexer(&reference).sync_to(90, 0, 90).unwrap();
+    assert_same_index(&maps, &uninterrupted);
+
+    // The resume block's receipts are pruned.
+    let floor = resume + 1;
+    let provider = chain(0..=90);
+    let dir = tempfile::tempdir().unwrap();
+    let maps = stored(dir.path(), &provider);
+    provider.receipts.lock().retain(|number, _| *number >= floor);
+    maps.indexer(&provider).sync_to(90, floor, 90).unwrap();
+    assert_eq!(
+        range(&maps).origin,
+        BlockRef { number: floor, hash: block_hash(floor), pointer: 0 }
+    );
+    let fresh_dir = tempfile::tempdir().unwrap();
+    let fresh = open(fresh_dir.path(), 0);
+    fresh.indexer(&reference).sync_to(90, floor, 90).unwrap();
+    assert_same_index(&maps, &fresh);
+
+    // The floor is above the target.
+    let provider = chain(0..=90);
+    let dir = tempfile::tempdir().unwrap();
+    let maps = stored(dir.path(), &provider);
+    provider.receipts.lock().retain(|number, _| *number >= 75);
+    maps.indexer(&provider).sync_to(60, 75, 60).unwrap();
+    assert_eq!(maps.store.snapshot().range().unwrap(), None);
+}
+
 /// A manual unwind replaced the last block of the last map. Startup trims the maps that end in it
 /// and renders them again from the new block.
 #[test]
