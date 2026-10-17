@@ -38,6 +38,7 @@ use reth_node_core::{
 use reth_payload_builder::{PayloadBuilderHandle, PayloadStore};
 use reth_primitives_traits::NodePrimitives;
 use reth_provider::{DBProvider, DatabaseProviderFactory};
+use reth_prune::{PruneMode, PruneModes, MINIMUM_UNWIND_SAFE_DISTANCE};
 use reth_rpc::{
     eth::{core::EthRpcConverterFor, DevSigner, EthApiTypes, FullEthApiServer},
     AdminApi,
@@ -1167,21 +1168,14 @@ where
         });
 
         // FilterMaps indexes finalized blocks in the background. The RPC serves eth_getLogs from
-        // it once the registry below exists. A failed indexer stops alone: the node keeps running.
+        // it once the registry below exists. The indexer retries its failures and panics itself,
+        // so it never stops the node.
         let filter_maps = if config.filter_maps.enabled {
-            // The CLI rejects a receipts log filter next to --filter-maps, but reth.toml can set
-            // one.
-            let prunes_receipts = !node
-                .provider()
-                .database_provider_ro()?
-                .prune_modes_ref()
-                .receipts_log_filter
-                .is_empty();
-            if prunes_receipts {
-                eyre::bail!(
-                    "--filter-maps needs every receipt, but the receipts log filter prunes some"
-                );
-            }
+            // The CLI rejects some of these modes next to --filter-maps, but reth.toml can set
+            // them.
+            check_filter_maps_prune_modes(
+                node.provider().database_provider_ro()?.prune_modes_ref(),
+            )?;
             let filter_maps = FilterMaps::open(
                 &config.datadir().filter_maps(),
                 FilterMapsConfig { history: config.filter_maps.history },
@@ -1779,18 +1773,48 @@ async fn prewarm_new_block_bals_task<EthApi: GetBlockAccessList, N: NodePrimitiv
     }
 }
 
+/// Refuses receipt prune modes that keep no useful `FilterMaps` index: the index needs the
+/// receipts of every finalized block.
+///
+/// The minimum distance, what `--full` keeps, is a policy line rather than a hard limit. Below a
+/// few hundred blocks every restart wipes the store, since a restart resumes up to a map group
+/// behind, and a finality stall longer than the distance wipes it at runtime. Below
+/// [`MINIMUM_UNWIND_SAFE_DISTANCE`] the header bloom serves the whole receipt window cheaply.
+fn check_filter_maps_prune_modes(modes: &PruneModes) -> eyre::Result<()> {
+    if !modes.receipts_log_filter.is_empty() {
+        eyre::bail!("--filter-maps needs every receipt, but the receipts log filter prunes some");
+    }
+    match modes.receipts {
+        // On receipts, a full prune keeps only the last 64 blocks.
+        Some(PruneMode::Full) => eyre::bail!(
+            "--filter-maps needs the receipts of finalized blocks, but receipts are fully pruned"
+        ),
+        Some(PruneMode::Distance(distance)) if distance < MINIMUM_UNWIND_SAFE_DISTANCE => {
+            eyre::bail!(
+                "--filter-maps needs a receipts distance of at least {MINIMUM_UNWIND_SAFE_DISTANCE} blocks, as --full keeps, but it is {distance}"
+            )
+        }
+        // `Before(n)` keeps every block from `n` on.
+        _ => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloy_consensus::{Block, BlockBody, Header};
-    use alloy_primitives::B256;
+    use alloy_primitives::{Address, B256};
+    use reth_chainspec::MAINNET;
     use reth_evm_ethereum::EthEvmConfig;
     use reth_network_api::noop::NoopNetwork;
+    use reth_node_core::args::PruningArgs;
     use reth_primitives_traits::RecoveredBlock;
     use reth_provider::{test_utils::MockEthProvider, Chain, ExecutionOutcome};
+    use reth_prune::ReceiptsLogPruneConfig;
     use reth_rpc::EthApiBuilder;
     use reth_rpc_eth_types::EthStateCacheConfig;
     use reth_transaction_pool::noop::NoopTransactionPool;
+    use std::collections::BTreeMap;
 
     #[tokio::test]
     async fn bal_prewarming_startup_range_and_native_stop() {
@@ -1867,6 +1891,50 @@ mod tests {
                     "count={count}, native={native}, native_event={native_event}, block={number}",
                 );
             }
+        }
+    }
+
+    #[test]
+    fn filter_maps_refuses_receipt_prune_modes_that_keep_no_index() {
+        let modes = |args: PruningArgs| {
+            args.prune_config(&*MAINNET).map(|config| config.segments).unwrap_or_default()
+        };
+        for args in [
+            PruningArgs { full: true, ..Default::default() },
+            PruningArgs { receipts_pre_merge: true, ..Default::default() },
+            PruningArgs::default(),
+        ] {
+            assert!(check_filter_maps_prune_modes(&modes(args.clone())).is_ok(), "{args:?}");
+        }
+
+        let distance_error = |distance| {
+            format!(
+                "--filter-maps needs a receipts distance of at least 10064 blocks, as --full keeps, but it is {distance}"
+            )
+        };
+        let log_filter = ReceiptsLogPruneConfig(BTreeMap::from([(
+            Address::with_last_byte(1),
+            PruneMode::Distance(10_064),
+        )]));
+        for (args, error) in [
+            (
+                PruningArgs { receipts_full: true, ..Default::default() },
+                "--filter-maps needs the receipts of finalized blocks, but receipts are fully pruned"
+                    .to_string(),
+            ),
+            (PruningArgs { minimal: true, ..Default::default() }, distance_error(64)),
+            (
+                PruningArgs { full: true, receipts_distance: Some(10_063), ..Default::default() },
+                distance_error(10_063),
+            ),
+            (
+                PruningArgs { receipts_log_filter: Some(log_filter), ..Default::default() },
+                "--filter-maps needs every receipt, but the receipts log filter prunes some"
+                    .to_string(),
+            ),
+        ] {
+            let err = check_filter_maps_prune_modes(&modes(args.clone())).unwrap_err();
+            assert_eq!(err.to_string(), error, "{args:?}");
         }
     }
 }

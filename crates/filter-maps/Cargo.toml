@@ -31,7 +31,7 @@ sha2.workspace = true
 rocksdb.workspace = true
 
 # async
-tokio = { workspace = true, features = ["macros", "rt", "sync"] }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 
 # misc
 metrics.workspace = true
@@ -42,6 +42,9 @@ tracing.workspace = true
 [dev-dependencies]
 reth-ethereum-primitives.workspace = true
 reth-filter-maps-test-utils.workspace = true
+reth-primitives-traits.workspace = true
 reth-provider = { workspace = true, features = ["test-utils"] }
+metrics-util = { workspace = true, features = ["debugging"] }
 proptest.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

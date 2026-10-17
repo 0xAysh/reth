@@ -39,6 +39,7 @@ use reth_node_core::{
     dirs::{ChainPath, DataDirPath},
     exit::NodeExitFuture,
 };
+use reth_node_metrics::recorder::install_prometheus_recorder;
 use reth_payload_primitives::BuiltPayload;
 use reth_primitives_traits::SealedBlock;
 use reth_provider::{
@@ -933,17 +934,44 @@ where
     /// because the node runs without `--filter-maps` or the block is not finalized.
     pub async fn wait_for_filter_maps_head(&self, number: BlockNumber) -> eyre::Result<()> {
         poll_until(format!("FilterMaps to index block {number}"), move || async move {
-            let indexed = self.filter_maps_indexed_blocks();
+            let indexed = self.filter_maps_indexed_blocks()?;
             Ok(indexed.is_some_and(|blocks| *blocks.end() >= number).then_some(()))
         })
         .await
     }
 
     /// Returns the blocks the `FilterMaps` index of the node covers, or `None` if the node runs
-    /// without `--filter-maps` or the index covers no block yet.
-    pub fn filter_maps_indexed_blocks(&self) -> Option<RangeInclusive<BlockNumber>> {
-        let reader = self.rpc.inner.eth_handlers().filter.filter_maps()?;
-        reader.snapshot().indexed_blocks()
+    /// without `--filter-maps` or the index covers no block yet. Fails if the store cannot be
+    /// read.
+    pub fn filter_maps_indexed_blocks(&self) -> eyre::Result<Option<RangeInclusive<BlockNumber>>> {
+        let Some(reader) = self.rpc.inner.eth_handlers().filter.filter_maps() else {
+            return Ok(None)
+        };
+        Ok(reader.snapshot()?.indexed_blocks())
+    }
+
+    /// Returns the value of the metric `name` in the series that has every label of `labels`, as
+    /// the Prometheus endpoint serves it: with the `reth_` prefix and `_` for `.`. Fails if no
+    /// series matches, so a misspelled name cannot pass as 0.
+    ///
+    /// The recorder is global, so the value includes every node of the test process, restarted
+    /// nodes too.
+    pub fn metric(&self, name: &str, labels: &[(&str, &str)]) -> eyre::Result<f64> {
+        let rendered = install_prometheus_recorder().handle().render();
+        let labels =
+            labels.iter().map(|(key, value)| format!("{key}=\"{value}\"")).collect::<Vec<_>>();
+        for line in rendered.lines().filter(|line| !line.starts_with('#')) {
+            let Some((series, value)) = line.rsplit_once(' ') else { continue };
+            let (metric, series_labels) = series
+                .split_once('{')
+                .map_or((series, ""), |(metric, labels)| (metric, labels.trim_end_matches('}')));
+            if metric == name &&
+                labels.iter().all(|label| series_labels.split(',').any(|other| other == label))
+            {
+                return Ok(value.parse()?)
+            }
+        }
+        Err(eyre!("no metric {name} with labels {labels:?}"))
     }
 
     /// Returns the receipt floor of the node: the lowest block whose receipts it still holds,

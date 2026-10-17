@@ -108,6 +108,10 @@ export const rethCliSidebar: SidebarItem = {
                         {
                             text: "reth db clear static-file",
                             link: "/cli/reth/db/clear/static-file"
+                        },
+                        {
+                            text: "reth db clear filter-maps",
+                            link: "/cli/reth/db/clear/filter-maps"
                         }
                     ]
                 },

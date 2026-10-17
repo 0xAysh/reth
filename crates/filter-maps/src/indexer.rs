@@ -14,17 +14,33 @@ use crate::{
 use alloy_consensus::{BlockHeader, TxReceipt};
 use reth_chain_state::{ForkChoiceSubscriptions, PersistedBlockSubscriptions};
 use reth_metrics::{
-    metrics::{Counter, Gauge},
+    metrics::{Counter, Gauge, Histogram},
     Metrics,
 };
 use reth_storage_api::{BlockHashReader, PruneCheckpointReader, ReceiptProvider};
 use reth_storage_errors::provider::ProviderError;
-use std::sync::Arc;
-use tracing::{debug, error, warn};
+use std::{
+    any::Any,
+    mem,
+    ops::RangeInclusive,
+    panic::{catch_unwind, AssertUnwindSafe},
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use tracing::{error, info, warn};
 
 /// The number of blocks that [`Indexer::run`] renders between two checks for shutdown, and whose
 /// hashes are read at once.
 const STEP: u64 = 1_000;
+
+/// The delay before the first retry of a failed step.
+const MIN_BACKOFF: Duration = Duration::from_secs(1);
+
+/// The longest delay between two retries.
+const MAX_BACKOFF: Duration = Duration::from_secs(60);
+
+/// The shortest interval between two progress lines, as Geth's `logFrequency`.
+const PROGRESS_INTERVAL: Duration = Duration::from_secs(20);
 
 /// Indexes finalized blocks into the `FilterMaps` store.
 ///
@@ -36,8 +52,16 @@ pub struct Indexer<P> {
     provider: P,
     /// The rendering state, once the store is checked against the chain.
     state: Option<RenderState>,
-    /// The block whose receipts the last step found missing.
-    missing_receipt_block: Option<u64>,
+    /// The delay before the last retry, while steps keep failing.
+    backoff: Option<Duration>,
+    /// When the last progress line was logged, or catch-up started.
+    progress_logged: Option<Instant>,
+    /// The blocks rendered since the last progress line.
+    blocks_since_progress: u64,
+    /// When the last tail drop line was logged.
+    tail_drop_logged: Option<Instant>,
+    /// Whether this indexer has reset an inconsistent store.
+    reset: bool,
     metrics: IndexerMetrics,
 }
 
@@ -48,9 +72,46 @@ impl<P> Indexer<P> {
             config,
             provider,
             state: None,
-            missing_receipt_block: None,
+            backoff: None,
+            progress_logged: None,
+            blocks_since_progress: 0,
+            tail_drop_logged: None,
+            reset: false,
             metrics: IndexerMetrics::default(),
         }
+    }
+
+    /// Runs one indexing step and turns a failure or a panic into a retry after a backoff: the
+    /// index is advisory, and nothing restarts a stopped indexer.
+    ///
+    /// Missing receipts keep the rendering state, since the receipts are read before their block
+    /// is pushed. Every other failure resumes from the store, because a failed group write has
+    /// already taken the group from the renderer.
+    fn step_or_retry(
+        &mut self,
+        step: impl FnOnce(&mut Self) -> Result<bool, FilterMapsError>,
+    ) -> Next {
+        let delay = next_backoff(self.backoff);
+        match catch_unwind(AssertUnwindSafe(|| step(self))) {
+            Ok(Ok(caught_up)) => {
+                self.backoff = None;
+                return if caught_up { Next::Wait } else { Next::Continue }
+            }
+            Ok(Err(error @ FilterMapsError::Provider(ProviderError::ReceiptNotFound(_)))) => {
+                warn!(target: "filter_maps", %error, retry_in = ?delay, "Receipts are missing, retrying later");
+            }
+            Ok(Err(error)) => {
+                error!(target: "filter_maps", %error, retry_in = ?delay, "FilterMaps indexing failed, retrying later");
+                self.state = None;
+            }
+            Err(payload) => {
+                error!(target: "filter_maps", panic = %panic_message(&*payload), retry_in = ?delay, "FilterMaps indexer panicked");
+                self.state = None;
+            }
+        }
+        self.metrics.failures.increment(1);
+        self.backoff = Some(delay);
+        Next::Retry(delay)
     }
 }
 
@@ -65,10 +126,12 @@ where
     /// Indexes up to min(finalized, persisted) whenever either moves.
     ///
     /// It renders 1,000 blocks at a time and yields in between, so a shutdown does not wait for a
-    /// long catch-up. A step that misses receipts waits for the next update before it retries. On
-    /// an error, a second miss of the same block included, it logs and returns. The stored range
-    /// stays correct, so queries keep using it.
+    /// long catch-up. A step that fails or panics is retried after a backoff that starts at one
+    /// second and doubles up to a minute, so the indexer never stops for good. The stored range
+    /// stays correct meanwhile, so queries keep using it. It returns only when a chain
+    /// notification channel closes.
     pub async fn run(mut self) {
+        self.metrics.running.set(1);
         let mut finalized_blocks = self.provider.subscribe_finalized_block();
         let mut persisted_blocks = self.provider.subscribe_persisted_block();
         loop {
@@ -77,23 +140,28 @@ where
                 finalized_blocks.borrow_and_update().as_ref().map(|header| header.number());
             let persisted = persisted_blocks.borrow_and_update().map(|block| block.number);
             if let (Some(finalized), Some(persisted)) = (finalized, persisted) {
-                match self.index_step(finalized.min(persisted), finalized) {
-                    Ok(true) => {}
-                    Ok(false) => {
+                match self.step_or_retry(|indexer| {
+                    indexer.index_step(finalized.min(persisted), finalized)
+                }) {
+                    Next::Wait => {}
+                    Next::Continue => {
                         tokio::task::yield_now().await;
                         continue
                     }
-                    Err(error) => {
-                        error!(target: "filter_maps", %error, "FilterMaps indexer stopped");
-                        return
+                    // Not raced against the channels: the persisted block moves every few
+                    // seconds and would cut every longer backoff short.
+                    Next::Retry(delay) => {
+                        tokio::time::sleep(delay).await;
+                        continue
                     }
                 }
             }
             tokio::select! {
-                changed = finalized_blocks.changed() => if changed.is_err() { return },
-                changed = persisted_blocks.changed() => if changed.is_err() { return },
+                changed = finalized_blocks.changed() => if changed.is_err() { break },
+                changed = persisted_blocks.changed() => if changed.is_err() { break },
             }
         }
+        self.metrics.running.set(0);
     }
 }
 
@@ -109,30 +177,21 @@ where
         self.sync(target, floor, finalized, u64::MAX).map(drop)
     }
 
-    /// Indexes up to [`STEP`] blocks towards `target` and returns whether the index caught up.
+    /// Reads the receipt floor, then indexes up to [`STEP`] blocks towards `target` and returns
+    /// whether the index caught up.
     ///
-    /// Missing receipts are retried once, at the next call: the pruner deletes receipts before it
-    /// commits the checkpoint that raises the receipt floor, so the floor read for this step can
-    /// be stale. If the next call still misses the same block, it fails.
+    /// The pruner deletes receipts before it commits the checkpoint that raises the receipt floor,
+    /// so this step can miss receipts above a stale floor. Each retry reads the floor again, and
+    /// once it passes the missing block the store starts a new origin there.
     fn index_step(&mut self, target: u64, finalized: u64) -> Result<bool, FilterMapsError> {
-        let floor = receipt_floor(&self.provider)?;
-        let result = self.sync(target, floor, finalized, STEP);
-        let next_block = self.state.as_ref().map(|state| state.next_block);
-        match result {
-            Err(FilterMapsError::Provider(ProviderError::ReceiptNotFound(_)))
-                if next_block.is_some() && self.missing_receipt_block != next_block =>
-            {
-                warn!(target: "filter_maps", ?next_block, "Receipts are missing, retrying later");
-                self.missing_receipt_block = next_block;
-                Ok(true)
-            }
-            result => {
-                if result.is_ok() {
-                    self.missing_receipt_block = None;
-                }
-                result
-            }
-        }
+        let started = Instant::now();
+        self.metrics.store_target.set(target as f64);
+        let result = match receipt_floor(&self.provider) {
+            Ok(floor) => self.sync(target, floor, finalized, STEP),
+            Err(error) => Err(error.into()),
+        };
+        self.metrics.step_duration_seconds.record(started.elapsed());
+        result
     }
 }
 
@@ -158,24 +217,119 @@ where
         max_blocks: u64,
     ) -> Result<bool, FilterMapsError> {
         // A gap reset: the next block's receipts are pruned, so the store cannot continue.
-        if self.state.as_ref().is_some_and(|state| state.next_block < floor) {
-            debug!(target: "filter_maps", floor, "Receipt floor passed the index, starting over");
+        if let Some(state) = &self.state &&
+            state.next_block < floor
+        {
+            // Warn only when stored maps are discarded, as at a start.
+            if state.range.after_last_map > state.range.first_map {
+                warn!(target: "filter_maps", floor, "Receipt floor passed the index, starting over");
+            }
             self.state = None;
             self.store.wipe()?;
         }
         if self.state.is_none() {
-            self.state = self.start(target, floor)?;
+            self.state = self.start(target, floor, finalized)?;
+            // A restart may have nothing to write for a while, so report the checked range now.
+            self.metrics.record(self.state.as_ref().map(|state| &state.range));
         }
         let Some(state) = self.state.as_ref() else { return Ok(true) };
-        let last = target.min(state.next_block.saturating_add(max_blocks - 1));
+        let first = state.next_block;
+        let last = target.min(first.saturating_add(max_blocks - 1));
         self.render(last, last == target)?;
-        self.drop_tail(floor, finalized)?;
+        self.log_progress(
+            last.saturating_add(1).saturating_sub(first),
+            last,
+            target,
+            Instant::now(),
+        );
+        match self.drop_tail(floor, finalized) {
+            // The next step starts a fresh store.
+            Err(FilterMapsError::Corrupt(reason)) if self.take_reset(&reason) => {
+                self.state = None;
+                self.store.wipe()?;
+                return Ok(false)
+            }
+            result => result?,
+        }
         Ok(last == target)
     }
 
+    /// Logs the catch-up progress at most every [`PROGRESS_INTERVAL`] while a step that rendered
+    /// `rendered` blocks up to `last`, done at `now`, leaves the index more than one step behind
+    /// `target`. In steady state every step reaches the target, so it logs nothing.
+    fn log_progress(&mut self, rendered: u64, last: u64, target: u64, now: Instant) {
+        if last == target {
+            self.progress_logged = None;
+            self.blocks_since_progress = 0;
+            return
+        }
+        self.blocks_since_progress += rendered;
+        let Some(logged) = self.progress_logged else {
+            self.progress_logged = Some(now);
+            return
+        };
+        let elapsed = now.duration_since(logged);
+        // The index head moves a map group at a time, so a line waits for the first stored group.
+        if elapsed >= PROGRESS_INTERVAL &&
+            let Some(indexed) =
+                self.state.as_ref().and_then(|state| state.range.indexed_blocks())
+        {
+            let (blocks_per_sec, eta) =
+                catch_up_rate(self.blocks_since_progress, elapsed, target - last);
+            info!(target: "filter_maps", indexed = *indexed.end(), target, blocks_per_sec, ?eta, "Indexing logs");
+            self.progress_logged = Some(now);
+            self.blocks_since_progress = 0;
+        }
+    }
+
     /// Checks the store against the chain and returns where rendering resumes, or `None` while
-    /// the floor is above the target.
-    fn start(&self, target: u64, floor: u64) -> Result<Option<RenderState>, FilterMapsError> {
+    /// the tail cutoff is above the target.
+    ///
+    /// A fresh store starts at the tail cutoff, the first block the window keeps. A stored range
+    /// starts over when its origin is above the cutoff, since a store counted from its origin
+    /// cannot grow backwards, or when the last block of its last map is below the cutoff, since
+    /// every rendered block would only be dropped.
+    ///
+    /// A stored range that contradicts its own records resets the store once per indexer.
+    fn start(
+        &mut self,
+        target: u64,
+        floor: u64,
+        finalized: u64,
+    ) -> Result<Option<RenderState>, FilterMapsError> {
+        let cutoff = tail_cutoff(self.config.history, floor, finalized);
+        match self.resume_stored(target, floor, cutoff) {
+            Ok(Some(state)) => return Ok(Some(state)),
+            // The fresh start below wipes the store in the same batch as the new range.
+            Ok(None) => {}
+            Err(FilterMapsError::Corrupt(reason)) if self.take_reset(&reason) => {}
+            Err(error) => return Err(error),
+        }
+
+        // The store is empty, every map was trimmed, the receipts to resume are pruned, the
+        // stored range does not fit the window, or it is inconsistent.
+        if cutoff > target {
+            self.store.wipe()?;
+            return Ok(None)
+        }
+        // The cutoff is at most the finalized block, so its hash exists.
+        let hash = self
+            .provider
+            .block_hash(cutoff)?
+            .ok_or_else(|| ProviderError::HeaderNotFound(cutoff.into()))?;
+        let origin = BlockRef { number: cutoff, hash, pointer: 0 };
+        let range = self.store.init(origin)?;
+        Ok(Some(RenderState::new(range, origin, 0)))
+    }
+
+    /// Checks the stored range against the chain and returns where rendering resumes, or `None`
+    /// when the store must start fresh.
+    fn resume_stored(
+        &self,
+        target: u64,
+        floor: u64,
+        cutoff: u64,
+    ) -> Result<Option<RenderState>, FilterMapsError> {
         let snapshot = self.store.snapshot();
         let mut range = snapshot.range()?;
         if let Some(stored) = range.as_mut() {
@@ -183,6 +337,7 @@ where
             self.trim(&snapshot, stored, target)?;
             if stored.after_last_map != maps {
                 if stored.after_last_map == stored.first_map {
+                    warn!(target: "filter_maps", target, "Every stored FilterMaps map ends above the target or in a non-canonical block, starting over");
                     range = None;
                 } else {
                     self.store.set_range(stored)?;
@@ -190,24 +345,34 @@ where
             }
         }
         if let Some(range) = range {
-            let state = RenderState::resume(&snapshot, range)?;
-            if state.next_block >= floor {
-                return Ok(Some(state))
+            // Warn only when stored maps are discarded: a floor above the target would otherwise
+            // log on every finalized update.
+            let has_maps = range.after_last_map > range.first_map;
+            if range.origin.number <= cutoff && range.after_last_block >= cutoff {
+                let state = RenderState::resume(&snapshot, range)?;
+                if state.next_block >= floor {
+                    return Ok(Some(state))
+                }
+                if has_maps {
+                    warn!(target: "filter_maps", floor, next_block = state.next_block, "Receipt floor passed the index, starting over");
+                }
+            } else if has_maps {
+                warn!(target: "filter_maps", origin = range.origin.number, cutoff, "FilterMaps store is outside the history window, starting over");
             }
         }
+        Ok(None)
+    }
 
-        // The store is empty, every map was trimmed, or the receipts to resume are pruned.
-        if floor > target {
-            self.store.wipe()?;
-            return Ok(None)
+    /// Takes the one reset of an inconsistent store that an indexer may make, as Geth resets
+    /// once and then disables. Returns `false` once it is taken: the error then goes to the
+    /// retry with backoff, without another wipe.
+    fn take_reset(&mut self, reason: &str) -> bool {
+        if mem::replace(&mut self.reset, true) {
+            return false
         }
-        let hash = self
-            .provider
-            .block_hash(floor)?
-            .ok_or_else(|| ProviderError::HeaderNotFound(floor.into()))?;
-        let origin = BlockRef { number: floor, hash, pointer: 0 };
-        let range = self.store.init(origin)?;
-        Ok(Some(RenderState::new(range, origin, 0)))
+        error!(target: "filter_maps", %reason, "FilterMaps store is inconsistent, indexing again");
+        self.metrics.resets.increment(1);
+        true
     }
 
     /// Drops maps from the end of `range` while their last block is above `target` or not
@@ -259,6 +424,7 @@ where
                     .ok_or_else(|| ProviderError::ReceiptNotFound(number.into()))?;
                 state.renderer.push_block(number, hash, receipts.iter().flat_map(TxReceipt::logs));
                 state.next_block = number + 1;
+                self.metrics.blocks_rendered.increment(1);
                 while let Some(group) = state.renderer.take_full_group() {
                     write_group(&self.store, &self.metrics, &mut state.range, &group)?;
                     state.written_maps = 0;
@@ -277,11 +443,7 @@ where
     /// the index head.
     fn drop_tail(&mut self, floor: u64, finalized: u64) -> Result<(), FilterMapsError> {
         let Some(state) = self.state.as_mut() else { return Ok(()) };
-        let cutoff = if self.config.history == 0 {
-            floor
-        } else {
-            floor.max((finalized + 1).saturating_sub(self.config.history))
-        };
+        let cutoff = tail_cutoff(self.config.history, floor, finalized);
         let params = DEFAULT_PARAMS;
         while state.range.after_last_map > state.range.first_map {
             let epoch = params.map_epoch(state.range.first_map);
@@ -293,8 +455,12 @@ where
             if last_block >= cutoff {
                 break
             }
+            if self.tail_drop_logged.is_none_or(|logged| logged.elapsed() >= PROGRESS_INTERVAL) {
+                info!(target: "filter_maps", epoch, cutoff, "Dropping old FilterMaps epochs");
+                self.tail_drop_logged = Some(Instant::now());
+            }
             state.range = self.store.drop_epoch(&state.range, epoch)?;
-            self.metrics.record(&state.range);
+            self.metrics.record(Some(&state.range));
         }
         Ok(())
     }
@@ -335,27 +501,63 @@ impl RenderState {
             hash: last_block.hash,
             pointer: snapshot.block_pointer(last_block.number)?,
         };
+        // The last block of the previous map starts at most at this map's first slot (Geth's
+        // `lvIndex > targetLvPtr` check). A later start would skip slots of the map.
+        if start.pointer > u64::from(map) * DEFAULT_PARAMS.values_per_map() {
+            return Err(FilterMapsError::Corrupt(format!(
+                "pointer {} of block {} is past the start of map {map}",
+                start.pointer, start.number
+            )))
+        }
         Ok(Self::new(range, start, map))
     }
+}
+
+/// What [`Indexer::run`] does after a step.
+#[derive(Debug, PartialEq, Eq)]
+enum Next {
+    /// The index caught up: wait for the chain to move.
+    Wait,
+    /// More blocks are ready: step again after a yield.
+    Continue,
+    /// The step failed: step again after the delay.
+    Retry(Duration),
 }
 
 #[derive(Metrics)]
 #[metrics(scope = "filter_maps")]
 struct IndexerMetrics {
-    /// The first block whose log values are all in stored maps.
+    /// The first block whose log values are all in stored maps, 0 while the index covers no block.
     first_indexed_block: Gauge,
-    /// The index head: the last block whose log values are all in stored maps.
+    /// The index head: the last block whose log values are all in stored maps, 0 while the index
+    /// covers no block.
     last_indexed_block: Gauge,
     /// The number of maps written to the store.
     maps_written: Counter,
+    /// The block the indexer indexes towards: min(finalized, persisted).
+    store_target: Gauge,
+    /// The number of blocks rendered into maps.
+    blocks_rendered: Counter,
+    /// The duration of one indexing step, in seconds.
+    step_duration_seconds: Histogram,
+    /// The duration of one map group write, in seconds.
+    write_duration_seconds: Histogram,
+    /// The number of failed or panicked indexing steps. Each one is retried after a backoff.
+    failures: Counter,
+    /// 1 while the indexer task runs.
+    running: Gauge,
+    /// The number of inconsistent stores wiped and indexed again.
+    resets: Counter,
 }
 
 impl IndexerMetrics {
-    fn record(&self, range: &RangeRecord) {
-        if let Some(blocks) = range.indexed_blocks() {
-            self.first_indexed_block.set(*blocks.start() as f64);
-            self.last_indexed_block.set(*blocks.end() as f64);
-        }
+    /// Sets the indexed-block gauges to the blocks of `range`, or both to 0 when it covers no
+    /// block: the store is empty, was wiped, or holds no finished map yet.
+    fn record(&self, range: Option<&RangeRecord>) {
+        let (first, last) =
+            range.and_then(RangeRecord::indexed_blocks).map_or((0, 0), RangeInclusive::into_inner);
+        self.first_indexed_block.set(first as f64);
+        self.last_indexed_block.set(last as f64);
     }
 }
 
@@ -366,12 +568,48 @@ fn write_group(
     range: &mut RangeRecord,
     group: &[FinishedMap],
 ) -> Result<(), FilterMapsError> {
+    let started = Instant::now();
     let written = store.write_group(range, group)?;
+    metrics.write_duration_seconds.record(started.elapsed());
     let new_maps = written.after_last_map.saturating_sub(range.after_last_map);
     metrics.maps_written.increment(u64::from(new_maps));
-    metrics.record(&written);
+    metrics.record(Some(&written));
     *range = written;
     Ok(())
+}
+
+/// Returns the tail cutoff: the first block the index keeps. It keeps exactly `history` blocks up
+/// to `finalized`, never below the receipt floor, and every block from the floor with history 0.
+fn tail_cutoff(history: u64, floor: u64, finalized: u64) -> u64 {
+    if history == 0 {
+        floor
+    } else {
+        floor.max((finalized + 1).saturating_sub(history))
+    }
+}
+
+/// Returns the delay before the next retry: [`MIN_BACKOFF`] after a success, then doubling up to
+/// [`MAX_BACKOFF`].
+fn next_backoff(previous: Option<Duration>) -> Duration {
+    previous.map_or(MIN_BACKOFF, |previous| previous.saturating_mul(2).min(MAX_BACKOFF))
+}
+
+/// Returns the message of a panic payload, read as `reth-tasks` reads it for a panicked task.
+fn panic_message(payload: &(dyn Any + Send)) -> &str {
+    payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("unknown panic")
+}
+
+/// Returns the blocks rendered per second, and the time left for `remaining` blocks at that rate,
+/// after rendering `blocks` blocks took `elapsed`.
+fn catch_up_rate(blocks: u64, elapsed: Duration, remaining: u64) -> (u64, Duration) {
+    let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX).max(1);
+    let blocks = blocks.max(1);
+    let eta = Duration::from_millis(remaining.saturating_mul(elapsed_ms) / blocks);
+    (blocks.saturating_mul(1_000) / elapsed_ms, eta)
 }
 
 #[cfg(test)]

@@ -2,8 +2,8 @@
 //!
 //! Every record is matched exactly: canonical decimal numbers, lowercase fixed-width hex, single
 //! spaces, a final newline, and declared counts that must equal the items that follow. Structural
-//! validation covers the relationships that hold without replaying the stream; the `replay` module
-//! covers everything that needs the actual events.
+//! validation covers the relationships that hold without replaying the stream; the render and
+//! matcher unit tests of `reth-filter-maps` replay the events.
 
 use alloy_primitives::{Address, B256};
 use sha2::{Digest, Sha256};

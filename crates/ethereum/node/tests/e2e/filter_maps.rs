@@ -68,56 +68,87 @@ async fn filter_maps_matches_bloom_path() -> eyre::Result<()> {
 
     let queries = chain.queries(0);
     let bloom = run_queries(&node, &queries).await?;
-    assert_eq!(node.filter_maps_indexed_blocks(), None, "no map finishes in the genesis block");
+    assert_eq!(node.filter_maps_indexed_blocks()?, None, "no map finishes in the genesis block");
+
+    // Emitter 2 logs nothing in blocks 0 to 6, but the heavy blocks fill their blooms, so the
+    // header bloom reads the receipts of all five.
+    let unmatched = Filter::new().address(chain.emitters[2]).from_block(0).to_block(chain.heavy[4]);
+    let before = PathCounters::read(&node)?;
+    assert_eq!(node.rpc_provider().get_logs(&unmatched).await?, []);
+    let bloom_path = PathCounters::read(&node)?.since(&before);
+    assert_eq!(bloom_path.bloom, [1.0, 7.0, 5.0, 0.0]);
+    assert_eq!(bloom_path.index, [0.0; 4]);
 
     node.finalize(node.block_hash(chain.head)).await?;
     node.wait_for_filter_maps_head(chain.heavy[4]).await?;
-    let indexed = node.filter_maps_indexed_blocks().unwrap();
+    let indexed = node.filter_maps_indexed_blocks()?.unwrap();
     assert!(indexed.contains(&chain.heavy[0]) && indexed.contains(&chain.heavy[4]));
     assert_eq!(run_queries(&node, &queries).await?, bloom);
+
+    // The index names no candidate block, so no receipts are read.
+    let before = PathCounters::read(&node)?;
+    assert_eq!(node.rpc_provider().get_logs(&unmatched).await?, []);
+    let index_path = PathCounters::read(&node)?.since(&before);
+    assert_eq!(index_path.index, [1.0, 0.0, 0.0, 0.0]);
+    assert_eq!(index_path.bloom, [0.0; 4]);
     Ok(())
 }
 
-/// A restarted node reopens its index, answers as before, and indexes new finalized blocks.
+/// A restarted node resumes the map group it stored last: it renders again only the blocks from the
+/// last block of map 31, answers as before, and indexes new finalized blocks.
+///
+/// A fresh store starts at index 0, so 30 heavy blocks of 74,001 slots finish map 31 in heavy[28]
+/// and map 32 in heavy[29]. With map 32 stored, resuming at the start of group 32 and resuming at
+/// the next map differ, so a broken resume fails.
 #[tokio::test]
-async fn filter_maps_resumes_after_restart() -> eyre::Result<()> {
+async fn filter_maps_resumes_a_stored_map_group_after_restart() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
     let (mut node, wallet) = filter_maps_setup().with_restartable_nodes().build_single().await?;
     node.set_finality(Finality::Keep);
     let mut chain = Chain::deploy(&mut node, wallet.account(0)).await?;
-    chain.mine_heavy(&mut node, 6).await?;
+    chain.mine_heavy(&mut node, 30).await?;
     chain.mine_light(&mut node, 4).await?;
-    let queries = chain.queries(0);
+    let queries = chain.queries(chain.heavy[26]);
     let bloom = run_queries(&node, &queries).await?;
     node.finalize(node.block_hash(chain.head)).await?;
-    node.wait_for_filter_maps_head(chain.heavy[4]).await?;
+    node.wait_for_filter_maps_head(chain.heavy[28]).await?;
     assert_eq!(run_queries(&node, &queries).await?, bloom);
+    // The engine writes the finalized block to disk with the next persisted block. Without one, the
+    // restarted node reloads genesis as finalized, and the startup trim drops every stored map.
+    chain.mine_light(&mut node, 1).await?;
+    node.wait_for_persisted_block(chain.head).await?;
 
+    let rendered = node.metric("reth_filter_maps_blocks_rendered", &[])?;
     let mut node = node.restart().await?;
-    node.wait_for_filter_maps_head(chain.heavy[4]).await?;
+    // The reopened range covers the block, so this returns at once.
+    node.wait_for_filter_maps_head(chain.heavy[28]).await?;
     assert_eq!(run_queries(&node, &queries).await?, bloom);
 
     node.set_finality(Finality::Keep);
     chain.mine_heavy(&mut node, 3).await?;
-    let queries = chain.queries(0);
+    let queries = chain.queries(chain.heavy[26]);
     let bloom = run_queries(&node, &queries).await?;
     node.finalize(node.block_hash(chain.head)).await?;
-    node.wait_for_filter_maps_head(chain.heavy[7]).await?;
+    node.wait_for_filter_maps_head(chain.heavy[31]).await?;
     assert_eq!(run_queries(&node, &queries).await?, bloom);
+    // A re-render from the origin would render every block again.
+    let rendered = node.metric("reth_filter_maps_blocks_rendered", &[])? - rendered;
+    assert_eq!(rendered, (chain.head - chain.heavy[28] + 1) as f64);
     Ok(())
 }
 
-/// On a node that prunes receipts, the index starts at the receipt floor: the store resets when
-/// the floor passes its next block. Queries above the floor give the same logs, and a query below
-/// it fails as before.
+/// On a node that prunes receipts, the index starts at the receipt floor, which is the tail cutoff
+/// on a chain shorter than the history: the store resets when the floor passes its next block.
+/// Queries above the floor give the same logs, and a query below it fails as before.
 #[tokio::test]
 async fn filter_maps_pruned_node_starts_at_receipt_floor() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
 
     let (mut node, wallet) = filter_maps_setup()
+        // --filter-maps refuses a receipts distance below 10,064 blocks, so prune before a block.
         .with_pruning(PruningArgs {
-            receipts_distance: Some(32),
+            receipts_before: Some(16),
             minimum_distance: Some(32),
             block_interval: Some(1),
             ..Default::default()
@@ -133,9 +164,9 @@ async fn filter_maps_pruned_node_starts_at_receipt_floor() -> eyre::Result<()> {
     let mut chain = Chain::deploy(&mut node, wallet.account(0)).await?;
     chain.mine_light(&mut node, 45).await?;
     chain.mine_heavy(&mut node, 2).await?;
-    // The pruner keeps the last 32 blocks. With storage v2 it deletes whole static files of 8
-    // blocks, so the floor moves in steps of 8.
-    node.wait_for_prune_checkpoint(PruneSegment::Receipts, chain.head - 33).await?;
+    // The pruner prunes the blocks before 16 once the head is 32 blocks past them. With storage
+    // v2 it deletes whole static files of 8 blocks, so the floor moves in steps of 8.
+    node.wait_for_prune_checkpoint(PruneSegment::Receipts, 15).await?;
     let floor = node.receipt_floor()?;
     assert!(floor > 1, "receipts are pruned");
 
@@ -148,11 +179,40 @@ async fn filter_maps_pruned_node_starts_at_receipt_floor() -> eyre::Result<()> {
     node.finalize(node.block_hash(chain.head)).await?;
     node.wait_for_filter_maps_head(chain.heavy[0]).await?;
     // The store started at genesis, before anything was pruned, so it reset to start here.
-    let indexed = node.filter_maps_indexed_blocks().unwrap();
+    let indexed = node.filter_maps_indexed_blocks()?.unwrap();
     assert_eq!(*indexed.start(), floor);
     assert_eq!(run_queries(&node, &queries).await?, bloom);
     let error = node.rpc_provider().get_logs(&below_floor).await.unwrap_err();
     assert_eq!(error.to_string(), below_floor_error.to_string());
+    Ok(())
+}
+
+/// A receipts log filter in reth.toml, which the CLI cannot reject, stops the launch.
+#[tokio::test]
+async fn filter_maps_refuses_a_reth_toml_receipts_log_filter() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("reth.toml");
+    std::fs::write(
+        &path,
+        "[prune.segments.receipts_log_filter]\n\
+         \"0x0000000000000000000000000000000000000001\" = { distance = 10064 }\n",
+    )?;
+    let Err(error) = filter_maps_setup()
+        .with_node_config_modifier(move |mut config| {
+            config.config = Some(path.clone());
+            config
+        })
+        .build_single()
+        .await
+    else {
+        panic!("the node launched")
+    };
+    assert_eq!(
+        error.root_cause().to_string(),
+        "--filter-maps needs every receipt, but the receipts log filter prunes some"
+    );
     Ok(())
 }
 
@@ -219,14 +279,15 @@ impl Chain {
         Ok(())
     }
 
-    /// The query set, over blocks from `from` on.
+    /// The query set, over blocks from `from` on. The ranges over heavy blocks take the first
+    /// heavy blocks at or after `from`.
     ///
     /// The heavy blocks take more than one filter map each, so every range over two of them
     /// crosses a map boundary, and the ranges to the head extend past the index head, which ends
     /// in an unfinished map.
     fn queries(&self, from: u64) -> Vec<Filter> {
         let [first, second, third] = self.emitters;
-        let heavy = &self.heavy;
+        let heavy = self.heavy.iter().copied().filter(|block| *block >= from).collect::<Vec<_>>();
         let to_head = |filter: Filter| filter.from_block(from).to_block(self.head);
         vec![
             // An address and a topic, then OR lists over addresses and over topic 1.
@@ -240,6 +301,37 @@ impl Chain {
             // No address or topic: the header bloom always answers.
             Filter::new().from_block(*heavy.last().unwrap()).to_block(self.head),
         ]
+    }
+}
+
+/// The `eth_getLogs` counters of each path: windows, headers read, receipt sets read, logs.
+#[derive(Debug)]
+struct PathCounters {
+    index: [f64; 4],
+    bloom: [f64; 4],
+}
+
+impl PathCounters {
+    fn read(node: &Node) -> eyre::Result<Self> {
+        let path = |path| -> eyre::Result<[f64; 4]> {
+            let mut counters = [0.0; 4];
+            for (counter, name) in counters.iter_mut().zip([
+                "windows_total",
+                "headers_read_total",
+                "receipt_sets_read_total",
+                "logs_total",
+            ]) {
+                *counter =
+                    node.metric(&format!("reth_rpc_eth_filter_{name}"), &[("path", path)])?;
+            }
+            Ok(counters)
+        };
+        Ok(Self { index: path("index")?, bloom: path("bloom")? })
+    }
+
+    fn since(&self, before: &Self) -> Self {
+        let delta = |now: [f64; 4], before: [f64; 4]| std::array::from_fn(|i| now[i] - before[i]);
+        Self { index: delta(self.index, before.index), bloom: delta(self.bloom, before.bloom) }
     }
 }
 

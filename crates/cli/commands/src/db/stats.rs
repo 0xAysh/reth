@@ -8,6 +8,7 @@ use reth_chainspec::EthereumHardforks;
 use reth_db::{mdbx, static_file::iter_static_files, DatabaseEnv};
 use reth_db_api::{database::Database, TableViewer, Tables};
 use reth_db_common::DbTool;
+use reth_filter_maps::{FilterMaps, FilterMapsStats};
 use reth_fs_util as fs;
 use reth_node_builder::{NodePrimitives, NodeTypesWithDB, NodeTypesWithDBAdapter};
 use reth_node_core::dirs::{ChainPath, DataDirPath};
@@ -16,7 +17,7 @@ use reth_provider::{
     RocksDBProviderFactory,
 };
 use reth_static_file_types::SegmentRangeInclusive;
-use std::time::Duration;
+use std::{path::Path, time::Duration};
 
 #[derive(Parser, Debug)]
 /// The arguments for the `reth db stats` command
@@ -50,6 +51,8 @@ impl Command {
         data_dir: ChainPath<DataDirPath>,
         tool: &DbTool<NodeTypesWithDBAdapter<N, DatabaseEnv>>,
     ) -> eyre::Result<()> {
+        let filter_maps_path = data_dir.filter_maps();
+
         if self.checksum {
             let checksum_report = self.checksum_report(tool)?;
             println!("{checksum_report}");
@@ -68,6 +71,22 @@ impl Command {
 
         let rocksdb_stats_table = self.rocksdb_stats_table(tool);
         println!("{rocksdb_stats_table}");
+
+        // Prints nothing when the datadir has no store, as on a node without `--filter-maps`.
+        match FilterMaps::stats(&filter_maps_path) {
+            Ok(Some(stats)) => {
+                println!("\n");
+                println!("{}", filter_maps_stats_table(&filter_maps_path, &stats));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                println!("\n");
+                println!(
+                    "Failed to read the FilterMaps store at {}: {error}",
+                    filter_maps_path.display()
+                );
+            }
+        }
 
         Ok(())
     }
@@ -444,4 +463,26 @@ impl Command {
 
         Ok(table)
     }
+}
+
+fn filter_maps_stats_table(path: &Path, stats: &FilterMapsStats) -> ComfyTable {
+    let mut table = ComfyTable::new();
+    table.load_preset(comfy_table::presets::ASCII_MARKDOWN);
+    table.set_header(["FilterMaps", ""]);
+    let origin = stats.origin.map_or_else(|| "none".to_string(), |block| block.to_string());
+    let indexed_blocks = stats.indexed_blocks.as_ref().map_or_else(
+        || "none".to_string(),
+        |blocks| format!("{}..={}", blocks.start(), blocks.end()),
+    );
+    let maps = format!("{} ({}..{})", stats.maps.len(), stats.maps.start, stats.maps.end);
+    for (name, value) in [
+        ("Store Path", path.display().to_string()),
+        ("Total Size", human_bytes(stats.size_bytes as f64)),
+        ("Index Origin", origin),
+        ("Indexed Blocks", indexed_blocks),
+        ("Stored Maps", maps),
+    ] {
+        table.add_row([name.to_string(), value]);
+    }
+    table
 }

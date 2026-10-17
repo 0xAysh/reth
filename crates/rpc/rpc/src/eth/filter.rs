@@ -17,6 +17,11 @@ use itertools::Itertools;
 use jsonrpsee::{core::RpcResult, server::IdProvider};
 use reth_errors::ProviderError;
 use reth_filter_maps::{receipt_floor, FilterMapsReader, MatchPattern, TopicSelection};
+use reth_metrics::{
+    metrics,
+    metrics::{Counter, Histogram},
+    Metrics,
+};
 use reth_primitives_traits::{NodePrimitives, SealedHeader};
 use reth_rpc_eth_api::{
     helpers::{EthBlocks, LoadReceipt},
@@ -47,7 +52,7 @@ use tokio::{
     sync::{mpsc::Receiver, oneshot, Mutex},
     time::MissedTickBehavior,
 };
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, trace};
 
 impl<Eth> EngineEthFilter<RpcLog<Eth::NetworkTypes>> for EthFilter<Eth>
 where
@@ -153,6 +158,10 @@ where
             stale_filter_ttl,
             query_limits: QueryLimits { max_blocks_per_filter, max_logs_per_response },
             filter_maps: OnceLock::new(),
+            index_warnings: WarningLimiter::default(),
+            index_metrics: LogPathMetrics::new_with_labels(&[("path", "index")]),
+            bloom_metrics: LogPathMetrics::new_with_labels(&[("path", "bloom")]),
+            log_query_metrics: LogQueryMetrics::default(),
         };
 
         let eth_filter = Self { inner: Arc::new(inner) };
@@ -478,6 +487,14 @@ struct EthFilterInner<Eth: EthApiTypes> {
     stale_filter_ttl: Duration,
     /// The `FilterMaps` index, once the node opened it. Until then, queries use the header bloom.
     filter_maps: OnceLock<FilterMapsReader>,
+    /// Limits the warnings of index reads that fall back on the header bloom.
+    index_warnings: WarningLimiter,
+    /// What `eth_getLogs` read in the windows the index served.
+    index_metrics: LogPathMetrics,
+    /// What `eth_getLogs` read in the windows the header bloom served.
+    bloom_metrics: LogPathMetrics,
+    /// Index fallbacks and match time of `eth_getLogs`.
+    log_query_metrics: LogQueryMetrics,
 }
 
 impl<Eth> EthFilterInner<Eth>
@@ -707,14 +724,28 @@ where
         let this = self.clone();
         self.task_spawner.spawn_blocking_task(async move {
             let _permit = permit;
-            let fut = this.get_logs_in_block_range_inner(&filter, from_block, to_block, limits);
-            tokio::pin!(fut);
-            let res = tokio::select! {
-                // Range scans perform blocking reads before their first yield.
-                biased;
-                _ = tx.closed() => None,
-                res = &mut fut => Some(res),
+            let started = Instant::now();
+            // The task owns the stats, so a failed or cancelled query reports its work too.
+            let mut stats = LogQueryStats::default();
+            let res = {
+                let fut = this.clone().get_logs_in_block_range_inner(
+                    &filter, from_block, to_block, limits, &mut stats,
+                );
+                tokio::pin!(fut);
+                tokio::select! {
+                    // Range scans perform blocking reads before their first yield.
+                    biased;
+                    _ = tx.closed() => None,
+                    res = &mut fut => Some(res),
+                }
             };
+            this.record_log_query(&stats);
+            let outcome = match &res {
+                Some(Ok(_)) => "logs",
+                Some(Err(_)) => "error",
+                None => "cancelled",
+            };
+            debug!(target: "rpc::eth::filter", ?stats, elapsed = ?started.elapsed(), outcome, "Log query done");
             if let Some(res) = res {
                 let _ = tx.send(res);
             }
@@ -729,6 +760,8 @@ where
     /// ranges and utilizes the rpc cache for optimistically fetching receipts and blocks.
     /// This function is considered blocking and should thus be spawned on a blocking task.
     ///
+    /// Adds what the query read on each path to `stats`, also when it fails.
+    ///
     /// Returns an error if:
     ///  - underlying database error
     async fn get_logs_in_block_range_inner(
@@ -737,6 +770,7 @@ where
         from_block: u64,
         to_block: u64,
         limits: QueryLimits,
+        stats: &mut LogQueryStats,
     ) -> Result<Vec<RpcLog<Eth::NetworkTypes>>, EthFilterError> {
         let mut all_logs = Vec::new();
 
@@ -746,14 +780,35 @@ where
         // In the blocks that FilterMaps indexes, the index names the candidate blocks. Everywhere
         // else, and for a filter without an address or topic, the header bloom does. One snapshot
         // serves the whole query, so every window sees the same index.
-        let index = self.filter_maps.get().and_then(|reader| {
-            let pattern = match_pattern(filter);
-            pattern.has_searchable_values().then(|| (reader.snapshot(), pattern))
-        });
+        let index = self
+            .filter_maps
+            .get()
+            .map(|reader| (reader, match_pattern(filter)))
+            .filter(|(_, pattern)| pattern.has_searchable_values())
+            .and_then(|(reader, pattern)| match reader.snapshot() {
+                Ok(snapshot) => Some((snapshot, pattern)),
+                // A range that cannot be read loses no log: the header bloom is complete.
+                Err(error) => {
+                    stats.fallbacks += 1;
+                    if let Some(suppressed) = self.index_warnings.allow(Instant::now()) {
+                        error!(target: "rpc::eth::filter", %error, suppressed, "Failed to read the FilterMaps range, using the header bloom");
+                    }
+                    None
+                }
+            });
         let indexed = match &index {
-            Some((snapshot, _)) => {
-                indexed_window(snapshot.indexed_blocks(), receipt_floor(self.provider())?)
-            }
+            Some((snapshot, _)) => match receipt_floor(self.provider()) {
+                Ok(receipt_floor) => indexed_window(snapshot.indexed_blocks(), receipt_floor),
+                // A floor that cannot be read leaves every block on the header bloom, which is
+                // complete.
+                Err(error) => {
+                    stats.fallbacks += 1;
+                    if let Some(suppressed) = self.index_warnings.allow(Instant::now()) {
+                        error!(target: "rpc::eth::filter", %error, suppressed, "Failed to read the receipt floor, using the header bloom");
+                    }
+                    None
+                }
+            },
             None => None,
         };
 
@@ -766,20 +821,37 @@ where
 
             let candidates = match &index {
                 Some((snapshot, pattern)) if window.indexed => {
-                    match snapshot.candidate_blocks(window.from..=window.to, pattern) {
+                    let started = Instant::now();
+                    let candidates = snapshot.candidate_blocks(window.from..=window.to, pattern);
+                    stats.match_duration =
+                        Some(stats.match_duration.unwrap_or_default() + started.elapsed());
+                    match candidates {
                         Ok(candidates) => Some(candidates),
                         // A failed lookup loses no log: the header bloom is complete.
                         Err(error) => {
-                            warn!(target: "rpc::eth::filter", %error, from = window.from, to = window.to, "FilterMaps lookup failed, using the header bloom");
+                            stats.fallbacks += 1;
+                            if let Some(suppressed) = self.index_warnings.allow(Instant::now()) {
+                                error!(target: "rpc::eth::filter", %error, from = window.from, to = window.to, suppressed, "FilterMaps lookup failed, using the header bloom");
+                            }
                             None
                         }
                     }
                 }
                 _ => None,
             };
+            // A window that falls back counts on the bloom path, so the two paths add up to the
+            // query.
+            let path = if candidates.is_some() { &mut stats.index } else { &mut stats.bloom };
+            path.windows += 1;
             let matching_headers = match candidates {
-                Some(candidates) => self.candidate_headers(filter, candidates)?,
-                None => self.bloom_headers(filter, window.from..=window.to)?,
+                Some(candidates) => {
+                    path.headers_read += candidates.len() as u64;
+                    self.candidate_headers(filter, candidates)?
+                }
+                None => {
+                    path.headers_read += window.to - window.from + 1;
+                    self.bloom_headers(filter, window.from..=window.to)?
+                }
             };
 
             // initialize the appropriate range mode based on collected headers
@@ -796,7 +868,9 @@ where
             while let Some(ReceiptBlockResult { receipts, recovered_block, header }) =
                 range_mode.next().await?
             {
+                path.receipt_sets_read += 1;
                 let num_hash = header.num_hash();
+                let logs_before = all_logs.len();
                 append_matching_block_logs(
                     &mut all_logs,
                     self.eth_api.converter(),
@@ -808,6 +882,11 @@ where
                     &receipts,
                     false,
                 )?;
+                let added = (all_logs.len() - logs_before) as u64;
+                if added > 0 {
+                    path.matching_blocks += 1;
+                    path.logs += added;
+                }
 
                 // size check but only if range is multiple blocks, so we always return all
                 // logs of a single block
@@ -840,6 +919,16 @@ where
         }
 
         Ok(all_logs)
+    }
+
+    /// Adds the work of one `eth_getLogs` query to the metrics.
+    fn record_log_query(&self, stats: &LogQueryStats) {
+        self.index_metrics.record(&stats.index);
+        self.bloom_metrics.record(&stats.bloom);
+        self.log_query_metrics.fallbacks_total.increment(stats.fallbacks);
+        if let Some(duration) = stats.match_duration {
+            self.log_query_metrics.match_duration_seconds.record(duration);
+        }
     }
 
     /// Reads the headers of the candidate blocks and keeps the ones whose bloom matches `filter`.
@@ -1060,6 +1149,98 @@ fn indexed_window(
     let (first, last) = indexed?.into_inner();
     let first = first.max(receipt_floor);
     (first <= last).then_some(first..=last)
+}
+
+/// What one `eth_getLogs` query read on each path.
+#[derive(Debug, Default)]
+struct LogQueryStats {
+    /// The windows that the `FilterMaps` index served.
+    index: PathStats,
+    /// Every other window, including the ones whose index lookup failed.
+    bloom: PathStats,
+    /// Index lookups and receipt floor reads that failed, so their blocks used the header bloom.
+    fallbacks: u64,
+    /// The time spent matching against the index, if the query looked it up.
+    match_duration: Option<Duration>,
+}
+
+/// What a query read on one path.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct PathStats {
+    /// The header windows served.
+    windows: u64,
+    /// The headers read: the candidate blocks on the index path, every block on the bloom path.
+    headers_read: u64,
+    /// The block receipt sets read, counted as the query uses them: one per header whose bloom
+    /// matched and whose block has receipts. A query that the log cap or a cancel ends may have
+    /// fetched up to one parallel batch more.
+    receipt_sets_read: u64,
+    /// The blocks with at least one matching log.
+    matching_blocks: u64,
+    /// The matching logs.
+    logs: u64,
+}
+
+/// The `eth_getLogs` work on one path, labelled `path` = `index` or `bloom`.
+#[derive(Metrics)]
+#[metrics(scope = "rpc.eth_filter")]
+struct LogPathMetrics {
+    /// The number of header windows served.
+    windows_total: Counter,
+    /// The number of headers read. On the index path, these are the candidate blocks.
+    headers_read_total: Counter,
+    /// The number of block receipt sets read, counted as queries use them.
+    receipt_sets_read_total: Counter,
+    /// The number of blocks with at least one matching log.
+    matching_blocks_total: Counter,
+    /// The number of matching logs.
+    logs_total: Counter,
+}
+
+impl LogPathMetrics {
+    fn record(&self, stats: &PathStats) {
+        self.windows_total.increment(stats.windows);
+        self.headers_read_total.increment(stats.headers_read);
+        self.receipt_sets_read_total.increment(stats.receipt_sets_read);
+        self.matching_blocks_total.increment(stats.matching_blocks);
+        self.logs_total.increment(stats.logs);
+    }
+}
+
+/// The `eth_getLogs` work that belongs to no single path.
+#[derive(Metrics)]
+#[metrics(scope = "rpc.eth_filter")]
+struct LogQueryMetrics {
+    /// The number of index lookups and receipt floor reads that failed, so their blocks used the
+    /// header bloom.
+    fallbacks_total: Counter,
+    /// The time one query spent matching against the `FilterMaps` index, in seconds.
+    match_duration_seconds: Histogram,
+}
+
+/// Allows one warning per [`WarningLimiter::INTERVAL`] across concurrent queries, so a persistent
+/// index error cannot flood the log.
+#[derive(Debug, Default)]
+struct WarningLimiter {
+    /// When the last warning was allowed, and how many were suppressed since.
+    state: parking_lot::Mutex<(Option<Instant>, u64)>,
+}
+
+impl WarningLimiter {
+    const INTERVAL: Duration = Duration::from_secs(60);
+
+    /// Returns the number of warnings suppressed since the last allowed one if a warning at `now`
+    /// is allowed, and `None` if it is suppressed.
+    fn allow(&self, now: Instant) -> Option<u64> {
+        let mut state = self.state.lock();
+        let (last, suppressed) = &mut *state;
+        if last.is_some_and(|last| now.saturating_duration_since(last) < Self::INTERVAL) {
+            *suppressed += 1;
+            return None
+        }
+        *last = Some(now);
+        Some(std::mem::take(suppressed))
+    }
 }
 
 /// A run of blocks that one header read serves.
@@ -1549,13 +1730,14 @@ mod tests {
     use reth_filter_maps::{FilterMaps, FilterMapsConfig};
     use reth_network_api::noop::NoopNetwork;
     use reth_provider::test_utils::MockEthProvider;
+    use reth_prune_types::{PruneCheckpoint, PruneSegment};
     use reth_rpc_convert::RpcConverter;
     use reth_rpc_eth_api::node::RpcNodeCoreAdapter;
     use reth_rpc_eth_types::receipt::EthReceiptConverter;
     use reth_tasks::Runtime;
     use reth_testing_utils::generators;
     use reth_transaction_pool::test_utils::{testing_pool, TestPool};
-    use std::{collections::VecDeque, sync::Arc};
+    use std::{collections::VecDeque, path::Path, sync::Arc};
 
     #[test]
     fn receipts_unavailable_error_matches_geth() {
@@ -1606,6 +1788,16 @@ mod tests {
             [window(2_600, 2_700, false)]
         );
         assert_eq!(log_windows(0..=500, None, 1_000), [window(0, 500, false)]);
+    }
+
+    #[test]
+    fn index_lookup_warnings_are_limited_to_one_per_interval() {
+        let limiter = WarningLimiter::default();
+        let t0 = Instant::now();
+        assert_eq!(limiter.allow(t0), Some(0));
+        assert_eq!(limiter.allow(t0 + Duration::from_secs(1)), None);
+        assert_eq!(limiter.allow(t0 + Duration::from_secs(59)), None);
+        assert_eq!(limiter.allow(t0 + Duration::from_secs(60)), Some(2));
     }
 
     #[test]
@@ -2494,7 +2686,7 @@ mod tests {
             Runtime::test(),
         );
         eth_filter.set_filter_maps(filter_maps.reader());
-        let indexed = eth_filter.filter_maps().unwrap().snapshot().indexed_blocks();
+        let indexed = eth_filter.filter_maps().unwrap().snapshot().unwrap().indexed_blocks();
         assert_eq!(indexed, Some(0..=4));
         let logs = eth_filter
             .inner
@@ -2504,6 +2696,320 @@ mod tests {
             .unwrap();
         let blocks = logs.iter().map(|log| log.block_number.unwrap()).collect::<Vec<_>>();
         assert_eq!(blocks, [1, 3], "block 2 is no candidate of the index");
+    }
+
+    /// Returns a mock chain of blocks 0 to 4 with a log of `address` in blocks 1 and 3, and the
+    /// hash of block 4.
+    fn chain_with_logs_of(address: Address) -> (MockEthProvider, B256) {
+        let provider = MockEthProvider::default();
+        let mut parent_hash = B256::ZERO;
+        for number in 0..=4u64 {
+            let logs = if number % 2 == 1 { vec![log_of(address)] } else { Vec::new() };
+            parent_hash = add_block_with_logs(&provider, number, parent_hash, &logs, logs.clone());
+        }
+        (provider, parent_hash)
+    }
+
+    #[tokio::test]
+    async fn the_bloom_path_counts_every_header_and_receipt_set() {
+        let address = Address::repeat_byte(7);
+        let (provider, _) = chain_with_logs_of(address);
+        let eth_filter = EthFilter::new(
+            build_test_eth_api(provider),
+            EthFilterConfig::default(),
+            Runtime::test(),
+        );
+        let mut stats = LogQueryStats::default();
+        eth_filter
+            .inner
+            .clone()
+            .get_logs_in_block_range_inner(
+                &Filter::new().address(address),
+                0,
+                4,
+                QueryLimits::default(),
+                &mut stats,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            stats.bloom,
+            PathStats {
+                windows: 1,
+                headers_read: 5,
+                receipt_sets_read: 2,
+                matching_blocks: 2,
+                logs: 2
+            }
+        );
+        assert_eq!(stats.index, PathStats::default());
+        assert_eq!(stats.fallbacks, 0);
+    }
+
+    #[tokio::test]
+    async fn the_index_path_counts_its_candidates() {
+        let address = Address::repeat_byte(7);
+        let (provider, parent_hash) = chain_with_logs_of(address);
+        // Block 5 finishes map 0, so the index covers blocks 0 to 4.
+        let filler = Log {
+            address: Address::repeat_byte(8),
+            data: LogData::new_unchecked(vec![B256::ZERO; 4], Bytes::new()),
+        };
+        add_block_with_logs(&provider, 5, parent_hash, &[], vec![filler; 13_200]);
+        let dir = tempfile::tempdir().unwrap();
+        let filter_maps = FilterMaps::open(dir.path(), FilterMapsConfig { history: 0 }).unwrap();
+        filter_maps.indexer(provider.clone()).index_to(5, 5).unwrap();
+        let eth_filter = EthFilter::new(
+            build_test_eth_api(provider),
+            EthFilterConfig::default(),
+            Runtime::test(),
+        );
+        eth_filter.set_filter_maps(filter_maps.reader());
+
+        let mut stats = LogQueryStats::default();
+        eth_filter
+            .inner
+            .clone()
+            .get_logs_in_block_range_inner(
+                &Filter::new().address(address),
+                0,
+                4,
+                QueryLimits::default(),
+                &mut stats,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            stats.index,
+            PathStats {
+                windows: 1,
+                headers_read: 2,
+                receipt_sets_read: 2,
+                matching_blocks: 2,
+                logs: 2
+            }
+        );
+        assert_eq!(stats.bloom, PathStats::default());
+        assert!(stats.match_duration.is_some());
+    }
+
+    /// Builds the chain of `logs_in_the_indexed_window_come_from_the_index` and indexes it into a
+    /// store at `path`: the index covers blocks 0 to 4, and block 2 gets matching logs after it
+    /// was indexed, so only the header bloom path reports it.
+    fn index_chain_with_a_late_receipt(address: Address, path: &Path) -> MockEthProvider {
+        let provider = MockEthProvider::default();
+        let mut parent_hash = B256::ZERO;
+        for number in 0..=4u64 {
+            let logs = if number % 2 == 1 { vec![log_of(address)] } else { Vec::new() };
+            let bloom_logs = if number == 2 { vec![log_of(address)] } else { logs.clone() };
+            parent_hash = add_block_with_logs(&provider, number, parent_hash, &bloom_logs, logs);
+        }
+        let filler = Log {
+            address: Address::repeat_byte(8),
+            data: LogData::new_unchecked(vec![B256::ZERO; 4], Bytes::new()),
+        };
+        add_block_with_logs(&provider, 5, parent_hash, &[], vec![filler; 13_200]);
+        let filter_maps = FilterMaps::open(path, FilterMapsConfig { history: 0 }).unwrap();
+        filter_maps.indexer(provider.clone()).index_to(5, 5).unwrap();
+        let late = Receipt { logs: vec![log_of(address)], success: true, ..Default::default() };
+        provider.add_receipts(2, vec![late]);
+        provider
+    }
+
+    /// The filter of [`build_test_eth_api`].
+    type TestEthFilter = EthFilter<
+        EthApi<
+            RpcNodeCoreAdapter<MockEthProvider, TestPool, NoopNetwork, EthEvmConfig>,
+            RpcConverter<Ethereum, EthEvmConfig, EthReceiptConverter<ChainSpec>>,
+        >,
+    >;
+
+    /// Runs an address query over blocks 0 to 4 and returns the blocks of its logs and its stats.
+    async fn query_blocks_0_to_4(
+        eth_filter: &TestEthFilter,
+        address: Address,
+    ) -> (Vec<u64>, LogQueryStats) {
+        let mut stats = LogQueryStats::default();
+        let logs = eth_filter
+            .inner
+            .clone()
+            .get_logs_in_block_range_inner(
+                &Filter::new().address(address),
+                0,
+                4,
+                QueryLimits::default(),
+                &mut stats,
+            )
+            .await
+            .unwrap();
+        (logs.iter().map(|log| log.block_number.unwrap()).collect(), stats)
+    }
+
+    #[tokio::test]
+    async fn a_failed_index_lookup_falls_back_to_the_header_bloom() {
+        let address = Address::repeat_byte(7);
+        let dir = tempfile::tempdir().unwrap();
+        let provider = index_chain_with_a_late_receipt(address, dir.path());
+        // The lookup reads the pointer of the block after the window first.
+        {
+            let db = rocksdb::DB::open_default(dir.path()).unwrap();
+            db.delete([&b"fm-p"[..], &5u64.to_be_bytes()].concat()).unwrap();
+        }
+        let filter_maps = FilterMaps::open(dir.path(), FilterMapsConfig { history: 0 }).unwrap();
+        let eth_filter = EthFilter::new(
+            build_test_eth_api(provider),
+            EthFilterConfig::default(),
+            Runtime::test(),
+        );
+        eth_filter.set_filter_maps(filter_maps.reader());
+        let indexed = eth_filter.filter_maps().unwrap().snapshot().unwrap().indexed_blocks();
+        assert_eq!(indexed, Some(0..=4));
+
+        let (blocks, stats) = query_blocks_0_to_4(&eth_filter, address).await;
+        assert_eq!(blocks, [1, 2, 3], "block 2 comes from the header bloom");
+        assert_eq!(stats.fallbacks, 1);
+        assert_eq!(
+            stats.bloom,
+            PathStats {
+                windows: 1,
+                headers_read: 5,
+                receipt_sets_read: 3,
+                matching_blocks: 3,
+                logs: 3
+            }
+        );
+        assert_eq!(stats.index, PathStats::default());
+    }
+
+    #[tokio::test]
+    async fn logs_below_the_receipt_floor_come_from_the_header_bloom() {
+        let address = Address::repeat_byte(7);
+        for segment in [PruneSegment::Receipts, PruneSegment::ContractLogs] {
+            let dir = tempfile::tempdir().unwrap();
+            let provider = index_chain_with_a_late_receipt(address, dir.path());
+            // The receipt floor is block 3.
+            provider.add_prune_checkpoint(segment, PruneCheckpoint::pruned_through(2));
+            let filter_maps =
+                FilterMaps::open(dir.path(), FilterMapsConfig { history: 0 }).unwrap();
+            let eth_filter = EthFilter::new(
+                build_test_eth_api(provider),
+                EthFilterConfig::default(),
+                Runtime::test(),
+            );
+            eth_filter.set_filter_maps(filter_maps.reader());
+
+            let (blocks, stats) = query_blocks_0_to_4(&eth_filter, address).await;
+            assert_eq!(blocks, [1, 2, 3], "{segment}");
+            assert_eq!(stats.bloom.headers_read, 3, "{segment}");
+            assert_eq!(stats.index.headers_read, 1, "{segment}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_floor_read_serves_the_query_from_the_header_bloom() {
+        let address = Address::repeat_byte(7);
+        let dir = tempfile::tempdir().unwrap();
+        let provider = index_chain_with_a_late_receipt(address, dir.path());
+        provider.set_prune_checkpoint_reads_fail(true);
+        let filter_maps = FilterMaps::open(dir.path(), FilterMapsConfig { history: 0 }).unwrap();
+        let eth_filter = EthFilter::new(
+            build_test_eth_api(provider),
+            EthFilterConfig::default(),
+            Runtime::test(),
+        );
+        eth_filter.set_filter_maps(filter_maps.reader());
+
+        let (blocks, stats) = query_blocks_0_to_4(&eth_filter, address).await;
+        assert_eq!(blocks, [1, 2, 3], "block 2 comes from the header bloom");
+        assert_eq!(stats.fallbacks, 1);
+        assert_eq!(stats.bloom.headers_read, 5);
+        assert_eq!(stats.index, PathStats::default());
+    }
+
+    #[tokio::test]
+    async fn filter_changes_come_from_the_index_in_the_indexed_window() {
+        let provider = MockEthProvider::default();
+        let address = Address::repeat_byte(7);
+        let mut parent_hash = add_block_with_logs(&provider, 0, B256::ZERO, &[], Vec::new());
+        let eth_filter = EthFilter::new(
+            build_test_eth_api(provider.clone()),
+            EthFilterConfig::default(),
+            Runtime::test(),
+        );
+        let id = eth_filter
+            .inner
+            .install_filter(FilterKind::Log(Box::new(Filter::new().address(address))))
+            .await
+            .unwrap();
+
+        for number in 1..=4u64 {
+            let logs = if number % 2 == 1 { vec![log_of(address)] } else { Vec::new() };
+            let bloom_logs = if number == 2 { vec![log_of(address)] } else { logs.clone() };
+            parent_hash = add_block_with_logs(&provider, number, parent_hash, &bloom_logs, logs);
+        }
+        let filler = Log {
+            address: Address::repeat_byte(8),
+            data: LogData::new_unchecked(vec![B256::ZERO; 4], Bytes::new()),
+        };
+        add_block_with_logs(&provider, 5, parent_hash, &[], vec![filler; 13_200]);
+        let dir = tempfile::tempdir().unwrap();
+        let filter_maps = FilterMaps::open(dir.path(), FilterMapsConfig { history: 0 }).unwrap();
+        filter_maps.indexer(provider.clone()).index_to(5, 5).unwrap();
+        let late = Receipt { logs: vec![log_of(address)], success: true, ..Default::default() };
+        provider.add_receipts(2, vec![late]);
+        eth_filter.set_filter_maps(filter_maps.reader());
+
+        let FilterChanges::Logs(logs) = eth_filter.filter_changes(id.clone()).await.unwrap() else {
+            panic!("a log filter returns logs")
+        };
+        let blocks = logs.iter().map(|log| log.block_number.unwrap()).collect::<Vec<_>>();
+        assert_eq!(blocks, [1, 3], "block 2 is no candidate of the index");
+        assert!(matches!(eth_filter.filter_changes(id).await.unwrap(), FilterChanges::Empty));
+    }
+
+    #[tokio::test]
+    async fn a_query_over_the_log_cap_keeps_its_stats() {
+        let address = Address::repeat_byte(7);
+        let (provider, _) = chain_with_logs_of(address);
+        let eth_filter = EthFilter::new(
+            build_test_eth_api(provider),
+            EthFilterConfig::default(),
+            Runtime::test(),
+        );
+        let mut stats = LogQueryStats::default();
+        let limits = QueryLimits { max_logs_per_response: Some(1), ..Default::default() };
+        let result = eth_filter
+            .inner
+            .clone()
+            .get_logs_in_block_range_inner(
+                &Filter::new().address(address),
+                0,
+                4,
+                limits,
+                &mut stats,
+            )
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(EthFilterError::QueryExceedsMaxResults {
+                    max_logs: 1,
+                    from_block: 0,
+                    to_block: 2
+                })
+            ),
+            "{result:?}"
+        );
+        assert_eq!(
+            stats.bloom,
+            PathStats {
+                windows: 1,
+                headers_read: 5,
+                receipt_sets_read: 2,
+                matching_blocks: 2,
+                logs: 2
+            }
+        );
     }
 
     #[tokio::test]

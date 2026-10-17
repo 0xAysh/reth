@@ -11,7 +11,7 @@ use crate::{
 };
 use alloy_eips::BlockNumHash;
 use alloy_primitives::B256;
-use rocksdb::{DBCompressionType, Options, SnapshotWithThreadMode, WriteBatch, DB};
+use rocksdb::{properties, DBCompressionType, Options, SnapshotWithThreadMode, WriteBatch, DB};
 use std::{ops::RangeInclusive, path::Path};
 
 /// The store format version. A store with another version is wiped at open.
@@ -47,9 +47,25 @@ impl Store {
         if let Some(record) = store.db.get(RANGE_KEY)? &&
             RangeRecord::decode(&record).is_none()
         {
+            tracing::error!(target: "filter_maps", path = %path.display(), "FilterMaps range record cannot be decoded or has another version, wiping the store");
             store.wipe()?;
         }
         Ok(store)
+    }
+
+    /// Opens the store at `path` for reading only. It takes no lock, so it works next to a running
+    /// node, and it never writes: a missing store is an error and a stale range record stays.
+    pub(crate) fn open_read_only(path: &Path) -> Result<Self, FilterMapsError> {
+        Ok(Self { db: DB::open_for_read_only(&Options::default(), path, false)? })
+    }
+
+    /// Returns the bytes of the live SST files plus the memtables.
+    pub(crate) fn size_bytes(&self) -> Result<u64, FilterMapsError> {
+        let mut size = 0;
+        for property in [properties::LIVE_SST_FILES_SIZE, properties::SIZE_ALL_MEM_TABLES] {
+            size += self.db.property_int_value(property)?.unwrap_or(0);
+        }
+        Ok(size)
     }
 
     /// Returns a consistent view of the store.
@@ -94,8 +110,10 @@ impl Store {
 
     /// Writes the finished maps of one map group and the extended range in one batch.
     ///
-    /// `maps` are consecutive and in one map group. They continue the stored maps or rewrite the
-    /// latest group from its start.
+    /// `maps` are consecutive, in one map group, and start at the group's first map in the range:
+    /// they continue the stored maps or rewrite the latest group from its start. Anything else is
+    /// refused as [`FilterMapsError::Corrupt`] before it writes: every row of the group is
+    /// rewritten, so a write that started after a stored map would erase that map's base rows.
     pub(crate) fn write_group(
         &self,
         range: &RangeRecord,
@@ -104,13 +122,16 @@ impl Store {
         let params = DEFAULT_PARAMS;
         let (Some(first), Some(last)) = (maps.first(), maps.last()) else { return Ok(*range) };
         let group = params.map_group_index(first.index);
-        debug_assert!(
-            maps.windows(2).all(|pair| pair[0].index + 1 == pair[1].index) &&
-                params.map_group_index(last.index) == group &&
-                first.index >= range.first_map &&
-                first.index <= range.after_last_map,
-            "maps continue the range within one group"
-        );
+        if !(maps.windows(2).all(|pair| pair[0].index + 1 == pair[1].index) &&
+            params.map_group_index(last.index) == group &&
+            first.index == group.max(range.first_map) &&
+            first.index <= range.after_last_map)
+        {
+            return Err(FilterMapsError::Corrupt(format!(
+                "maps {}..={} do not continue maps {}..{} within one group",
+                first.index, last.index, range.first_map, range.after_last_map
+            )))
+        }
 
         let mut batch = WriteBatch::default();
         // Every row of the group is rewritten from the buffer, so no stale base row survives a
@@ -167,13 +188,23 @@ impl Store {
     /// Drops epoch `epoch`, the first stored epoch, and returns the shortened range.
     ///
     /// The last block of the epoch's last map and that block's pointer stay: they are the resume
-    /// point of the next epoch's first map (Geth's `deleteTailEpoch`).
+    /// point of the next epoch's first map (Geth's `deleteTailEpoch`). Any other epoch, the epoch
+    /// of the index head included, is refused as [`FilterMapsError::Corrupt`].
     pub(crate) fn drop_epoch(
         &self,
         range: &RangeRecord,
         epoch: u32,
     ) -> Result<RangeRecord, FilterMapsError> {
         let params = DEFAULT_PARAMS;
+        if !(range.after_last_map > range.first_map &&
+            epoch == params.map_epoch(range.first_map) &&
+            epoch < params.map_epoch(range.after_last_map - 1))
+        {
+            return Err(FilterMapsError::Corrupt(format!(
+                "invalid tail epoch {epoch} for maps {}..{}",
+                range.first_map, range.after_last_map
+            )))
+        }
         let first_map = params.first_epoch_map(epoch);
         let last_map = params.last_epoch_map(epoch);
         let next_map = last_map + 1;
@@ -445,6 +476,24 @@ fn decode_columns(value: &[u8]) -> Result<Vec<u32>, FilterMapsError> {
 /// Encodes 3-byte little-endian columns (Geth's `WriteFilterMapExtRow`).
 fn encode_columns(columns: &[u32]) -> Vec<u8> {
     columns.iter().flat_map(|column| column.to_le_bytes().into_iter().take(COLUMN_BYTES)).collect()
+}
+
+#[cfg(test)]
+impl Store {
+    /// Overwrites the pointer of block `block`.
+    pub(crate) fn put_pointer(&self, block: u64, pointer: u64) {
+        self.db.put(pointer_key(block), pointer.to_be_bytes()).unwrap();
+    }
+
+    /// Deletes the pointer of block `block`.
+    pub(crate) fn delete_pointer(&self, block: u64) {
+        self.db.delete(pointer_key(block)).unwrap();
+    }
+
+    /// Deletes the last-block-of-map record of map `map`.
+    pub(crate) fn delete_last_block(&self, map: u32) {
+        self.db.delete(last_block_key(map)).unwrap();
+    }
 }
 
 #[cfg(test)]

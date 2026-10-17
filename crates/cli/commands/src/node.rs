@@ -305,6 +305,7 @@ mod tests {
                 "--prune.receiptslogfilter",
                 "0x0000000000000000000000000000000000000001:full",
             ],
+            vec!["reth", "--filter-maps", "--prune.receipts.full"],
         ] {
             let err = NodeCommand::<EthereumChainSpecParser>::try_parse_args_from(args.clone())
                 .unwrap_err();
