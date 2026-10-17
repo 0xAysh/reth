@@ -178,25 +178,87 @@ fn the_tail_drops_whole_epochs_behind_the_cutoff() {
     let maps = open(dir.path(), 0);
     start_at(&maps, 100, 1021 << 16);
     let mut indexer = maps.indexer(&provider);
-    indexer.sync_to(200, 0, 200).unwrap();
+    indexer.sync_to(200, 100, 200).unwrap();
     let before = range(&maps);
     assert!(before.after_last_map > 1025, "the index head is in epoch 1");
     let last_block = maps.store.snapshot().last_block_of_map(1023).unwrap().number;
 
     // The cutoff is finalized + 1 - history.
     indexer.config.history = 200 + 1 - last_block;
-    indexer.sync_to(200, 0, 200).unwrap();
+    indexer.sync_to(200, 100, 200).unwrap();
     assert_eq!(range(&maps), before, "the cutoff equals the last block of epoch 0");
 
     indexer.config.history -= 1;
-    indexer.sync_to(200, 0, 200).unwrap();
+    indexer.sync_to(200, 100, 200).unwrap();
     let after = range(&maps);
     assert_eq!((after.first_map, after.first_block), (1024, last_block + 1));
     assert_eq!(after.after_last_map, before.after_last_map);
 
     indexer.config.history = 1;
-    indexer.sync_to(200, 0, 200).unwrap();
+    indexer.sync_to(200, 100, 200).unwrap();
     assert_eq!(range(&maps).first_map, 1024, "the head epoch stays");
+}
+
+#[test]
+fn the_tail_cutoff_keeps_exactly_history_blocks() {
+    assert_eq!(tail_cutoff(2_350_000, 0, 26_150_000), 23_800_001);
+    assert_eq!(tail_cutoff(0, 0, 26_150_000), 0);
+    assert_eq!(tail_cutoff(2_350_000, 25_000_000, 26_150_000), 25_000_000);
+    assert_eq!(tail_cutoff(2_350_000, 0, 1_000_000), 0);
+}
+
+#[test]
+fn a_fresh_store_starts_at_the_tail_cutoff() {
+    let provider = chain(0..=120);
+    let dir = tempfile::tempdir().unwrap();
+    let maps = open(dir.path(), 50);
+    maps.indexer(&provider).sync_to(120, 0, 120).unwrap();
+    // 120 + 1 - 50.
+    let stored = range(&maps);
+    assert_eq!(stored.origin, BlockRef { number: 71, hash: block_hash(71), pointer: 0 });
+    assert_eq!(stored.first_map, 0);
+    assert_eq!(maps.reader().snapshot().indexed_blocks().map(|blocks| *blocks.start()), Some(71));
+
+    // The floor is above the cutoff.
+    let above_dir = tempfile::tempdir().unwrap();
+    let above = open(above_dir.path(), 50);
+    above.indexer(&provider).sync_to(120, 90, 120).unwrap();
+    assert_eq!(range(&above).origin.number, 90);
+}
+
+#[test]
+fn raising_the_history_indexes_the_store_again() {
+    let provider = chain(0..=120);
+    let dir = tempfile::tempdir().unwrap();
+    let maps = open(dir.path(), 50);
+    let mut indexer = maps.indexer(&provider);
+    indexer.sync_to(120, 0, 120).unwrap();
+    assert_eq!(range(&maps).origin.number, 71);
+
+    // A store counted from its origin cannot grow backwards, so it starts over.
+    indexer.config.history = 0;
+    indexer.state = None;
+    indexer.sync_to(120, 0, 120).unwrap();
+    assert_eq!(range(&maps).origin, BlockRef { number: 0, hash: block_hash(0), pointer: 0 });
+
+    let fresh_dir = tempfile::tempdir().unwrap();
+    let fresh = open(fresh_dir.path(), 0);
+    fresh.indexer(&provider).sync_to(120, 0, 120).unwrap();
+    assert_same_index(&maps, &fresh);
+}
+
+#[test]
+fn a_store_below_the_tail_cutoff_keeps_its_origin() {
+    let provider = chain(0..=120);
+    let dir = tempfile::tempdir().unwrap();
+    let maps = open(dir.path(), 0);
+    let mut indexer = maps.indexer(&provider);
+    indexer.sync_to(60, 0, 60).unwrap();
+
+    indexer.config.history = 100;
+    indexer.state = None;
+    indexer.sync_to(120, 0, 120).unwrap();
+    assert_eq!(range(&maps).origin.number, 0);
 }
 
 #[test]

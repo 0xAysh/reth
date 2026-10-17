@@ -180,7 +180,7 @@ pub enum FilterMapsError {
 /// higher only after pruning with a receipts log filter. `eth_capabilities` applies the same rule
 /// (`effective_resource` in `reth-rpc-eth-api`, which this crate must not depend on).
 ///
-/// The indexer starts a fresh store here, and `eth_getLogs` answers from the index only from here
+/// A fresh store never starts below it, and `eth_getLogs` answers from the index only from here
 /// on, since the receipts of a candidate block are what it serves.
 pub fn receipt_floor(provider: &impl PruneCheckpointReader) -> ProviderResult<u64> {
     let mut floor = 0;

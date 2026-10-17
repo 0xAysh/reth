@@ -219,7 +219,7 @@ where
             self.store.wipe()?;
         }
         if self.state.is_none() {
-            self.state = self.start(target, floor)?;
+            self.state = self.start(target, floor, finalized)?;
             // A restart may have nothing to write for a while, so report the checked range now.
             self.metrics.record(self.state.as_ref().map(|state| &state.range));
         }
@@ -266,8 +266,19 @@ where
     }
 
     /// Checks the store against the chain and returns where rendering resumes, or `None` while
-    /// the floor is above the target.
-    fn start(&self, target: u64, floor: u64) -> Result<Option<RenderState>, FilterMapsError> {
+    /// the tail cutoff is above the target.
+    ///
+    /// A fresh store starts at the tail cutoff, the first block the window keeps. A stored range
+    /// starts over when its origin is above the cutoff, since a store counted from its origin
+    /// cannot grow backwards, or when the last block of its last map is below the cutoff, since
+    /// every rendered block would only be dropped.
+    fn start(
+        &self,
+        target: u64,
+        floor: u64,
+        finalized: u64,
+    ) -> Result<Option<RenderState>, FilterMapsError> {
+        let cutoff = tail_cutoff(self.config.history, floor, finalized);
         let snapshot = self.store.snapshot();
         let mut range = snapshot.range()?;
         if let Some(stored) = range.as_mut() {
@@ -281,23 +292,28 @@ where
                 }
             }
         }
-        if let Some(range) = range {
+        if let Some(range) = range &&
+            range.origin.number <= cutoff &&
+            range.after_last_block >= cutoff
+        {
             let state = RenderState::resume(&snapshot, range)?;
             if state.next_block >= floor {
                 return Ok(Some(state))
             }
         }
 
-        // The store is empty, every map was trimmed, or the receipts to resume are pruned.
-        if floor > target {
+        // The store is empty, every map was trimmed, the receipts to resume are pruned, or the
+        // stored range does not fit the window.
+        if cutoff > target {
             self.store.wipe()?;
             return Ok(None)
         }
+        // The cutoff is at most the finalized block, so its hash exists.
         let hash = self
             .provider
-            .block_hash(floor)?
-            .ok_or_else(|| ProviderError::HeaderNotFound(floor.into()))?;
-        let origin = BlockRef { number: floor, hash, pointer: 0 };
+            .block_hash(cutoff)?
+            .ok_or_else(|| ProviderError::HeaderNotFound(cutoff.into()))?;
+        let origin = BlockRef { number: cutoff, hash, pointer: 0 };
         let range = self.store.init(origin)?;
         Ok(Some(RenderState::new(range, origin, 0)))
     }
@@ -370,11 +386,7 @@ where
     /// the index head.
     fn drop_tail(&mut self, floor: u64, finalized: u64) -> Result<(), FilterMapsError> {
         let Some(state) = self.state.as_mut() else { return Ok(()) };
-        let cutoff = if self.config.history == 0 {
-            floor
-        } else {
-            floor.max((finalized + 1).saturating_sub(self.config.history))
-        };
+        let cutoff = tail_cutoff(self.config.history, floor, finalized);
         let params = DEFAULT_PARAMS;
         while state.range.after_last_map > state.range.first_map {
             let epoch = params.map_epoch(state.range.first_map);
@@ -497,6 +509,16 @@ fn write_group(
     metrics.record(Some(&written));
     *range = written;
     Ok(())
+}
+
+/// Returns the tail cutoff: the first block the index keeps. It keeps exactly `history` blocks up
+/// to `finalized`, never below the receipt floor, and every block from the floor with history 0.
+fn tail_cutoff(history: u64, floor: u64, finalized: u64) -> u64 {
+    if history == 0 {
+        floor
+    } else {
+        floor.max((finalized + 1).saturating_sub(history))
+    }
 }
 
 /// Returns the delay before the next retry: [`MIN_BACKOFF`] after a success, then doubling up to

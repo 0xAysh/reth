@@ -108,9 +108,9 @@ async fn filter_maps_resumes_after_restart() -> eyre::Result<()> {
     Ok(())
 }
 
-/// On a node that prunes receipts, the index starts at the receipt floor: the store resets when
-/// the floor passes its next block. Queries above the floor give the same logs, and a query below
-/// it fails as before.
+/// On a node that prunes receipts, the index starts at the receipt floor, which is the tail cutoff
+/// on a chain shorter than the history: the store resets when the floor passes its next block.
+/// Queries above the floor give the same logs, and a query below it fails as before.
 #[tokio::test]
 async fn filter_maps_pruned_node_starts_at_receipt_floor() -> eyre::Result<()> {
     reth_tracing::init_test_tracing();
