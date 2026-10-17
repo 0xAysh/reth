@@ -25,7 +25,11 @@
 use reth_prune_types::PruneSegment;
 use reth_storage_api::PruneCheckpointReader;
 use reth_storage_errors::provider::{ProviderError, ProviderResult};
-use std::{ops::RangeInclusive, path::Path, sync::Arc};
+use std::{
+    ops::{Range, RangeInclusive},
+    path::Path,
+    sync::Arc,
+};
 use store::{RangeRecord, Store, StoreSnapshot};
 
 mod indexer;
@@ -68,6 +72,26 @@ impl FilterMaps {
     pub fn indexer<P>(&self, provider: P) -> Indexer<P> {
         Indexer::new(Arc::clone(&self.store), self.config, provider)
     }
+
+    /// Reads the stats of the store at `path` without writing to it, also next to a running node.
+    ///
+    /// Returns `None` when no store exists at `path`, and fails when `RocksDB` cannot open or read
+    /// it. Unlike [`open`](Self::open), it neither creates the directory nor wipes a range record
+    /// it cannot decode.
+    pub fn stats(path: &Path) -> Result<Option<FilterMapsStats>, FilterMapsError> {
+        // RocksDB writes `CURRENT` when it creates a database.
+        if !path.join("CURRENT").exists() {
+            return Ok(None)
+        }
+        let store = Store::open_read_only(path)?;
+        let range = store.snapshot().range()?;
+        Ok(Some(FilterMapsStats {
+            size_bytes: store.size_bytes()?,
+            origin: range.map(|range| range.origin.number),
+            maps: range.map_or(0..0, |range| range.first_map..range.after_last_map),
+            indexed_blocks: range.as_ref().and_then(RangeRecord::indexed_blocks),
+        }))
+    }
 }
 
 /// `FilterMaps` configuration.
@@ -76,6 +100,22 @@ pub struct FilterMapsConfig {
     /// The number of blocks up to the finalized block to keep indexed. 0 keeps every block that
     /// has receipts.
     pub history: u64,
+}
+
+/// What a `FilterMaps` store holds, read by [`FilterMaps::stats`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilterMapsStats {
+    /// The bytes of the live SST files plus the memtables. The memtables hold the replayed
+    /// write-ahead log, so a store that was never flushed is not 0.
+    pub size_bytes: u64,
+    /// The index origin block, or `None` for an empty store or a range record that does not
+    /// decode, which the next start with `--filter-maps` wipes.
+    pub origin: Option<u64>,
+    /// The stored maps, empty when `origin` is `None`.
+    pub maps: Range<u32>,
+    /// The blocks whose log values are all in stored maps, or `None` when the stored maps cover
+    /// no block completely.
+    pub indexed_blocks: Option<RangeInclusive<u64>>,
 }
 
 /// A cheap, cloneable reader of the `FilterMaps` store.

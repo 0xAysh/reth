@@ -765,3 +765,22 @@ fn a_tail_drop_leaves_the_progress_line_alone() {
     assert_eq!((indexer.progress_logged, indexer.blocks_since_progress), progress);
     assert!(indexer.tail_drop_logged.is_some());
 }
+
+#[test]
+fn store_stats_read_an_open_store_without_writing() {
+    let provider = chain(0..=60);
+    let dir = tempfile::tempdir().unwrap();
+    let maps = open(dir.path(), 0);
+    maps.indexer(&provider).index_to(60, 60).unwrap();
+
+    let stats = FilterMaps::stats(dir.path()).unwrap().expect("the store exists");
+    let range = range(&maps);
+    assert_eq!(stats.origin, Some(0));
+    assert_eq!(stats.maps, range.first_map..range.after_last_map);
+    assert_eq!(stats.indexed_blocks, maps.reader().snapshot().unwrap().indexed_blocks());
+    assert!(stats.size_bytes > 0);
+
+    let missing = dir.path().join("missing");
+    assert!(FilterMaps::stats(&missing).unwrap().is_none());
+    assert!(!missing.exists());
+}

@@ -11,7 +11,7 @@ use crate::{
 };
 use alloy_eips::BlockNumHash;
 use alloy_primitives::B256;
-use rocksdb::{DBCompressionType, Options, SnapshotWithThreadMode, WriteBatch, DB};
+use rocksdb::{properties, DBCompressionType, Options, SnapshotWithThreadMode, WriteBatch, DB};
 use std::{ops::RangeInclusive, path::Path};
 
 /// The store format version. A store with another version is wiped at open.
@@ -51,6 +51,21 @@ impl Store {
             store.wipe()?;
         }
         Ok(store)
+    }
+
+    /// Opens the store at `path` for reading only. It takes no lock, so it works next to a running
+    /// node, and it never writes: a missing store is an error and a stale range record stays.
+    pub(crate) fn open_read_only(path: &Path) -> Result<Self, FilterMapsError> {
+        Ok(Self { db: DB::open_for_read_only(&Options::default(), path, false)? })
+    }
+
+    /// Returns the bytes of the live SST files plus the memtables.
+    pub(crate) fn size_bytes(&self) -> Result<u64, FilterMapsError> {
+        let mut size = 0;
+        for property in [properties::LIVE_SST_FILES_SIZE, properties::SIZE_ALL_MEM_TABLES] {
+            size += self.db.property_int_value(property)?.unwrap_or(0);
+        }
+        Ok(size)
     }
 
     /// Returns a consistent view of the store.

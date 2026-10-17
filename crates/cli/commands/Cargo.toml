@@ -30,6 +30,7 @@ reth-era-utils.workspace = true
 reth-etl.workspace = true
 reth-evm.workspace = true
 reth-exex.workspace = true
+reth-filter-maps.workspace = true
 reth-fs-util.workspace = true
 reth-net-nat.workspace = true
 reth-network = { workspace = true, features = ["serde"] }

@@ -8120,6 +8120,7 @@ dependencies = [
  "reth-etl",
  "reth-evm",
  "reth-exex",
+ "reth-filter-maps",
  "reth-fs-util",
  "reth-net-nat",
  "reth-network",

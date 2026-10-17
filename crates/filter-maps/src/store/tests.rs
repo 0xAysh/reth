@@ -3,6 +3,7 @@ use crate::{
     matcher::{candidate_blocks, MatchPattern},
     slots::BlockPointer,
     test_utils::{block_hash, fixture_start, render_fixture, render_synthetic, take_finished_maps},
+    FilterMaps,
 };
 use alloy_primitives::{hex, Address};
 use reth_filter_maps_test_utils::manifest;
@@ -292,4 +293,19 @@ fn base_rows_round_trip_through_geth_encoding() {
         [vec![1, 2], vec![], vec![0xff_ffff], vec![]]
     );
     assert_eq!(encode_base_rows(&[&[], &[]]), None);
+}
+
+#[test]
+fn store_stats_leave_a_range_record_that_does_not_decode() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let store = Store::open(dir.path()).unwrap();
+        store.init(origin(100, 30 << 16)).unwrap();
+        store.db.put(RANGE_KEY, b"not a range").unwrap();
+    }
+
+    let stats = FilterMaps::stats(dir.path()).unwrap().expect("the store exists");
+    assert_eq!((stats.origin, stats.maps, stats.indexed_blocks), (None, 0..0, None));
+    let store = Store::open_read_only(dir.path()).unwrap();
+    assert_eq!(store.db.get(RANGE_KEY).unwrap().as_deref(), Some(&b"not a range"[..]));
 }
