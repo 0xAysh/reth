@@ -173,11 +173,12 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>> Command<C>
 
                 db_exec!(self.env, tool, N, AccessRights::RW, {
                     tool.drop(db_path, static_files_path, exex_wal_path)?;
+                    clear::clear_filter_maps(&data_dir.filter_maps())?;
                 });
             }
             Subcommands::Clear(command) => {
                 db_exec!(self.env, tool, N, AccessRights::RW, {
-                    command.execute(&tool)?;
+                    command.execute(&tool, &data_dir)?;
                 });
             }
             Subcommands::RepairTrie(command) => {
