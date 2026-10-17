@@ -149,6 +149,27 @@ fn a_restart_in_the_middle_of_a_group_resumes_the_same_index() {
     assert_same_index(&maps, &uninterrupted);
 }
 
+#[test]
+fn a_resume_pointer_after_the_map_boundary_is_corrupt() {
+    let provider = chain(0..=60);
+    let dir = tempfile::tempdir().unwrap();
+    let maps = open(dir.path(), 0);
+    start_at(&maps, 0, 30 << 16);
+    maps.indexer(&provider).sync_to(60, 0, 60).unwrap();
+    let stored = range(&maps);
+    // Resuming group 32 starts at the last block of map 31.
+    let block = maps.store.snapshot().last_block_of_map(31).unwrap().number;
+    let pointer = maps.store.snapshot().block_pointer(block).unwrap();
+
+    for corrupt in [(32 << 16) + 1, 33 << 16] {
+        maps.store.put_pointer(block, corrupt);
+        let resumed = RenderState::resume(&maps.store.snapshot(), stored);
+        assert!(matches!(resumed, Err(FilterMapsError::Corrupt(_))), "pointer {corrupt}");
+    }
+    maps.store.put_pointer(block, pointer);
+    assert!(RenderState::resume(&maps.store.snapshot(), stored).is_ok());
+}
+
 /// A manual unwind replaced the last block of the last map. Startup trims the maps that end in it
 /// and renders them again from the new block.
 #[test]

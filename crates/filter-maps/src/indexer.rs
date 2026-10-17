@@ -457,6 +457,14 @@ impl RenderState {
             hash: last_block.hash,
             pointer: snapshot.block_pointer(last_block.number)?,
         };
+        // The last block of the previous map starts at most at this map's first slot (Geth's
+        // `lvIndex > targetLvPtr` check). A later start would skip slots of the map.
+        if start.pointer > u64::from(map) * DEFAULT_PARAMS.values_per_map() {
+            return Err(FilterMapsError::Corrupt(format!(
+                "pointer {} of block {} is past the start of map {map}",
+                start.pointer, start.number
+            )))
+        }
         Ok(Self::new(range, start, map))
     }
 }

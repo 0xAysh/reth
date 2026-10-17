@@ -198,6 +198,57 @@ fn dropping_an_epoch_keeps_its_last_block_of_map() {
 }
 
 #[test]
+fn a_group_write_that_does_not_continue_the_range_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let origin = origin(100, 30 << 16);
+    let group = render_synthetic(origin, 31);
+    assert_eq!(indices(&group), [30, 31]);
+    let empty = store.init(origin).unwrap();
+    assert!(matches!(store.write_group(&empty, &group[1..]), Err(FilterMapsError::Corrupt(_))));
+
+    // Maps 1021 to 1024 span two groups.
+    let epoch_dir = tempfile::tempdir().unwrap();
+    let epoch_store = Store::open(epoch_dir.path()).unwrap();
+    let epoch_origin = BlockRef { number: 100, hash: block_hash(100), pointer: 1021 << 16 };
+    let two_groups = render_synthetic(epoch_origin, 1024);
+    assert_eq!(indices(&two_groups), [1021, 1022, 1023, 1024]);
+    let epoch_range = epoch_store.init(epoch_origin).unwrap();
+    assert!(matches!(
+        epoch_store.write_group(&epoch_range, &two_groups),
+        Err(FilterMapsError::Corrupt(_))
+    ));
+
+    // A write that starts after the group's first stored map would erase that map's base rows.
+    let range = store.write_group(&empty, &group).unwrap();
+    let snapshot = store.snapshot();
+    let rows = (0..DEFAULT_PARAMS.map_height())
+        .map(|row| read_rows(&snapshot, &[30], row))
+        .collect::<Vec<_>>();
+    drop(snapshot);
+    assert!(matches!(store.write_group(&range, &group[1..]), Err(FilterMapsError::Corrupt(_))));
+    let snapshot = store.snapshot();
+    for (row, expected) in rows.iter().enumerate() {
+        assert_eq!(&read_rows(&snapshot, &[30], row as u32), expected, "row {row}");
+    }
+    assert_eq!(snapshot.range().unwrap(), Some(range));
+}
+
+#[test]
+fn dropping_the_epoch_of_the_index_head_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let origin = origin(100, 1021 << 16);
+    let maps = render_synthetic(origin, 1023);
+    assert_eq!(indices(&maps), [1021, 1022, 1023]);
+    let range = store.init(origin).unwrap();
+    let range = store.write_group(&range, &maps).unwrap();
+
+    assert!(matches!(store.drop_epoch(&range, 0), Err(FilterMapsError::Corrupt(_))));
+    assert_eq!(store.snapshot().range().unwrap(), Some(range));
+}
+
+#[test]
 fn base_rows_round_trip_through_geth_encoding() {
     let rows: [&[u32]; 4] = [&[1, 2], &[], &[0xff_ffff], &[]];
     let encoded = encode_base_rows(&rows).unwrap();
