@@ -6,6 +6,7 @@ use crate::{
     FilterMaps,
 };
 use alloy_primitives::{hex, Address};
+use proptest::prelude::*;
 use reth_filter_maps_test_utils::manifest;
 use std::collections::HashMap;
 
@@ -308,4 +309,99 @@ fn store_stats_leave_a_range_record_that_does_not_decode() {
     assert_eq!((stats.origin, stats.maps, stats.indexed_blocks), (None, 0..0, None));
     let store = Store::open_read_only(dir.path()).unwrap();
     assert_eq!(store.db.get(RANGE_KEY).unwrap().as_deref(), Some(&b"not a range"[..]));
+}
+
+proptest! {
+    #[test]
+    fn columns_round_trip_below_the_map_width(
+        columns in prop::collection::vec(0..1u32 << 24, 0..=64),
+    ) {
+        let encoded = encode_columns(&columns);
+        prop_assert_eq!(encoded.len(), COLUMN_BYTES * columns.len());
+        prop_assert_eq!(decode_columns(&encoded).unwrap(), columns);
+    }
+
+    #[test]
+    fn every_base_row_group_round_trips_through_the_geth_encoding(rows in base_row_group()) {
+        let refs = rows.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let encoded = encode_base_rows(&refs);
+        let Some(last) = rows.iter().rposition(|row| !row.is_empty()) else {
+            prop_assert_eq!(encoded, None);
+            return Ok(())
+        };
+        let encoded = encoded.unwrap();
+        let total = rows.iter().map(Vec::len).sum::<usize>();
+        prop_assert_eq!(encoded.len(), (last + total).div_ceil(8) + COLUMN_BYTES * total);
+        prop_assert_eq!(decode_base_rows(&encoded, rows.len()).unwrap(), rows);
+    }
+
+    #[test]
+    fn range_records_round_trip(
+        range in range_record(),
+        fields in prop::collection::vec(any::<u8>(), RangeRecord::ENCODED_LEN - 4),
+    ) {
+        let mut encoded = range.encode();
+        prop_assert_eq!(encoded.len(), RangeRecord::ENCODED_LEN);
+        prop_assert_eq!(&encoded[..4], &VERSION.to_le_bytes()[..]);
+        prop_assert_eq!(RangeRecord::decode(&encoded), Some(range));
+        encoded.push(0);
+        prop_assert_eq!(RangeRecord::decode(&encoded), None);
+        encoded.truncate(RangeRecord::ENCODED_LEN - 1);
+        prop_assert_eq!(RangeRecord::decode(&encoded), None);
+
+        let bytes = [&VERSION.to_le_bytes()[..], &fields].concat();
+        let decoded = RangeRecord::decode(&bytes);
+        prop_assert!(decoded.is_some());
+        prop_assert_eq!(decoded.unwrap().encode(), bytes);
+    }
+
+    #[test]
+    fn decoders_never_panic_on_arbitrary_bytes(
+        bytes in prop::collection::vec(prop_oneof![Just(0u8), Just(0xff), any::<u8>()], 0..=512),
+        row_count in 0usize..=64,
+    ) {
+        prop_assert_eq!(decode_columns(&bytes).is_ok(), bytes.len() % COLUMN_BYTES == 0);
+
+        if let Ok(rows) = decode_base_rows(&bytes, row_count) {
+            prop_assert_eq!(rows.len(), row_count);
+            // Header bits past the last column are ignored, so only the rows must come back.
+            let refs = rows.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            let encoded = encode_base_rows(&refs).unwrap_or_default();
+            prop_assert_eq!(decode_base_rows(&encoded, row_count).unwrap(), rows);
+        }
+
+        if RangeRecord::decode(&bytes).is_some() {
+            prop_assert_eq!(bytes.len(), RangeRecord::ENCODED_LEN);
+            prop_assert_eq!(&bytes[..4], &VERSION.to_le_bytes()[..]);
+        }
+    }
+}
+
+/// The base rows of one row in a map group: one per map, mostly empty, as in a real group.
+fn base_row_group() -> impl Strategy<Value = Vec<Vec<u32>>> {
+    let row = prop_oneof![Just(Vec::new()), prop::collection::vec(0..1u32 << 24, 0..=8),];
+    prop::collection::vec(row, DEFAULT_PARAMS.base_row_group_size() as usize)
+}
+
+fn range_record() -> impl Strategy<Value = RangeRecord> {
+    (
+        any::<u64>(),
+        any::<[u8; 32]>(),
+        any::<u64>(),
+        any::<u64>(),
+        any::<u64>(),
+        any::<u32>(),
+        any::<u32>(),
+    )
+        .prop_map(
+            |(number, hash, pointer, first_block, after_last_block, first_map, after_last_map)| {
+                RangeRecord {
+                    origin: BlockRef { number, hash: B256::from(hash), pointer },
+                    first_block,
+                    after_last_block,
+                    first_map,
+                    after_last_map,
+                }
+            },
+        )
 }
