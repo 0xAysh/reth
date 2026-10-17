@@ -68,11 +68,11 @@ async fn filter_maps_matches_bloom_path() -> eyre::Result<()> {
 
     let queries = chain.queries(0);
     let bloom = run_queries(&node, &queries).await?;
-    assert_eq!(node.filter_maps_indexed_blocks(), None, "no map finishes in the genesis block");
+    assert_eq!(node.filter_maps_indexed_blocks()?, None, "no map finishes in the genesis block");
 
     node.finalize(node.block_hash(chain.head)).await?;
     node.wait_for_filter_maps_head(chain.heavy[4]).await?;
-    let indexed = node.filter_maps_indexed_blocks().unwrap();
+    let indexed = node.filter_maps_indexed_blocks()?.unwrap();
     assert!(indexed.contains(&chain.heavy[0]) && indexed.contains(&chain.heavy[4]));
     assert_eq!(run_queries(&node, &queries).await?, bloom);
     Ok(())
@@ -149,7 +149,7 @@ async fn filter_maps_pruned_node_starts_at_receipt_floor() -> eyre::Result<()> {
     node.finalize(node.block_hash(chain.head)).await?;
     node.wait_for_filter_maps_head(chain.heavy[0]).await?;
     // The store started at genesis, before anything was pruned, so it reset to start here.
-    let indexed = node.filter_maps_indexed_blocks().unwrap();
+    let indexed = node.filter_maps_indexed_blocks()?.unwrap();
     assert_eq!(*indexed.start(), floor);
     assert_eq!(run_queries(&node, &queries).await?, bloom);
     let error = node.rpc_provider().get_logs(&below_floor).await.unwrap_err();

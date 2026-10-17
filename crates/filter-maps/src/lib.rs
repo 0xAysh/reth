@@ -86,14 +86,13 @@ pub struct FilterMapsReader {
 
 impl FilterMapsReader {
     /// Returns a consistent view of the index. Take one per query.
-    pub fn snapshot(&self) -> ReaderSnapshot<'_> {
+    ///
+    /// Fails only when the store cannot be read. The caller then serves every block from the
+    /// header bloom, which is complete.
+    pub fn snapshot(&self) -> Result<ReaderSnapshot<'_>, FilterMapsError> {
         let snapshot = self.store.snapshot();
-        // A range that cannot be read leaves every block on the bloom path, which is complete.
-        let range = snapshot.range().unwrap_or_else(|error| {
-            tracing::warn!(target: "filter_maps", %error, "Failed to read the FilterMaps range");
-            None
-        });
-        ReaderSnapshot { snapshot, range }
+        let range = snapshot.range()?;
+        Ok(ReaderSnapshot { snapshot, range })
     }
 }
 

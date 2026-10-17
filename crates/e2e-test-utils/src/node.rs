@@ -933,17 +933,20 @@ where
     /// because the node runs without `--filter-maps` or the block is not finalized.
     pub async fn wait_for_filter_maps_head(&self, number: BlockNumber) -> eyre::Result<()> {
         poll_until(format!("FilterMaps to index block {number}"), move || async move {
-            let indexed = self.filter_maps_indexed_blocks();
+            let indexed = self.filter_maps_indexed_blocks()?;
             Ok(indexed.is_some_and(|blocks| *blocks.end() >= number).then_some(()))
         })
         .await
     }
 
     /// Returns the blocks the `FilterMaps` index of the node covers, or `None` if the node runs
-    /// without `--filter-maps` or the index covers no block yet.
-    pub fn filter_maps_indexed_blocks(&self) -> Option<RangeInclusive<BlockNumber>> {
-        let reader = self.rpc.inner.eth_handlers().filter.filter_maps()?;
-        reader.snapshot().indexed_blocks()
+    /// without `--filter-maps` or the index covers no block yet. Fails if the store cannot be
+    /// read.
+    pub fn filter_maps_indexed_blocks(&self) -> eyre::Result<Option<RangeInclusive<BlockNumber>>> {
+        let Some(reader) = self.rpc.inner.eth_handlers().filter.filter_maps() else {
+            return Ok(None)
+        };
+        Ok(reader.snapshot()?.indexed_blocks())
     }
 
     /// Returns the receipt floor of the node: the lowest block whose receipts it still holds,

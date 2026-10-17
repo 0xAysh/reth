@@ -21,6 +21,7 @@ use reth_storage_api::{BlockHashReader, PruneCheckpointReader, ReceiptProvider};
 use reth_storage_errors::provider::ProviderError;
 use std::{
     any::Any,
+    mem,
     ops::RangeInclusive,
     panic::{catch_unwind, AssertUnwindSafe},
     sync::Arc,
@@ -59,6 +60,8 @@ pub struct Indexer<P> {
     blocks_since_progress: u64,
     /// When the last tail drop line was logged.
     tail_drop_logged: Option<Instant>,
+    /// Whether this indexer has reset an inconsistent store.
+    reset: bool,
     metrics: IndexerMetrics,
 }
 
@@ -73,6 +76,7 @@ impl<P> Indexer<P> {
             progress_logged: None,
             blocks_since_progress: 0,
             tail_drop_logged: None,
+            reset: false,
             metrics: IndexerMetrics::default(),
         }
     }
@@ -238,7 +242,15 @@ where
             target,
             Instant::now(),
         );
-        self.drop_tail(floor, finalized)?;
+        match self.drop_tail(floor, finalized) {
+            // The next step starts a fresh store.
+            Err(FilterMapsError::Corrupt(reason)) if self.take_reset(&reason) => {
+                self.state = None;
+                self.store.wipe()?;
+                return Ok(false)
+            }
+            result => result?,
+        }
         Ok(last == target)
     }
 
@@ -277,13 +289,47 @@ where
     /// starts over when its origin is above the cutoff, since a store counted from its origin
     /// cannot grow backwards, or when the last block of its last map is below the cutoff, since
     /// every rendered block would only be dropped.
+    ///
+    /// A stored range that contradicts its own records resets the store once per indexer.
     fn start(
-        &self,
+        &mut self,
         target: u64,
         floor: u64,
         finalized: u64,
     ) -> Result<Option<RenderState>, FilterMapsError> {
         let cutoff = tail_cutoff(self.config.history, floor, finalized);
+        match self.resume_stored(target, floor, cutoff) {
+            Ok(Some(state)) => return Ok(Some(state)),
+            // The fresh start below wipes the store in the same batch as the new range.
+            Ok(None) => {}
+            Err(FilterMapsError::Corrupt(reason)) if self.take_reset(&reason) => {}
+            Err(error) => return Err(error),
+        }
+
+        // The store is empty, every map was trimmed, the receipts to resume are pruned, the
+        // stored range does not fit the window, or it is inconsistent.
+        if cutoff > target {
+            self.store.wipe()?;
+            return Ok(None)
+        }
+        // The cutoff is at most the finalized block, so its hash exists.
+        let hash = self
+            .provider
+            .block_hash(cutoff)?
+            .ok_or_else(|| ProviderError::HeaderNotFound(cutoff.into()))?;
+        let origin = BlockRef { number: cutoff, hash, pointer: 0 };
+        let range = self.store.init(origin)?;
+        Ok(Some(RenderState::new(range, origin, 0)))
+    }
+
+    /// Checks the stored range against the chain and returns where rendering resumes, or `None`
+    /// when the store must start fresh.
+    fn resume_stored(
+        &self,
+        target: u64,
+        floor: u64,
+        cutoff: u64,
+    ) -> Result<Option<RenderState>, FilterMapsError> {
         let snapshot = self.store.snapshot();
         let mut range = snapshot.range()?;
         if let Some(stored) = range.as_mut() {
@@ -314,21 +360,19 @@ where
                 warn!(target: "filter_maps", origin = range.origin.number, cutoff, "FilterMaps store is outside the history window, starting over");
             }
         }
+        Ok(None)
+    }
 
-        // The store is empty, every map was trimmed, the receipts to resume are pruned, or the
-        // stored range does not fit the window.
-        if cutoff > target {
-            self.store.wipe()?;
-            return Ok(None)
+    /// Takes the one reset of an inconsistent store that an indexer may make, as Geth resets
+    /// once and then disables. Returns `false` once it is taken: the error then goes to the
+    /// retry with backoff, without another wipe.
+    fn take_reset(&mut self, reason: &str) -> bool {
+        if mem::replace(&mut self.reset, true) {
+            return false
         }
-        // The cutoff is at most the finalized block, so its hash exists.
-        let hash = self
-            .provider
-            .block_hash(cutoff)?
-            .ok_or_else(|| ProviderError::HeaderNotFound(cutoff.into()))?;
-        let origin = BlockRef { number: cutoff, hash, pointer: 0 };
-        let range = self.store.init(origin)?;
-        Ok(Some(RenderState::new(range, origin, 0)))
+        error!(target: "filter_maps", %reason, "FilterMaps store is inconsistent, indexing again");
+        self.metrics.resets.increment(1);
+        true
     }
 
     /// Drops maps from the end of `range` while their last block is above `target` or not
@@ -502,6 +546,8 @@ struct IndexerMetrics {
     failures: Counter,
     /// 1 while the indexer task runs.
     running: Gauge,
+    /// The number of inconsistent stores wiped and indexed again.
+    resets: Counter,
 }
 
 impl IndexerMetrics {

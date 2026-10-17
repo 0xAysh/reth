@@ -112,7 +112,7 @@ fn catching_up_indexes_every_finished_map() {
     let range = range(&maps);
     assert_eq!((range.first_map, range.after_last_map), (0, last.index + 1));
     let reader = maps.reader();
-    let snapshot = reader.snapshot();
+    let snapshot = reader.snapshot().unwrap();
     assert_eq!(snapshot.indexed_blocks(), Some(0..=last.last_block.number - 1));
 
     // Every synthetic block has logs from address 3. Blocks past the index head are candidates
@@ -168,6 +168,69 @@ fn a_resume_pointer_after_the_map_boundary_is_corrupt() {
     }
     maps.store.put_pointer(block, pointer);
     assert!(RenderState::resume(&maps.store.snapshot(), stored).is_ok());
+}
+
+/// A range record that decodes while a record it names is missing resets the store once.
+#[test]
+fn an_inconsistent_store_is_wiped_and_indexed_again() {
+    let provider = chain(0..=120);
+    let fresh_dir = tempfile::tempdir().unwrap();
+    let fresh = open(fresh_dir.path(), 0);
+    fresh.indexer(&provider).sync_to(120, 0, 120).unwrap();
+
+    // A last-block-of-map record is missing.
+    let name_a_missing_map = |maps: &FilterMaps| {
+        let stored = range(maps);
+        maps.store
+            .set_range(&RangeRecord { after_last_map: stored.after_last_map + 1, ..stored })
+            .unwrap();
+    };
+    // The pointer of the resume block is missing.
+    let delete_the_resume_pointer = |maps: &FilterMaps| {
+        let block = maps.store.snapshot().last_block_of_map(31).unwrap().number;
+        maps.store.delete_pointer(block);
+    };
+    let damages: [&dyn Fn(&FilterMaps); 2] = [&name_a_missing_map, &delete_the_resume_pointer];
+    for damage in damages {
+        let dir = tempfile::tempdir().unwrap();
+        let maps = open(dir.path(), 0);
+        start_at(&maps, 0, 30 << 16);
+        maps.indexer(&provider).sync_to(60, 0, 60).unwrap();
+        damage(&maps);
+
+        let mut indexer = maps.indexer(&provider);
+        indexer.sync_to(120, 0, 120).unwrap();
+        assert_same_index(&maps, &fresh);
+
+        // One reset per indexer: Geth resets, then disables.
+        indexer.state = None;
+        name_a_missing_map(&maps);
+        assert!(matches!(indexer.sync_to(120, 0, 120), Err(FilterMapsError::Corrupt(_))));
+    }
+}
+
+/// The tail drop reads the last block of an epoch's last map, which a start never reads.
+#[test]
+fn a_tail_drop_of_an_inconsistent_store_wipes_it_once() {
+    let provider = chain(100..=200);
+    let dir = tempfile::tempdir().unwrap();
+    let maps = open(dir.path(), 0);
+    start_at(&maps, 100, 1021 << 16);
+    let mut indexer = maps.indexer(&provider);
+    indexer.sync_to(200, 100, 200).unwrap();
+    let last_block = maps.store.snapshot().last_block_of_map(1023).unwrap().number;
+    maps.store.delete_last_block(1023);
+
+    // Epoch 0 is behind the cutoff now.
+    indexer.config.history = 200 - last_block;
+    assert!(!indexer.sync(200, 100, 200, u64::MAX).unwrap(), "the reset leaves the index behind");
+    assert_eq!(maps.store.snapshot().range().unwrap(), None);
+    indexer.sync_to(200, 100, 200).unwrap();
+
+    let fresh_dir = tempfile::tempdir().unwrap();
+    let fresh = open(fresh_dir.path(), 200 - last_block);
+    fresh.indexer(&provider).sync_to(200, 100, 200).unwrap();
+    assert_same_index(&maps, &fresh);
 }
 
 /// A manual unwind replaced the last block of the last map. Startup trims the maps that end in it
@@ -238,7 +301,10 @@ fn a_fresh_store_starts_at_the_tail_cutoff() {
     let stored = range(&maps);
     assert_eq!(stored.origin, BlockRef { number: 71, hash: block_hash(71), pointer: 0 });
     assert_eq!(stored.first_map, 0);
-    assert_eq!(maps.reader().snapshot().indexed_blocks().map(|blocks| *blocks.start()), Some(71));
+    assert_eq!(
+        maps.reader().snapshot().unwrap().indexed_blocks().map(|blocks| *blocks.start()),
+        Some(71)
+    );
 
     // The floor is above the cutoff.
     let above_dir = tempfile::tempdir().unwrap();
@@ -294,7 +360,10 @@ fn a_floor_above_the_next_block_starts_a_new_origin() {
     let range = range(&maps);
     assert_eq!(range.origin, BlockRef { number: 75, hash: block_hash(75), pointer: 0 });
     assert_eq!(range.first_map, 0);
-    assert_eq!(maps.reader().snapshot().indexed_blocks().map(|blocks| *blocks.start()), Some(75));
+    assert_eq!(
+        maps.reader().snapshot().unwrap().indexed_blocks().map(|blocks| *blocks.start()),
+        Some(75)
+    );
 }
 
 #[test]
@@ -333,7 +402,7 @@ fn missing_receipts_are_retried_until_the_floor_passes_them() {
             indexer.step_or_retry(|indexer| indexer.sync(90, 0, 90, STEP)),
             Next::Retry(Duration::from_secs(delay))
         );
-        assert_eq!(maps.reader().snapshot().indexed_blocks(), None);
+        assert_eq!(maps.reader().snapshot().unwrap().indexed_blocks(), None);
     }
 
     assert_eq!(indexer.step_or_retry(|indexer| indexer.sync(90, 70, 90, STEP)), Next::Wait);
@@ -466,7 +535,7 @@ fn a_restarted_indexer_reports_its_range_before_it_writes() {
         metric_values(snapshotter);
         maps.indexer(&provider).index_to(target, target).unwrap();
     });
-    let indexed = maps.reader().snapshot().indexed_blocks().unwrap();
+    let indexed = maps.reader().snapshot().unwrap().indexed_blocks().unwrap();
     assert_eq!(metrics["filter_maps.first_indexed_block"], gauge(*indexed.start()));
     assert_eq!(metrics["filter_maps.last_indexed_block"], gauge(*indexed.end()));
     assert_eq!(metrics["filter_maps.maps_written"], DebugValue::Counter(0));

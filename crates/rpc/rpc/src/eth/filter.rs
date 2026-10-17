@@ -15,7 +15,7 @@ use futures::{
 };
 use itertools::Itertools;
 use jsonrpsee::{core::RpcResult, server::IdProvider};
-use reth_errors::{ProviderError, ProviderResult};
+use reth_errors::ProviderError;
 use reth_filter_maps::{receipt_floor, FilterMapsReader, MatchPattern, TopicSelection};
 use reth_metrics::{
     metrics,
@@ -52,7 +52,7 @@ use tokio::{
     sync::{mpsc::Receiver, oneshot, Mutex},
     time::MissedTickBehavior,
 };
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, trace};
 
 impl<Eth> EngineEthFilter<RpcLog<Eth::NetworkTypes>> for EthFilter<Eth>
 where
@@ -158,6 +158,7 @@ where
             stale_filter_ttl,
             query_limits: QueryLimits { max_blocks_per_filter, max_logs_per_response },
             filter_maps: OnceLock::new(),
+            index_warnings: WarningLimiter::default(),
             index_metrics: LogPathMetrics::new_with_labels(&[("path", "index")]),
             bloom_metrics: LogPathMetrics::new_with_labels(&[("path", "bloom")]),
             log_query_metrics: LogQueryMetrics::default(),
@@ -486,6 +487,8 @@ struct EthFilterInner<Eth: EthApiTypes> {
     stale_filter_ttl: Duration,
     /// The `FilterMaps` index, once the node opened it. Until then, queries use the header bloom.
     filter_maps: OnceLock<FilterMapsReader>,
+    /// Limits the warnings of index reads that fall back on the header bloom.
+    index_warnings: WarningLimiter,
     /// What `eth_getLogs` read in the windows the index served.
     index_metrics: LogPathMetrics,
     /// What `eth_getLogs` read in the windows the header bloom served.
@@ -777,14 +780,35 @@ where
         // In the blocks that FilterMaps indexes, the index names the candidate blocks. Everywhere
         // else, and for a filter without an address or topic, the header bloom does. One snapshot
         // serves the whole query, so every window sees the same index.
-        let index = self.filter_maps.get().and_then(|reader| {
-            let pattern = match_pattern(filter);
-            pattern.has_searchable_values().then(|| (reader.snapshot(), pattern))
-        });
+        let index = self
+            .filter_maps
+            .get()
+            .map(|reader| (reader, match_pattern(filter)))
+            .filter(|(_, pattern)| pattern.has_searchable_values())
+            .and_then(|(reader, pattern)| match reader.snapshot() {
+                Ok(snapshot) => Some((snapshot, pattern)),
+                // A range that cannot be read loses no log: the header bloom is complete.
+                Err(error) => {
+                    stats.fallbacks += 1;
+                    if let Some(suppressed) = self.index_warnings.allow(Instant::now()) {
+                        error!(target: "rpc::eth::filter", %error, suppressed, "Failed to read the FilterMaps range, using the header bloom");
+                    }
+                    None
+                }
+            });
         let indexed = match &index {
-            Some((snapshot, _)) => {
-                indexed_window(snapshot.indexed_blocks(), receipt_floor(self.provider()), stats)
-            }
+            Some((snapshot, _)) => match receipt_floor(self.provider()) {
+                Ok(receipt_floor) => indexed_window(snapshot.indexed_blocks(), receipt_floor),
+                // A floor that cannot be read leaves every block on the header bloom, which is
+                // complete.
+                Err(error) => {
+                    stats.fallbacks += 1;
+                    if let Some(suppressed) = self.index_warnings.allow(Instant::now()) {
+                        error!(target: "rpc::eth::filter", %error, suppressed, "Failed to read the receipt floor, using the header bloom");
+                    }
+                    None
+                }
+            },
             None => None,
         };
 
@@ -805,8 +829,10 @@ where
                         Ok(candidates) => Some(candidates),
                         // A failed lookup loses no log: the header bloom is complete.
                         Err(error) => {
-                            warn!(target: "rpc::eth::filter", %error, from = window.from, to = window.to, "FilterMaps lookup failed, using the header bloom");
                             stats.fallbacks += 1;
+                            if let Some(suppressed) = self.index_warnings.allow(Instant::now()) {
+                                error!(target: "rpc::eth::filter", %error, from = window.from, to = window.to, suppressed, "FilterMaps lookup failed, using the header bloom");
+                            }
                             None
                         }
                     }
@@ -1116,23 +1142,11 @@ fn match_pattern(filter: &Filter) -> MatchPattern {
 }
 
 /// Returns the indexed blocks whose receipts the node still holds.
-///
-/// A floor that cannot be read leaves every block on the header bloom, which is complete, and
-/// counts as a fallback in `stats`.
 fn indexed_window(
     indexed: Option<RangeInclusive<u64>>,
-    receipt_floor: ProviderResult<u64>,
-    stats: &mut LogQueryStats,
+    receipt_floor: u64,
 ) -> Option<RangeInclusive<u64>> {
     let (first, last) = indexed?.into_inner();
-    let receipt_floor = match receipt_floor {
-        Ok(receipt_floor) => receipt_floor,
-        Err(error) => {
-            warn!(target: "rpc::eth::filter", %error, "Failed to read the receipt floor, using the header bloom");
-            stats.fallbacks += 1;
-            return None
-        }
-    };
     let first = first.max(receipt_floor);
     (first <= last).then_some(first..=last)
 }
@@ -1202,6 +1216,31 @@ struct LogQueryMetrics {
     fallbacks_total: Counter,
     /// The time one query spent matching against the `FilterMaps` index, in seconds.
     match_duration_seconds: Histogram,
+}
+
+/// Allows one warning per [`WarningLimiter::INTERVAL`] across concurrent queries, so a persistent
+/// index error cannot flood the log.
+#[derive(Debug, Default)]
+struct WarningLimiter {
+    /// When the last warning was allowed, and how many were suppressed since.
+    state: parking_lot::Mutex<(Option<Instant>, u64)>,
+}
+
+impl WarningLimiter {
+    const INTERVAL: Duration = Duration::from_secs(60);
+
+    /// Returns the number of warnings suppressed since the last allowed one if a warning at `now`
+    /// is allowed, and `None` if it is suppressed.
+    fn allow(&self, now: Instant) -> Option<u64> {
+        let mut state = self.state.lock();
+        let (last, suppressed) = &mut *state;
+        if last.is_some_and(|last| now.saturating_duration_since(last) < Self::INTERVAL) {
+            *suppressed += 1;
+            return None
+        }
+        *last = Some(now);
+        Some(std::mem::take(suppressed))
+    }
 }
 
 /// A run of blocks that one header read serves.
@@ -1751,22 +1790,21 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_floor_read_leaves_every_block_on_the_header_bloom() {
-        let mut stats = LogQueryStats::default();
-        let floor = Err(ProviderError::UnsupportedProvider);
-        assert_eq!(indexed_window(Some(10..=20), floor, &mut stats), None);
-        assert_eq!(stats.fallbacks, 1);
-        assert_eq!(indexed_window(Some(10..=20), Ok(15), &mut stats), Some(15..=20));
-        assert_eq!(stats.fallbacks, 1);
+    fn index_lookup_warnings_are_limited_to_one_per_interval() {
+        let limiter = WarningLimiter::default();
+        let t0 = Instant::now();
+        assert_eq!(limiter.allow(t0), Some(0));
+        assert_eq!(limiter.allow(t0 + Duration::from_secs(1)), None);
+        assert_eq!(limiter.allow(t0 + Duration::from_secs(59)), None);
+        assert_eq!(limiter.allow(t0 + Duration::from_secs(60)), Some(2));
     }
 
     #[test]
     fn the_indexed_window_starts_at_the_receipt_floor() {
-        let stats = &mut LogQueryStats::default();
-        assert_eq!(indexed_window(Some(100..=500), Ok(0), stats), Some(100..=500));
-        assert_eq!(indexed_window(Some(100..=500), Ok(300), stats), Some(300..=500));
-        assert_eq!(indexed_window(Some(100..=500), Ok(501), stats), None);
-        assert_eq!(indexed_window(None, Ok(0), stats), None);
+        assert_eq!(indexed_window(Some(100..=500), 0), Some(100..=500));
+        assert_eq!(indexed_window(Some(100..=500), 300), Some(300..=500));
+        assert_eq!(indexed_window(Some(100..=500), 501), None);
+        assert_eq!(indexed_window(None, 0), None);
     }
 
     // Helper function to create a test EthApi instance
@@ -2647,7 +2685,7 @@ mod tests {
             Runtime::test(),
         );
         eth_filter.set_filter_maps(filter_maps.reader());
-        let indexed = eth_filter.filter_maps().unwrap().snapshot().indexed_blocks();
+        let indexed = eth_filter.filter_maps().unwrap().snapshot().unwrap().indexed_blocks();
         assert_eq!(indexed, Some(0..=4));
         let logs = eth_filter
             .inner

@@ -47,6 +47,7 @@ impl Store {
         if let Some(record) = store.db.get(RANGE_KEY)? &&
             RangeRecord::decode(&record).is_none()
         {
+            tracing::error!(target: "filter_maps", path = %path.display(), "FilterMaps range record cannot be decoded or has another version, wiping the store");
             store.wipe()?;
         }
         Ok(store)
@@ -467,6 +468,16 @@ impl Store {
     /// Overwrites the pointer of block `block`.
     pub(crate) fn put_pointer(&self, block: u64, pointer: u64) {
         self.db.put(pointer_key(block), pointer.to_be_bytes()).unwrap();
+    }
+
+    /// Deletes the pointer of block `block`.
+    pub(crate) fn delete_pointer(&self, block: u64) {
+        self.db.delete(pointer_key(block)).unwrap();
+    }
+
+    /// Deletes the last-block-of-map record of map `map`.
+    pub(crate) fn delete_last_block(&self, map: u32) {
+        self.db.delete(last_block_key(map)).unwrap();
     }
 }
 
