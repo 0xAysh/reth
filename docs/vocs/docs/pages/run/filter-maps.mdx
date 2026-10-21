@@ -62,6 +62,25 @@ would empty the store on many restarts, and the header bloom serves a window
 that short cheaply anyway. The index helps most on nodes that keep receipts for
 many blocks.
 
+## Block limit
+
+`--rpc.max-blocks-per-filter` (default 100,000) bounds the blocks that one
+`eth_getLogs` request scans on the header bloom. With `--filter-maps`, the
+blocks in the indexed window do not count toward it: the index serves them
+without a header scan. These blocks still count:
+
+- the blocks below the indexed window;
+- the blocks above the index head;
+- every block of a filter with no address and no topic;
+- every block while the index covers no block yet, or while the store or the
+  receipt floor cannot be read;
+- the blocks of a window whose index lookup fails, since they fall back to the
+  header bloom.
+
+For example, on a node that keeps receipts from genesis, `cast logs --address`
+from block 0 is still rejected, while the same query from the first indexed
+block is accepted. [`reth db stats`](/cli/reth/db/stats) shows the indexed blocks.
+
 ## The store
 
 The store is its own RocksDB database at `<datadir>/filter-maps`. It does not

@@ -81,6 +81,7 @@ pub struct EthConfig {
     /// Maximum number of blocks for `trace_filter` requests.
     pub max_trace_filter_blocks: u64,
     /// Maximum number of blocks that could be scanned per filter request in `eth_getLogs` calls.
+    /// Blocks that the `FilterMaps` index serves do not count.
     pub max_blocks_per_filter: u64,
     /// Maximum number of logs that can be returned in a single response in `eth_getLogs` calls.
     pub max_logs_per_response: usize,
@@ -269,7 +270,8 @@ impl EthConfig {
 /// Config for the filter
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EthFilterConfig {
-    /// Maximum number of blocks that a filter can scan for logs.
+    /// Maximum number of blocks that a filter can scan for logs. Blocks that the `FilterMaps`
+    /// index serves do not count.
     ///
     /// If `None` then no limit is enforced.
     pub max_blocks_per_filter: Option<u64>,

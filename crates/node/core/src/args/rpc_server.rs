@@ -630,7 +630,8 @@ pub struct RpcServerArgs {
     #[arg(long = "rpc.max-trace-filter-blocks", alias = "rpc-max-trace-filter-blocks", value_name = "COUNT", default_value_t = DefaultRpcServerArgs::get_global().rpc_max_trace_filter_blocks)]
     pub rpc_max_trace_filter_blocks: u64,
 
-    /// Maximum number of blocks that could be scanned per filter request. (0 = entire chain)
+    /// Maximum number of blocks that could be scanned per filter request. With --filter-maps,
+    /// blocks the index covers do not count. (0 = entire chain)
     #[arg(long = "rpc.max-blocks-per-filter", alias = "rpc-max-blocks-per-filter", value_name = "COUNT", default_value_t = DefaultRpcServerArgs::get_global().rpc_max_blocks_per_filter)]
     pub rpc_max_blocks_per_filter: ZeroAsNoneU64,
 

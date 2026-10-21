@@ -44,7 +44,8 @@ pub trait EthFilterApi<T: RpcObject, L: RpcObject> {
 /// Limits for logs queries
 #[derive(Default, Debug, Clone, Copy)]
 pub struct QueryLimits {
-    /// Maximum number of blocks that could be scanned per filter
+    /// Maximum number of blocks that could be scanned per filter. Blocks that the `FilterMaps`
+    /// index serves do not count.
     pub max_blocks_per_filter: Option<u64>,
     /// Maximum number of logs that can be returned in a response
     pub max_logs_per_response: Option<usize>,
