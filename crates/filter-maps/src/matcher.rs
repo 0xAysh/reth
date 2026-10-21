@@ -9,6 +9,12 @@ use crate::{address_value, slots::BlockPointer, topic_value, FilterMapsError, DE
 use alloy_primitives::{Address, B256};
 use std::ops::{Range, RangeInclusive};
 
+/// The fewest indices for which [`resolve_blocks`] reads every pointer of the window in one scan.
+/// A scan of a full window reads about 1,002 pointers in about 0.15 ms (an estimate), and a binary
+/// search costs about 28 µs, or 10 point reads, per candidate block, so break-even is about 5
+/// candidate blocks. A window has at least as many indices as candidate blocks.
+const POINTER_SCAN_MIN_INDICES: usize = 8;
+
 /// An Ethereum log filter, compiled to log values.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MatchPattern {
@@ -69,6 +75,10 @@ pub(crate) trait FilterMapMatchSource {
 
     /// Returns the block pointer of `block_number`.
     fn block_pointer(&self, block_number: u64) -> Result<u64, FilterMapsError>;
+
+    /// Returns the block pointer of every block in `blocks`, in block order. A block with no
+    /// pointer is corrupt.
+    fn block_pointers(&self, blocks: RangeInclusive<u64>) -> Result<Vec<u64>, FilterMapsError>;
 }
 
 /// Returns the candidate blocks for `pattern` in `blocks`, in ascending order.
@@ -299,6 +309,10 @@ impl ValueMatch {
 
 /// Resolves sorted indices to the blocks that hold them. `first` is the first block of the range
 /// and `after` the block after the range.
+///
+/// With few indices, each block is found by a binary search over the range's pointers. With
+/// [`POINTER_SCAN_MIN_INDICES`] or more, all pointers of the range are read in one scan and the
+/// indices walk them.
 fn resolve_blocks(
     source: &impl FilterMapMatchSource,
     indices: &[u64],
@@ -306,6 +320,37 @@ fn resolve_blocks(
     after: BlockPointer,
 ) -> Result<Vec<u64>, FilterMapsError> {
     let mut blocks = Vec::new();
+    if indices.len() >= POINTER_SCAN_MIN_INDICES {
+        // `first` and `after` come from the same source, so the scan starts and ends with them.
+        // Each pointer must be above the one before, as each probe of the binary search checks.
+        let pointers = source.block_pointers(first.block..=after.block)?;
+        if let Some(offset) = pointers.windows(2).position(|pair| pair[0] >= pair[1]) {
+            let block = first.block + offset as u64 + 1;
+            return Err(FilterMapsError::PointerOrder { block, pointer: pointers[offset + 1] })
+        }
+        let last = pointers.len() - 1;
+        // The block at `offset` from `first` holds the slots from its pointer to the next one's.
+        let mut offset = 0;
+        for &index in indices {
+            while offset + 1 < last && pointers[offset + 1] <= index {
+                offset += 1;
+            }
+            let slots = pointers[offset]..pointers[offset + 1];
+            let block = first.block + offset as u64;
+            if !slots.contains(&index) {
+                return Err(FilterMapsError::CandidateOutsideBlock {
+                    index,
+                    block,
+                    pointer: slots.start,
+                    next_pointer: slots.end,
+                })
+            }
+            if blocks.last() != Some(&block) {
+                blocks.push(block);
+            }
+        }
+        return Ok(blocks)
+    }
     // The slots of the last resolved block: from its pointer to the next block's pointer.
     let mut latest = None::<Range<u64>>;
     for &index in indices {

@@ -15,6 +15,10 @@ const TRANSFER: B256 = b256!("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a116
 /// A wallet address as a topic.
 const WALLET: B256 = b256!("0x000000000000000000000000d8da6bf26964af9d7eed9e03e53415d37aa96045");
 
+/// Indices in blocks 10 to 39 of `growing_blocks`: more than `POINTER_SCAN_MIN_INDICES`, so they
+/// resolve with a pointer scan.
+const BUSY_WINDOW_INDICES: [u64; 12] = [1, 9, 16, 36, 64, 100, 144, 225, 289, 400, 529, 784];
+
 /// Matches every fixture query over the maps the renderer produced and compares the potential
 /// indices and candidate blocks with Geth's.
 #[test]
@@ -291,4 +295,66 @@ fn unordered_block_pointers_are_errors() {
         candidate_blocks(&reversed, 10..=10, &pattern),
         Err(FilterMapsError::PointerOrder { block: 11, pointer: 5 })
     ));
+}
+
+#[test]
+fn a_busy_window_resolves_with_one_pointer_scan() {
+    let source = growing_blocks();
+    let blocks = resolve_in_window(&source, &BUSY_WINDOW_INDICES).unwrap();
+    assert_eq!(blocks, [11, 13, 14, 16, 18, 20, 22, 25, 27, 30, 33, 38]);
+    assert_eq!((source.pointer_scans.get(), source.pointer_reads.get()), (1, 0));
+}
+
+#[test]
+fn a_quiet_window_keeps_the_binary_search() {
+    let source = growing_blocks();
+    assert_eq!(resolve_in_window(&source, &[36, 529]).unwrap(), [16, 33]);
+    assert_eq!(source.pointer_scans.get(), 0);
+    assert!(source.pointer_reads.get() > 0);
+}
+
+/// Block 10 holds slot 0, block 11 slots 1 to 3, block 12 slots 4 to 8, block 14 slots 16 to 24,
+/// block 15 slots 25 to 35, block 32 slots 484 to 528, and block 39, the last before `after`,
+/// slots 841 to 899.
+#[test]
+fn the_scan_and_the_search_resolve_the_same_blocks() {
+    let source = growing_blocks();
+    let expected = [10, 11, 12, 14, 15, 32, 39];
+    assert_eq!(resolve_in_window(&source, &[0, 3, 4, 24, 25, 500, 841]).unwrap(), expected);
+    assert_eq!(source.pointer_scans.get(), 0);
+    assert_eq!(resolve_in_window(&source, &[0, 3, 4, 24, 25, 500, 841, 899]).unwrap(), expected);
+    assert_eq!(source.pointer_scans.get(), 1);
+}
+
+#[test]
+fn a_gap_in_the_pointers_is_corrupt() {
+    let mut source = growing_blocks();
+    source.pointers.remove(&20);
+    assert_eq!(
+        resolve_in_window(&source, &BUSY_WINDOW_INDICES).unwrap_err().to_string(),
+        "corrupt FilterMaps record: block 20 has no pointer"
+    );
+}
+
+#[test]
+fn an_unordered_pointer_in_a_busy_window_is_an_error() {
+    let mut source = growing_blocks();
+    source.pointers.insert(20, 81);
+    assert_eq!(
+        resolve_in_window(&source, &BUSY_WINDOW_INDICES).unwrap_err().to_string(),
+        "block pointer 81 of block 20 is out of order"
+    );
+}
+
+/// Returns the pointers of blocks 10 to 40, where block `10 + i` starts at slot `i * i`: blocks 10
+/// to 39 hold slots 0 to 899, each block more than the one before.
+fn growing_blocks() -> MemorySource {
+    MemorySource { pointers: (0..=30).map(|i| (10 + i, i * i)).collect(), ..Default::default() }
+}
+
+/// Resolves `indices` in blocks 10 to 39, with block 40 as the block after them.
+fn resolve_in_window(source: &MemorySource, indices: &[u64]) -> Result<Vec<u64>, FilterMapsError> {
+    let first = BlockPointer { block: 10, pointer: source.pointers[&10] };
+    let after = BlockPointer { block: 40, pointer: source.pointers[&40] };
+    resolve_blocks(source, indices, first, after)
 }

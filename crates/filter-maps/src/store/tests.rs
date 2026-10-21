@@ -64,6 +64,35 @@ fn a_written_group_reads_back_through_the_matcher_source() {
     assert_eq!(snapshot.last_block_of_map(31).unwrap(), BlockNumHash::new(last.number, last.hash));
 }
 
+/// A scan reads the pointers of the blocks of
+/// `a_written_group_reads_back_through_the_matcher_source` as point reads do, and a block with no
+/// pointer is corrupt.
+#[test]
+fn a_pointer_scan_reads_like_point_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let origin = origin(100, 30 << 16);
+    let group = render_synthetic(origin, 31);
+    let range = store.init(origin).unwrap();
+    store.write_group(&range, &group).unwrap();
+    let last = group[1].last_block.number;
+
+    let snapshot = store.snapshot();
+    let point_reads =
+        (100..=last).map(|block| snapshot.block_pointer(block).unwrap()).collect::<Vec<_>>();
+    assert_eq!(snapshot.block_pointers(100..=last).unwrap(), point_reads);
+    assert_eq!(
+        snapshot.block_pointers(100..=last + 1).unwrap_err().to_string(),
+        format!("corrupt FilterMaps record: block {} has no pointer", last + 1)
+    );
+
+    store.delete_pointer(105);
+    assert_eq!(
+        store.snapshot().block_pointers(100..=last).unwrap_err().to_string(),
+        "corrupt FilterMaps record: block 105 has no pointer"
+    );
+}
+
 /// The `epoch-boundary` fixture marks row 34163 of map 1023, the last map of epoch 0.
 #[test]
 fn row_keys_follow_the_geth_formula() {
