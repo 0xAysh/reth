@@ -1,13 +1,19 @@
 use super::*;
 use crate::test_utils::{render_fixture, take_finished_maps, MemorySource};
-use alloy_primitives::address;
+use alloy_primitives::{address, b256};
 use reth_filter_maps_test_utils::{
     manifest,
     parser::{QueryResult, TopicConstraint},
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 const ADDRESS: Address = address!("0x0000000000000000000000000000000000000001");
+
+/// The first topic of `Transfer(address,address,uint256)`, the densest value on mainnet.
+const TRANSFER: B256 = b256!("0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef");
+
+/// A wallet address as a topic.
+const WALLET: B256 = b256!("0x000000000000000000000000d8da6bf26964af9d7eed9e03e53415d37aa96045");
 
 /// Matches every fixture query over the maps the renderer produced and compares the potential
 /// indices and candidate blocks with Geth's.
@@ -61,7 +67,84 @@ fn rows_are_read_once_per_masked_map_run() {
     let pattern = MatchPattern::new([ADDRESS], []);
 
     potential_indices(&source, &pattern, 64 << 16, (96 << 16) - 1).unwrap();
-    assert_eq!(source.row_reads.get(), 2, "one read on layer 0 and one on layer 1");
+    assert_eq!(source.row_reads.borrow().len(), 2, "one read on layer 0 and one on layer 1");
+}
+
+/// Q2's shape: a rare address and `Transfer`. The address has no match in most maps, so
+/// `Transfer`'s layer-1 row is read only where the address may match. In map 80 the address's base
+/// row is full, so the map waits for the address's layer 1 instead of being dropped.
+#[test]
+fn a_dense_topic_is_read_only_in_maps_where_the_rare_address_may_match() {
+    let (address, transfer) = (address_value(ADDRESS), topic_value(TRANSFER));
+    assert_distinct_rows(&[(address, 0), (address, 1), (transfer, 0), (transfer, 1)]);
+    let (s, s2) = ((70 << 16) + 100, (80 << 16) + 200);
+    let mut source = dense_transfer_source();
+    set_row(&mut source, 70, 0, address, vec![DEFAULT_PARAMS.column_index(s, address)]);
+    set_row(&mut source, 70, 1, transfer, vec![DEFAULT_PARAMS.column_index(s + 1, transfer)]);
+    set_row(&mut source, 80, 0, address, vec![0; DEFAULT_PARAMS.base_row_length() as usize]);
+    set_row(&mut source, 80, 1, address, vec![DEFAULT_PARAMS.column_index(s2, address)]);
+    set_row(&mut source, 80, 1, transfer, vec![DEFAULT_PARAMS.column_index(s2 + 1, transfer)]);
+    let pattern = MatchPattern::new([ADDRESS], [TopicSelection::OneOf(vec![TRANSFER])]);
+
+    assert_eq!(potential_indices(&source, &pattern, 64 << 16, (96 << 16) - 1).unwrap(), [s, s2]);
+    assert_eq!(row_reads_of(&source, 1, transfer), [vec![70, 80]]);
+}
+
+/// Q9's shape: `Transfer` first, then a rare wallet in topic 2. The wallet has no match in most
+/// maps on layer 0, so `Transfer`'s layer-1 row is read only where the wallet may match.
+#[test]
+fn a_dense_topic0_is_read_only_in_maps_where_a_later_rare_topic_may_match() {
+    let (transfer, wallet) = (topic_value(TRANSFER), topic_value(WALLET));
+    assert_distinct_rows(&[(transfer, 0), (transfer, 1), (wallet, 0)]);
+    let s = (70 << 16) + 100;
+    let mut source = dense_transfer_source();
+    set_row(&mut source, 70, 1, transfer, vec![DEFAULT_PARAMS.column_index(s + 1, transfer)]);
+    set_row(&mut source, 70, 0, wallet, vec![DEFAULT_PARAMS.column_index(s + 3, wallet)]);
+    let pattern = MatchPattern::new(
+        [],
+        [
+            TopicSelection::OneOf(vec![TRANSFER]),
+            TopicSelection::Any,
+            TopicSelection::OneOf(vec![WALLET]),
+        ],
+    );
+
+    assert_eq!(potential_indices(&source, &pattern, 64 << 16, (96 << 16) - 1).unwrap(), [s]);
+    assert_eq!(row_reads_of(&source, 1, transfer), [vec![70]]);
+}
+
+/// Returns maps 64 to 95, one map group in epoch 0, where `Transfer`'s base row is full in every
+/// map, as a dense value's row is.
+fn dense_transfer_source() -> MemorySource {
+    let mut source = MemorySource::default();
+    let full = vec![0; DEFAULT_PARAMS.base_row_length() as usize];
+    for map in 64..96 {
+        set_row(&mut source, map, 0, topic_value(TRANSFER), full.clone());
+    }
+    source
+}
+
+/// Stores `columns` as the row of `value` on `layer` of `map`.
+fn set_row(source: &mut MemorySource, map: u32, layer: u32, value: B256, columns: Vec<u32>) {
+    let row = DEFAULT_PARAMS.row_index(map, layer, value);
+    source.maps.entry(map).or_default().insert(row, columns);
+}
+
+/// Asserts that no two of the `(value, layer)` rows share a row index in maps 64 to 95: the
+/// memory source keys rows by row index only, so such rows would read as each other.
+fn assert_distinct_rows(rows: &[(B256, u32)]) {
+    let indices = rows
+        .iter()
+        .map(|&(value, layer)| DEFAULT_PARAMS.row_index(64, layer, value))
+        .collect::<HashSet<_>>();
+    assert_eq!(indices.len(), rows.len());
+}
+
+/// Returns the maps of each read of `value`'s row on `layer` in maps 64 to 95.
+fn row_reads_of(source: &MemorySource, layer: u32, value: B256) -> Vec<Vec<u32>> {
+    let row = DEFAULT_PARAMS.row_index(64, layer, value);
+    let reads = source.row_reads.borrow();
+    reads.iter().filter(|(_, index)| *index == row).map(|(maps, _)| maps.clone()).collect()
 }
 
 #[test]
@@ -92,7 +175,7 @@ fn a_wildcard_pattern_makes_every_block_a_candidate_without_reads() {
     let source = MemorySource::default();
     let pattern = MatchPattern::new([], [TopicSelection::Any]);
     assert_eq!(candidate_blocks(&source, 10..=13, &pattern).unwrap(), [10, 11, 12, 13]);
-    assert_eq!(source.row_reads.get(), 0);
+    assert_eq!(source.row_reads.borrow().len(), 0);
 }
 
 /// Marks each `(index, value)` on map 0 the way the renderer does on an empty map.
@@ -178,7 +261,7 @@ fn full_rows_continue_on_the_next_layer() {
     let source = MemorySource { maps: [(0, rows)].into(), ..Default::default() };
     let pattern = MatchPattern::new([ADDRESS], []);
     assert_eq!(potential_indices(&source, &pattern, 0, 9).unwrap(), [3]);
-    assert_eq!(source.row_reads.get(), 2);
+    assert_eq!(source.row_reads.borrow().len(), 2);
 }
 
 #[test]

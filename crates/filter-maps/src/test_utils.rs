@@ -11,7 +11,7 @@ use crate::{
 use alloy_primitives::{Address, Bytes, Log, B256};
 use reth_filter_maps_test_utils::parser::{Block, Fixture, Origin};
 use std::{
-    cell::Cell,
+    cell::RefCell,
     collections::{BTreeMap, HashMap},
 };
 
@@ -22,8 +22,8 @@ pub(crate) struct MemorySource {
     pub(crate) maps: BTreeMap<u32, HashMap<u32, Vec<u32>>>,
     /// Block pointers by block number.
     pub(crate) pointers: BTreeMap<u64, u64>,
-    /// The number of `row_prefixes` calls.
-    pub(crate) row_reads: Cell<usize>,
+    /// The maps and the row index of each `row_prefixes` call, in call order.
+    pub(crate) row_reads: RefCell<Vec<(Vec<u32>, u32)>>,
 }
 
 impl MemorySource {
@@ -42,7 +42,7 @@ impl FilterMapMatchSource for MemorySource {
         row_index: u32,
         max_columns: u32,
     ) -> Result<Vec<Vec<u32>>, FilterMapsError> {
-        self.row_reads.set(self.row_reads.get() + 1);
+        self.row_reads.borrow_mut().push((map_indices.to_vec(), row_index));
         map_indices
             .iter()
             .map(|map| {
