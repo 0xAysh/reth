@@ -99,6 +99,18 @@ store's files and keeps the directory, so a symlink stays in place. The next
 start with `--filter-maps` indexes again from the tail cutoff. `reth db drop`
 empties the store too. Both need the database lock, so stop the node first.
 
+### Size and build time
+
+Measured on mainnet in October 2026, with the default `--filter-maps.history`
+of 2,350,000 blocks; other histories were not measured:
+
+- The window held 2,350,143 blocks in 114,931 maps, about 20.4 blocks per map.
+  The store took 27.57 GB (25.7 GiB): about 11.7 KB per block and 240 KB per
+  map.
+- The first build took 34 min 28 s, about 1,136 blocks or 55.6 maps per second,
+  on an AWS i7ie.2xlarge (8 vCPU, 64 GiB, local NVMe), with the node at the head
+  and no queries.
+
 ### After an unwind
 
 After `reth stage unwind`, or after restoring the database from an older copy,
