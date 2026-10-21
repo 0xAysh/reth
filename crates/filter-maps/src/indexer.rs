@@ -1,8 +1,10 @@
 //! The indexer: renders finalized blocks into the store and keeps the store's range in shape.
 //!
 //! It indexes up to min(finalized, persisted) and stores finished maps only, so stored maps never
-//! need a reorg revert. Startup trims maps that a manual unwind made non-canonical, as Geth's
-//! `checkRevertRange` does, and every pass drops epochs behind the tail cutoff.
+//! need a reorg revert. Persisted is the engine's last persisted block, or the Finish checkpoint
+//! before the engine's first save after a start. Startup trims maps that a manual unwind made
+//! non-canonical, as Geth's `checkRevertRange` does, and every pass drops epochs behind the tail
+//! cutoff.
 
 use crate::{
     matcher::{map_of, FilterMapMatchSource},
@@ -17,7 +19,10 @@ use reth_metrics::{
     metrics::{Counter, Gauge, Histogram},
     Metrics,
 };
-use reth_storage_api::{BlockHashReader, PruneCheckpointReader, ReceiptProvider};
+use reth_stages_types::StageId;
+use reth_storage_api::{
+    BlockHashReader, PruneCheckpointReader, ReceiptProvider, StageCheckpointReader,
+};
 use reth_storage_errors::provider::ProviderError;
 use std::{
     any::Any,
@@ -120,10 +125,12 @@ where
     P: ReceiptProvider
         + BlockHashReader
         + PruneCheckpointReader
+        + StageCheckpointReader
         + ForkChoiceSubscriptions<Header: BlockHeader>
         + PersistedBlockSubscriptions,
 {
-    /// Indexes up to min(finalized, persisted) whenever either moves.
+    /// Indexes up to min(finalized, persisted) whenever either moves. Persisted is the engine's
+    /// last persisted block, or the Finish checkpoint before the engine's first save after a start.
     ///
     /// It renders 1,000 blocks at a time and yields in between, so a shutdown does not wait for a
     /// long catch-up. A step that fails or panics is retried after a backoff that starts at one
@@ -139,8 +146,23 @@ where
             let finalized =
                 finalized_blocks.borrow_and_update().as_ref().map(|header| header.number());
             let persisted = persisted_blocks.borrow_and_update().map(|block| block.number);
-            if let (Some(finalized), Some(persisted)) = (finalized, persisted) {
+            if let Some(finalized) = finalized {
                 match self.step_or_retry(|indexer| {
+                    // The persisted watch stays empty until the engine's first save after a start,
+                    // and the Finish checkpoint is the last block on disk until then.
+                    let persisted = match persisted {
+                        Some(persisted) => persisted,
+                        None => {
+                            let Some(checkpoint) =
+                                indexer.provider.get_stage_checkpoint(StageId::Finish)?
+                            else {
+                                // No block is on disk yet: report caught up, so the indexer waits
+                                // for the chain to move.
+                                return Ok(true)
+                            };
+                            checkpoint.block_number
+                        }
+                    };
                     indexer.index_step(finalized.min(persisted), finalized)
                 }) {
                     Next::Wait => {}
@@ -534,7 +556,9 @@ struct IndexerMetrics {
     last_indexed_block: Gauge,
     /// The number of maps written to the store.
     maps_written: Counter,
-    /// The block the indexer indexes towards: min(finalized, persisted).
+    /// The block the indexer indexes towards: min(finalized, persisted), where persisted is the
+    /// engine's last persisted block, or the Finish checkpoint before the engine's first save
+    /// after a start.
     store_target: Gauge,
     /// The number of blocks rendered into maps.
     blocks_rendered: Counter,
