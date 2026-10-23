@@ -378,6 +378,11 @@ impl<D> ChainPath<D> {
     pub fn exex_wal(&self) -> PathBuf {
         self.data_dir().join("exex/wal")
     }
+
+    /// Returns the path to the `FilterMaps` store for this chain.
+    pub fn filter_maps(&self) -> PathBuf {
+        self.data_dir().join("filter-maps")
+    }
 }
 
 impl<D> AsRef<Path> for ChainPath<D> {

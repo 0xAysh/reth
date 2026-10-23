@@ -57,6 +57,7 @@ exclude_crates=(
   reth-bb # binary-only, uses tokio features unsupported on wasm
   reth-trie-dst # native workload: MDBX, threads, and provider test utilities
   reth-storage-rpc-provider
+  reth-filter-maps # rocksdb
   reth-invalid-block-hooks # reth-provider
   reth-libmdbx # mdbx
   reth-mdbx-sys # mdbx

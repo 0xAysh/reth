@@ -25,6 +25,7 @@ use jsonrpsee::RpcModule;
 use parking_lot::Mutex;
 use reth_chain_state::{CanonStateNotification, CanonStateSubscriptions};
 use reth_chainspec::{ChainSpecProvider, EthChainSpec, EthereumHardforks, Hardforks};
+use reth_filter_maps::{FilterMaps, FilterMapsConfig};
 use reth_node_api::{
     AddOnsContext, BlockTy, EngineApiValidator, EngineTypes, FullNodeComponents, FullNodeTypes,
     NodeAddOns, NodeTypes, PayloadTypes, PayloadValidator, PrimitivesTy, TreeConfig,
@@ -36,6 +37,7 @@ use reth_node_core::{
 };
 use reth_payload_builder::{PayloadBuilderHandle, PayloadStore};
 use reth_primitives_traits::NodePrimitives;
+use reth_provider::{DBProvider, DatabaseProviderFactory};
 use reth_rpc::{
     eth::{core::EthRpcConverterFor, DevSigner, EthApiTypes, FullEthApiServer},
     AdminApi,
@@ -1164,6 +1166,34 @@ where
             cache_new_blocks_task(c, new_canonical_blocks).await;
         });
 
+        // FilterMaps indexes finalized blocks in the background. The RPC serves eth_getLogs from
+        // it once the registry below exists. A failed indexer stops alone: the node keeps running.
+        let filter_maps = if config.filter_maps.enabled {
+            // The CLI rejects a receipts log filter next to --filter-maps, but reth.toml can set
+            // one.
+            let prunes_receipts = !node
+                .provider()
+                .database_provider_ro()?
+                .prune_modes_ref()
+                .receipts_log_filter
+                .is_empty();
+            if prunes_receipts {
+                eyre::bail!(
+                    "--filter-maps needs every receipt, but the receipts log filter prunes some"
+                );
+            }
+            let filter_maps = FilterMaps::open(
+                &config.datadir().filter_maps(),
+                FilterMapsConfig { history: config.filter_maps.history },
+            )?;
+            node.task_executor()
+                .spawn_blocking_task(filter_maps.indexer(node.provider().clone()).run());
+            info!(target: "reth::cli", "FilterMaps indexer started");
+            Some(filter_maps.reader())
+        } else {
+            None
+        };
+
         let prewarm_bals = config
             .rpc
             .eth_config()
@@ -1207,6 +1237,11 @@ where
                 engine_events.clone(),
                 beacon_engine_handle.clone(),
             );
+
+        if let Some(reader) = filter_maps {
+            // The auth server shares this filter handler.
+            registry.eth_handlers().filter.set_filter_maps(reader);
+        }
 
         // in dev mode we generate 20 random dev-signer accounts
         if config.dev.dev {
