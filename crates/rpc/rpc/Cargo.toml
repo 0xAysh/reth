@@ -98,11 +98,13 @@ reth-testing-utils.workspace = true
 reth-ethereum-primitives.workspace = true
 reth-transaction-pool = { workspace = true, features = ["test-utils"] }
 reth-provider = { workspace = true, features = ["test-utils"] }
+reth-prune-types.workspace = true
 reth-db-api.workspace = true
 reth-db-common.workspace = true
 reth-storage-overlay.workspace = true
 
 rand.workspace = true
+rocksdb.workspace = true
 tempfile.workspace = true
 
 jsonrpsee = { workspace = true, features = ["client"] }

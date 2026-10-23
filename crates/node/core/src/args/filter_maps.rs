@@ -8,13 +8,14 @@ use clap::Args;
 pub struct FilterMapsArgs {
     /// Index finalized blocks with `FilterMaps` and serve `eth_getLogs` from the index.
     ///
-    /// The index needs every log of a block, so it cannot run with `--minimal` or
-    /// `--prune.receiptslogfilter`.
+    /// The index needs the receipts of every finalized block, so it cannot run with `--minimal`
+    /// (it keeps receipts for 64 blocks), `--prune.receipts.full` or `--prune.receiptslogfilter`.
+    /// At launch it also refuses a receipts distance below 10,064 blocks.
     #[arg(
         id = "filter-maps.enabled",
         long = "filter-maps",
         default_value_t = false,
-        conflicts_with_all = ["minimal", "receipts_log_filter"],
+        conflicts_with_all = ["minimal", "receipts_full", "receipts_log_filter"],
         help_heading = "FilterMaps"
     )]
     pub enabled: bool,

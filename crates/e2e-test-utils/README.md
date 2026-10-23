@@ -123,6 +123,7 @@ RUST_LOG=info,engine::tree=debug cargo nextest run -p reth-node-ethereum --test 
 | Query the node over JSON-RPC | `rpc_provider()`, `rpc_provider_with_wallet(w)`, `rpc_provider_for::<Net>()` for other networks |
 | Read node state directly | `node.inner.provider`, `node.inner.pool`, `node.current_forkchoice_state()`, `node.block_hash(n)` (panics if unknown) |
 | Read the `FilterMaps` index or the receipt floor | `node.filter_maps_indexed_blocks()`, `node.receipt_floor()` |
+| Read a metric the node recorded | `node.metric(name, labels)`, with the endpoint's names (`reth_` prefix, `_` for `.`); the recorder is global to the test process |
 | Check that the persisted state and trie are consistent | `trie::assert_trie_consistency(&node.inner.provider)`, after `wait_for_persisted_block` |
 
 ## Recipes

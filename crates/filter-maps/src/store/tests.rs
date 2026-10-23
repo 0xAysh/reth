@@ -3,8 +3,10 @@ use crate::{
     matcher::{candidate_blocks, MatchPattern},
     slots::BlockPointer,
     test_utils::{block_hash, fixture_start, render_fixture, render_synthetic, take_finished_maps},
+    FilterMaps,
 };
 use alloy_primitives::{hex, Address};
+use proptest::prelude::*;
 use reth_filter_maps_test_utils::manifest;
 use std::collections::HashMap;
 
@@ -83,6 +85,38 @@ fn row_keys_follow_the_geth_formula() {
     assert_eq!(rows[31], [16777153], "map 1023 is offset 31 of group 992");
     assert!(rows[..31].iter().all(Vec::is_empty));
     assert_eq!(store.db.get(hex!("666d2d72000000000215cfff")).unwrap(), None, "no overflow");
+}
+
+/// The value bytes of every key space, as Geth's encoders write them at the pinned revision.
+#[test]
+fn stored_values_follow_the_geth_encoding() {
+    let corpus = manifest::load_and_validate_corpus().unwrap();
+    let (_, fixture) =
+        corpus.iter().find(|(_, fixture)| fixture.scenario == "epoch-boundary").unwrap();
+    let maps = take_finished_maps(&mut render_fixture(fixture));
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let range = store.init(fixture_start(fixture)).unwrap();
+    store.write_group(&range, &maps).unwrap();
+
+    // `WriteFilterMapBaseRows`: header bits, then 3-byte little-endian columns.
+    assert_eq!(
+        store.db.get(hex!("666d2d72000000000215cfe000")).unwrap().unwrap(),
+        hex!("00000080c1ffff")
+    );
+    // `WriteFilterMapLastBlock`: the big-endian block number, then the block hash.
+    assert_eq!(
+        store.db.get(hex!("666d2d62000003ff")).unwrap().unwrap(),
+        hex!(
+            "0000000000000046"
+            "51809dcd8b3c616ed1438f2cc91d099310d91f9d229083722823427012034408"
+        )
+    );
+    // `WriteBlockLvPointer`: the big-endian pointer.
+    assert_eq!(
+        store.db.get(hex!("666d2d700000000000000046")).unwrap().unwrap(),
+        hex!("0000000003ffffff")
+    );
 }
 
 /// A row with nine columns stores one in its extended row. Rewritten with eight, the base part is
@@ -198,6 +232,57 @@ fn dropping_an_epoch_keeps_its_last_block_of_map() {
 }
 
 #[test]
+fn a_group_write_that_does_not_continue_the_range_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let origin = origin(100, 30 << 16);
+    let group = render_synthetic(origin, 31);
+    assert_eq!(indices(&group), [30, 31]);
+    let empty = store.init(origin).unwrap();
+    assert!(matches!(store.write_group(&empty, &group[1..]), Err(FilterMapsError::Corrupt(_))));
+
+    // Maps 1021 to 1024 span two groups.
+    let epoch_dir = tempfile::tempdir().unwrap();
+    let epoch_store = Store::open(epoch_dir.path()).unwrap();
+    let epoch_origin = BlockRef { number: 100, hash: block_hash(100), pointer: 1021 << 16 };
+    let two_groups = render_synthetic(epoch_origin, 1024);
+    assert_eq!(indices(&two_groups), [1021, 1022, 1023, 1024]);
+    let epoch_range = epoch_store.init(epoch_origin).unwrap();
+    assert!(matches!(
+        epoch_store.write_group(&epoch_range, &two_groups),
+        Err(FilterMapsError::Corrupt(_))
+    ));
+
+    // A write that starts after the group's first stored map would erase that map's base rows.
+    let range = store.write_group(&empty, &group).unwrap();
+    let snapshot = store.snapshot();
+    let rows = (0..DEFAULT_PARAMS.map_height())
+        .map(|row| read_rows(&snapshot, &[30], row))
+        .collect::<Vec<_>>();
+    drop(snapshot);
+    assert!(matches!(store.write_group(&range, &group[1..]), Err(FilterMapsError::Corrupt(_))));
+    let snapshot = store.snapshot();
+    for (row, expected) in rows.iter().enumerate() {
+        assert_eq!(&read_rows(&snapshot, &[30], row as u32), expected, "row {row}");
+    }
+    assert_eq!(snapshot.range().unwrap(), Some(range));
+}
+
+#[test]
+fn dropping_the_epoch_of_the_index_head_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let origin = origin(100, 1021 << 16);
+    let maps = render_synthetic(origin, 1023);
+    assert_eq!(indices(&maps), [1021, 1022, 1023]);
+    let range = store.init(origin).unwrap();
+    let range = store.write_group(&range, &maps).unwrap();
+
+    assert!(matches!(store.drop_epoch(&range, 0), Err(FilterMapsError::Corrupt(_))));
+    assert_eq!(store.snapshot().range().unwrap(), Some(range));
+}
+
+#[test]
 fn base_rows_round_trip_through_geth_encoding() {
     let rows: [&[u32]; 4] = [&[1, 2], &[], &[0xff_ffff], &[]];
     let encoded = encode_base_rows(&rows).unwrap();
@@ -209,4 +294,114 @@ fn base_rows_round_trip_through_geth_encoding() {
         [vec![1, 2], vec![], vec![0xff_ffff], vec![]]
     );
     assert_eq!(encode_base_rows(&[&[], &[]]), None);
+}
+
+#[test]
+fn store_stats_leave_a_range_record_that_does_not_decode() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let store = Store::open(dir.path()).unwrap();
+        store.init(origin(100, 30 << 16)).unwrap();
+        store.db.put(RANGE_KEY, b"not a range").unwrap();
+    }
+
+    let stats = FilterMaps::stats(dir.path()).unwrap().expect("the store exists");
+    assert_eq!((stats.origin, stats.maps, stats.indexed_blocks), (None, 0..0, None));
+    let store = Store::open_read_only(dir.path()).unwrap();
+    assert_eq!(store.db.get(RANGE_KEY).unwrap().as_deref(), Some(&b"not a range"[..]));
+}
+
+proptest! {
+    #[test]
+    fn columns_round_trip_below_the_map_width(
+        columns in prop::collection::vec(0..1u32 << 24, 0..=64),
+    ) {
+        let encoded = encode_columns(&columns);
+        prop_assert_eq!(encoded.len(), COLUMN_BYTES * columns.len());
+        prop_assert_eq!(decode_columns(&encoded).unwrap(), columns);
+    }
+
+    #[test]
+    fn every_base_row_group_round_trips_through_the_geth_encoding(rows in base_row_group()) {
+        let refs = rows.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let encoded = encode_base_rows(&refs);
+        let Some(last) = rows.iter().rposition(|row| !row.is_empty()) else {
+            prop_assert_eq!(encoded, None);
+            return Ok(())
+        };
+        let encoded = encoded.unwrap();
+        let total = rows.iter().map(Vec::len).sum::<usize>();
+        prop_assert_eq!(encoded.len(), (last + total).div_ceil(8) + COLUMN_BYTES * total);
+        prop_assert_eq!(decode_base_rows(&encoded, rows.len()).unwrap(), rows);
+    }
+
+    #[test]
+    fn range_records_round_trip(
+        range in range_record(),
+        fields in prop::collection::vec(any::<u8>(), RangeRecord::ENCODED_LEN - 4),
+    ) {
+        let mut encoded = range.encode();
+        prop_assert_eq!(encoded.len(), RangeRecord::ENCODED_LEN);
+        prop_assert_eq!(&encoded[..4], &VERSION.to_le_bytes()[..]);
+        prop_assert_eq!(RangeRecord::decode(&encoded), Some(range));
+        encoded.push(0);
+        prop_assert_eq!(RangeRecord::decode(&encoded), None);
+        encoded.truncate(RangeRecord::ENCODED_LEN - 1);
+        prop_assert_eq!(RangeRecord::decode(&encoded), None);
+
+        let bytes = [&VERSION.to_le_bytes()[..], &fields].concat();
+        let decoded = RangeRecord::decode(&bytes);
+        prop_assert!(decoded.is_some());
+        prop_assert_eq!(decoded.unwrap().encode(), bytes);
+    }
+
+    #[test]
+    fn decoders_never_panic_on_arbitrary_bytes(
+        bytes in prop::collection::vec(prop_oneof![Just(0u8), Just(0xff), any::<u8>()], 0..=512),
+        row_count in 0usize..=64,
+    ) {
+        prop_assert_eq!(decode_columns(&bytes).is_ok(), bytes.len() % COLUMN_BYTES == 0);
+
+        if let Ok(rows) = decode_base_rows(&bytes, row_count) {
+            prop_assert_eq!(rows.len(), row_count);
+            // Header bits past the last column are ignored, so only the rows must come back.
+            let refs = rows.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            let encoded = encode_base_rows(&refs).unwrap_or_default();
+            prop_assert_eq!(decode_base_rows(&encoded, row_count).unwrap(), rows);
+        }
+
+        if RangeRecord::decode(&bytes).is_some() {
+            prop_assert_eq!(bytes.len(), RangeRecord::ENCODED_LEN);
+            prop_assert_eq!(&bytes[..4], &VERSION.to_le_bytes()[..]);
+        }
+    }
+}
+
+/// The base rows of one row in a map group: one per map, mostly empty, as in a real group.
+fn base_row_group() -> impl Strategy<Value = Vec<Vec<u32>>> {
+    let row = prop_oneof![Just(Vec::new()), prop::collection::vec(0..1u32 << 24, 0..=8),];
+    prop::collection::vec(row, DEFAULT_PARAMS.base_row_group_size() as usize)
+}
+
+fn range_record() -> impl Strategy<Value = RangeRecord> {
+    (
+        any::<u64>(),
+        any::<[u8; 32]>(),
+        any::<u64>(),
+        any::<u64>(),
+        any::<u64>(),
+        any::<u32>(),
+        any::<u32>(),
+    )
+        .prop_map(
+            |(number, hash, pointer, first_block, after_last_block, first_map, after_last_map)| {
+                RangeRecord {
+                    origin: BlockRef { number, hash: B256::from(hash), pointer },
+                    first_block,
+                    after_last_block,
+                    first_map,
+                    after_last_map,
+                }
+            },
+        )
 }

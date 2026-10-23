@@ -32,6 +32,7 @@ reth-network-peers.workspace = true
 reth-engine-local.workspace = true
 reth-engine-primitives.workspace = true
 reth-filter-maps.workspace = true
+reth-node-metrics.workspace = true
 reth-tasks.workspace = true
 reth-node-ethereum.workspace = true
 reth-ethereum-primitives.workspace = true

@@ -1,0 +1,136 @@
+---
+description: Serve eth_getLogs from the FilterMaps local search index.
+---
+
+# FilterMaps
+
+FilterMaps is a local search index for `eth_getLogs`. The node renders the logs
+of finalized blocks into filter maps and keeps them in a store next to its
+database. A query reads the maps to find the candidate blocks that may hold a
+matching log, then reads the receipts of only those blocks.
+
+A query answers from the index only inside the indexed window: from the first
+indexed block or the receipt floor, whichever is higher, up to the index head,
+the last block that stored maps cover completely. Every other block, including
+the blocks that are not finalized yet, is answered from the header bloom, as
+without the index. The results are the same either way: the index only decides
+which receipts to read, and the receipts decide which logs match.
+
+The index is off by default.
+
+## Run a node with FilterMaps
+
+```bash
+reth node \
+    --filter-maps \
+    --authrpc.jwtsecret /path/to/secret
+```
+
+| Flag | Default | Meaning |
+| ---- | ------- | ------- |
+| `--filter-maps` | off | Index finalized blocks and serve `eth_getLogs` from the index. |
+| `--filter-maps.history` | `2350000` | Blocks up to the finalized block to keep indexed, about a year of mainnet blocks. `0` keeps every block with receipts. |
+
+The index drops whole epochs of maps once they are behind the tail cutoff: the
+higher of the receipt floor and `--filter-maps.history` blocks behind the
+finalized block. So it can keep up to one epoch more than the history.
+
+A new store starts at the tail cutoff, the first block the window keeps.
+Raising `--filter-maps.history`, or setting it to `0`, can move the tail cutoff
+below the index origin. The node then deletes the store and indexes
+it again from the new cutoff, because a store cannot grow backwards. Lowering
+the history drops the epochs behind the new cutoff.
+
+## Receipt pruning
+
+The index needs the receipts of every finalized block in its window, so some
+[prune settings](/run/storage/pruning) are refused:
+
+| Setting | With `--filter-maps` |
+| ------- | -------------------- |
+| No receipt pruning (archive node) | Accepted |
+| `--full` (keeps the last 10,064 blocks) | Accepted |
+| `--prune.receipts.distance` of 10,064 blocks or more | Accepted |
+| `--prune.receipts.before`, `--prune.receipts.pre-merge` | Accepted |
+| `--prune.receipts.distance` below 10,064 blocks | Refused at launch |
+| `--minimal` (keeps receipts for 64 blocks) | Refused |
+| `--prune.receipts.full` | Refused |
+| `--prune.receiptslogfilter`, or `receipts_log_filter` in `reth.toml` | Refused |
+
+10,064 blocks is a policy line, not a hard limit. A shorter receipt window
+would empty the store on many restarts, and the header bloom serves a window
+that short cheaply anyway. The index helps most on nodes that keep receipts for
+many blocks.
+
+## The store
+
+The store is its own RocksDB database at `<datadir>/filter-maps`. It does not
+follow `--datadir.rocksdb`: that flag sets the path of Reth's own RocksDB
+database, and a feature's store keeps a fixed path in the datadir, as the ExEx
+write-ahead log does.
+
+To keep the store on another disk, make `<datadir>/filter-maps` a symlink to a
+directory on that disk before the first start with `--filter-maps`.
+
+[`reth db stats`](/cli/reth/db/stats) shows the store's path, size, index
+origin, indexed blocks and stored maps. It reads the store without changing it.
+
+[`reth db clear filter-maps`](/cli/reth/db/clear/filter-maps) deletes the
+store's files and keeps the directory, so a symlink stays in place. The next
+start with `--filter-maps` indexes again from the tail cutoff. `reth db drop`
+empties the store too. Both need the database lock, so stop the node first.
+
+### After an unwind
+
+After `reth stage unwind`, or after restoring the database from an older copy,
+on a chain whose blocks change, as a dev chain's do, run
+`reth db clear filter-maps` before the next start. Until the node persists its
+first block after the start, queries use stored maps of blocks that no longer
+exist. On mainnet the unwound finalized blocks come back the same, so the stored
+maps stay right and nothing is needed.
+
+## Failures
+
+- A failed read of the store sends the query, or the part of it the read was
+  for, to the header bloom, which is complete. The node logs these errors at
+  most once a minute and counts every fallback. A failed read of the receipt
+  floor does the same.
+- A failed indexing step is retried after a backoff that starts at one second
+  and doubles up to a minute. Queries stay correct meanwhile; the index stops
+  moving until the step succeeds.
+- A store whose records contradict each other is deleted and indexed again,
+  once per start.
+- Reth writes a new finalized block to disk only with the next block it
+  persists. A node restarted right after a finality update can start with an
+  older finalized block; the indexer then removes the maps above it and renders
+  them again.
+
+## Metrics
+
+With `--metrics`, the index reports these metrics (see
+[Monitoring](/run/monitoring)). The Grafana overview dashboard in `etc/grafana`
+has a FilterMaps row with all of them except `windows_total` and
+`match_duration_seconds`.
+
+| Metric | Type | Meaning |
+| ------ | ---- | ------- |
+| `reth_filter_maps_first_indexed_block` | gauge | The first block whose log values are all in stored maps, 0 while the index covers no block. |
+| `reth_filter_maps_last_indexed_block` | gauge | The index head, 0 while the index covers no block. |
+| `reth_filter_maps_store_target` | gauge | The block the indexer indexes towards: min(finalized, persisted). |
+| `reth_filter_maps_blocks_rendered` | counter | Blocks rendered into maps. |
+| `reth_filter_maps_maps_written` | counter | Maps written to the store. |
+| `reth_filter_maps_step_duration_seconds` | summary | Duration of one indexing step. |
+| `reth_filter_maps_write_duration_seconds` | summary | Duration of one map group write. |
+| `reth_filter_maps_failures` | counter | Failed indexing steps, each retried after a backoff. |
+| `reth_filter_maps_resets` | counter | Inconsistent stores deleted and indexed again. |
+| `reth_filter_maps_running` | gauge | 1 while the indexer runs. |
+| `reth_rpc_eth_filter_windows_total` | counter, `path` | Parts of a query's block range: at most 1,000 blocks each, split at the edges of the indexed window. |
+| `reth_rpc_eth_filter_headers_read_total` | counter, `path` | Headers read. On the index path, the candidate blocks. |
+| `reth_rpc_eth_filter_receipt_sets_read_total` | counter, `path` | Blocks whose receipts the query used. A query cut short by `--rpc.max-logs-per-response` may have read a few more. |
+| `reth_rpc_eth_filter_matching_blocks_total` | counter, `path` | Blocks with at least one matching log. |
+| `reth_rpc_eth_filter_logs_total` | counter, `path` | Logs returned. |
+| `reth_rpc_eth_filter_fallbacks_total` | counter | Failed reads of the store or the receipt floor that fell back to the header bloom. |
+| `reth_rpc_eth_filter_match_duration_seconds` | summary | Time spent matching the index. |
+
+The `path` label is `index` or `bloom`. The index head trails the store target
+by up to about one map: the blocks of the unfinished map are not indexed yet.

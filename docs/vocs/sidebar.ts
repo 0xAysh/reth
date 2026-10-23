@@ -102,6 +102,10 @@ export const sidebar: SidebarItem[] = [
                             }
                         ]
                     },
+                    {
+                        text: "FilterMaps",
+                        link: "/run/filter-maps"
+                    },
                 ]
             },
             {
