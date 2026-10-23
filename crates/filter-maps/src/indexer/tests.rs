@@ -13,8 +13,12 @@ use reth_ethereum_primitives::Receipt;
 use reth_primitives_traits::SealedHeader;
 use reth_provider::{
     providers::BlockchainProvider,
-    test_utils::{create_test_provider_factory, MockEthProvider, NoopProvider},
+    test_utils::{
+        create_test_provider_factory, MockEthProvider, MockNodeTypesWithDB, NoopProvider,
+    },
 };
+use reth_stages_types::StageCheckpoint;
+use reth_storage_api::StageCheckpointWriter;
 use reth_storage_errors::provider::ProviderError;
 use std::{collections::HashMap, ops::RangeInclusive, path::Path, time::Duration};
 
@@ -92,6 +96,28 @@ fn assert_same_index(left: &FilterMaps, right: &FilterMaps) {
     for block in range.first_block..=range.after_last_block {
         assert_eq!(left.block_pointer(block).unwrap(), right.block_pointer(block).unwrap());
     }
+}
+
+/// Runs the indexer of a new store over `provider` for 6 seconds of paused time and returns the
+/// metrics it recorded. A failing indexer steps at 0, 1 and 3 seconds; the next step is due at 7.
+fn run_indexer_for_six_seconds(
+    provider: BlockchainProvider<MockNodeTypesWithDB>,
+) -> HashMap<String, DebugValue> {
+    let dir = tempfile::tempdir().unwrap();
+    let maps = open(dir.path(), 0);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    recorded(|_| {
+        runtime.block_on(async {
+            tokio::select! {
+                () = maps.indexer(provider).run() => panic!("the indexer stopped"),
+                () = tokio::time::sleep(Duration::from_secs(6)) => {}
+            }
+        })
+    })
 }
 
 #[test]
@@ -696,23 +722,40 @@ fn a_failing_indexer_backs_off_between_steps() {
     let chain_state = provider.canonical_in_memory_state();
     chain_state.set_finalized(SealedHeader::default());
     chain_state.set_persisted(BlockNumHash::default());
-    let dir = tempfile::tempdir().unwrap();
-    let maps = open(dir.path(), 0);
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .start_paused(true)
-        .build()
-        .unwrap();
-    let metrics = recorded(|_| {
-        runtime.block_on(async {
-            tokio::select! {
-                () = maps.indexer(provider).run() => panic!("the indexer stopped"),
-                // Steps at 0, 1 and 3 seconds; the next one is due at 7.
-                () = tokio::time::sleep(Duration::from_secs(6)) => {}
-            }
-        })
-    });
+    let metrics = run_indexer_for_six_seconds(provider);
     assert_eq!(metrics["filter_maps.failures"], DebugValue::Counter(3));
+}
+
+/// The persisted watch stays empty until the engine's first save after a start, so the Finish
+/// checkpoint stands in for it.
+#[test]
+fn the_indexer_steps_before_the_first_persistence() {
+    let factory = create_test_provider_factory();
+    let provider_rw = factory.provider_rw().unwrap();
+    provider_rw.save_stage_checkpoint(StageId::Finish, StageCheckpoint::new(5)).unwrap();
+    provider_rw.commit().unwrap();
+    let head = SealedHeader::seal_slow(Header { number: 10, ..Default::default() });
+    let provider = BlockchainProvider::with_latest(factory, head.clone()).unwrap();
+    // The database has no block, so every step fails on the hash of block 0.
+    provider.canonical_in_memory_state().set_finalized(head);
+    let metrics = run_indexer_for_six_seconds(provider);
+    assert_eq!(metrics["filter_maps.failures"], DebugValue::Counter(3));
+    // min(finalized 10, Finish 5), not the in-memory head.
+    assert_eq!(metrics["filter_maps.store_target"], gauge(5));
+}
+
+/// With no persisted block and no Finish checkpoint, no block is known to be on disk, so the
+/// indexer waits instead of stepping.
+#[test]
+fn the_indexer_waits_without_a_block_on_disk() {
+    let head = SealedHeader::seal_slow(Header { number: 10, ..Default::default() });
+    let provider =
+        BlockchainProvider::with_latest(create_test_provider_factory(), head.clone()).unwrap();
+    // The database has no block, so a step would fail on the hash of block 0.
+    provider.canonical_in_memory_state().set_finalized(head);
+    let metrics = run_indexer_for_six_seconds(provider);
+    assert_eq!(metrics["filter_maps.failures"], DebugValue::Counter(0));
+    assert_eq!(metrics["filter_maps.store_target"], gauge(0));
 }
 
 /// A progress line waits for the first stored map group, then comes at most every

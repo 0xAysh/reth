@@ -3,11 +3,17 @@
 //! Matching reverses row columns into potential log value indices, combines address and topic
 //! alternatives by position, and resolves the indices to blocks through block pointers. The
 //! results are candidates only: receipts and the exact log filter stay authoritative. This is
-//! Geth's `core/filtermaps/matcher.go` without its worker pool.
+//! Geth's `core/filtermaps/matcher.go` without its worker pool and its adaptive match order.
 
 use crate::{address_value, slots::BlockPointer, topic_value, FilterMapsError, DEFAULT_PARAMS};
 use alloy_primitives::{Address, B256};
 use std::ops::{Range, RangeInclusive};
+
+/// The fewest indices for which [`resolve_blocks`] reads every pointer of the window in one scan.
+/// A scan of a full window reads about 1,002 pointers in about 0.15 ms (an estimate), and a binary
+/// search costs about 28 µs, or 10 point reads, per candidate block, so break-even is about 5
+/// candidate blocks. A window has at least as many indices as candidate blocks.
+const POINTER_SCAN_MIN_INDICES: usize = 8;
 
 /// An Ethereum log filter, compiled to log values.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -69,6 +75,10 @@ pub(crate) trait FilterMapMatchSource {
 
     /// Returns the block pointer of `block_number`.
     fn block_pointer(&self, block_number: u64) -> Result<u64, FilterMapsError>;
+
+    /// Returns the block pointer of every block in `blocks`, in block order. A block with no
+    /// pointer is corrupt.
+    fn block_pointers(&self, blocks: RangeInclusive<u64>) -> Result<Vec<u64>, FilterMapsError>;
 }
 
 /// Returns the candidate blocks for `pattern` in `blocks`, in ascending order.
@@ -107,8 +117,7 @@ pub(crate) fn potential_indices(
     // Each epoch is matched on its own, as in Geth, to bound the memory of one pass.
     loop {
         let epoch_last = params.last_epoch_map(params.map_epoch(map)).min(last_map);
-        let maps = (map..=epoch_last).collect::<Vec<_>>();
-        output.extend(match_maps(source, pattern, &maps)?);
+        output.extend(match_maps(source, pattern, map..=epoch_last)?);
         if epoch_last == last_map {
             break
         }
@@ -118,78 +127,158 @@ pub(crate) fn potential_indices(
     Ok(output)
 }
 
+/// Returns the indices in `maps` where a log matching `pattern` may start, in ascending order.
+///
+/// It reads one mapping layer at a time, for every value of every position in filter order, as
+/// Geth's `getAllMatches` does. A map that a position resolves with no index is dropped: no later
+/// position and no later layer reads it. A map where a value's row is still full is not resolved,
+/// since the value may be marked on a higher layer. So a rare value spares a dense one the reads of
+/// its higher layers in every map where the rare value has no match, whichever position comes
+/// first.
 fn match_maps(
     source: &impl FilterMapMatchSource,
     pattern: &MatchPattern,
-    maps: &[u32],
+    maps: RangeInclusive<u32>,
 ) -> Result<Vec<u64>, FilterMapsError> {
-    let mut candidates = if pattern.addresses.is_empty() {
-        None
-    } else {
-        Some(match_alternatives(source, &pattern.addresses, maps)?)
-    };
-    for (ordinal, topic) in pattern.topics.iter().enumerate() {
-        let Some(values) = topic else { continue };
-        let indices = match_alternatives(source, values, maps)?;
-        let starts = log_starts(indices, ordinal as u64);
-        let narrowed = match candidates {
+    let first_map = *maps.start();
+    let maps = maps.collect::<Vec<_>>();
+    let mut addresses =
+        (!pattern.addresses.is_empty()).then(|| PositionMatch::new(&pattern.addresses, &maps));
+    let mut topics = pattern
+        .topics
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, topic)| {
+            Some((ordinal as u64, PositionMatch::new(topic.as_deref()?, &maps)))
+        })
+        .collect::<Vec<_>>();
+    let mut dropped = vec![false; maps.len()];
+    loop {
+        let mut read = false;
+        for position in addresses.iter_mut().chain(topics.iter_mut().map(|(_, position)| position))
+        {
+            read |= position.read_layer(source, first_map, &mut dropped)?;
+        }
+        if !read {
+            break
+        }
+    }
+    // A dropped map has an empty intersection: a position has no index in it.
+    let mut candidates = addresses.map(PositionMatch::into_indices);
+    for (ordinal, topic) in topics {
+        let starts = log_starts(topic.into_indices(), ordinal);
+        candidates = Some(match candidates {
             None => starts,
             Some(base) => intersect(&base, &starts),
-        };
-        if narrowed.is_empty() {
-            return Ok(narrowed)
-        }
-        candidates = Some(narrowed);
+        });
     }
     Ok(candidates.unwrap_or_default())
 }
 
-fn match_alternatives(
-    source: &impl FilterMapMatchSource,
-    values: &[B256],
-    maps: &[u32],
-) -> Result<Vec<u64>, FilterMapsError> {
-    let mut union = Vec::new();
-    for &value in values {
-        union.extend(match_value(source, value, maps)?);
-    }
-    union.sort_unstable();
-    union.dedup();
-    Ok(union)
+/// The matching state of one position of a pattern, its addresses or one topic, over the maps of
+/// an epoch.
+struct PositionMatch {
+    /// The alternatives of the position.
+    values: Vec<ValueMatch>,
+    /// Whether a value of the position may be marked in each map, by offset from the first map.
+    matched: Vec<bool>,
 }
 
-/// Returns the indices in `maps` where `value` may be marked.
-///
-/// A row that is full on one mapping layer may continue on the next, so the maps whose row is full
-/// are read again one layer up. Maps that share a masked map index share the value's row, so each
-/// run of them hashes the row once and reads it in one call (Geth's `getMatchesForLayer`).
-fn match_value(
-    source: &impl FilterMapMatchSource,
+impl PositionMatch {
+    fn new(values: &[B256], maps: &[u32]) -> Self {
+        Self {
+            values: values.iter().map(|&value| ValueMatch::new(value, maps)).collect(),
+            matched: vec![false; maps.len()],
+        }
+    }
+
+    /// Reads the next layer of every value in the maps that are not `dropped`, then drops the maps
+    /// that the position resolved with no index. `dropped` holds one flag per map, by offset from
+    /// `first_map`. Returns whether a value read a row.
+    fn read_layer(
+        &mut self,
+        source: &impl FilterMapMatchSource,
+        first_map: u32,
+        dropped: &mut [bool],
+    ) -> Result<bool, FilterMapsError> {
+        let mut read = false;
+        // The maps where a row of a value is still full.
+        let mut unresolved = vec![false; dropped.len()];
+        for value in &mut self.values {
+            value.active.retain(|map| !dropped[(map - first_map) as usize]);
+            let found = value.indices.len();
+            if !value.read_layer(source)? {
+                continue
+            }
+            read = true;
+            for &index in &value.indices[found..] {
+                self.matched[(map_of(index)? - first_map) as usize] = true;
+            }
+            for &map in &value.active {
+                unresolved[(map - first_map) as usize] = true;
+            }
+        }
+        for ((dropped, matched), unresolved) in
+            dropped.iter_mut().zip(&self.matched).zip(unresolved)
+        {
+            *dropped |= !matched && !unresolved;
+        }
+        Ok(read)
+    }
+
+    /// Returns the indices where a value of the position may be marked, in ascending order.
+    fn into_indices(self) -> Vec<u64> {
+        let mut union = self.values.into_iter().flat_map(|value| value.indices).collect::<Vec<_>>();
+        union.sort_unstable();
+        union.dedup();
+        union
+    }
+}
+
+/// The matching state of one value over the maps of an epoch.
+struct ValueMatch {
     value: B256,
-    maps: &[u32],
-) -> Result<Vec<u64>, FilterMapsError> {
-    let params = DEFAULT_PARAMS;
-    let mut output = Vec::new();
-    let mut active = maps.to_vec();
-    let mut layer = 0;
-    let mut capacity = 0u64;
-    while !active.is_empty() {
+    /// The maps whose row was full on every layer read so far, in ascending order. The next layer
+    /// reads them.
+    active: Vec<u32>,
+    /// The indices where the value may be marked, from the layers read so far.
+    indices: Vec<u64>,
+    /// The next layer to read.
+    layer: u32,
+    /// The marks that the rows read so far could hold in one map.
+    capacity: u64,
+}
+
+impl ValueMatch {
+    fn new(value: B256, maps: &[u32]) -> Self {
+        Self { value, active: maps.to_vec(), indices: Vec::new(), layer: 0, capacity: 0 }
+    }
+
+    /// Reads the value's rows of the active maps on the next layer and keeps the maps whose row is
+    /// full active: the value may continue on the layer after. Returns `false` and reads nothing
+    /// when no map is active.
+    ///
+    /// Maps that share a masked map index share the value's row, so each run of them hashes the row
+    /// once and reads it in one call (Geth's `getMatchesForLayer`).
+    fn read_layer(&mut self, source: &impl FilterMapMatchSource) -> Result<bool, FilterMapsError> {
+        let params = DEFAULT_PARAMS;
+        let Some(&first_active) = self.active.first() else { return Ok(false) };
         // A map holds at most `values_per_map` marks. Once the rows read so far could hold them
         // all, one more full row means the stored rows are corrupt.
-        if capacity >= params.values_per_map() {
+        if self.capacity >= params.values_per_map() {
             return Err(FilterMapsError::Corrupt(format!(
-                "row of value {value} in map {} is full on every mapping layer",
-                active[0]
+                "row of value {} in map {first_active} is full on every mapping layer",
+                self.value
             )))
         }
-        let limit = params.max_row_length(layer);
-        capacity += u64::from(limit);
+        let limit = params.max_row_length(self.layer);
+        self.capacity += u64::from(limit);
         let mut full = Vec::new();
-        let runs = active.chunk_by(|a, b| {
-            params.masked_map_index(*a, layer) == params.masked_map_index(*b, layer)
+        let runs = self.active.chunk_by(|a, b| {
+            params.masked_map_index(*a, self.layer) == params.masked_map_index(*b, self.layer)
         });
         for run in runs {
-            let row_index = params.row_index(run[0], layer, value);
+            let row_index = params.row_index(run[0], self.layer, self.value);
             let rows = source.row_prefixes(run, row_index, limit)?;
             // A short read would silently drop candidates.
             if rows.len() != run.len() {
@@ -203,8 +292,8 @@ fn match_value(
                 let map_first = u64::from(map) * params.values_per_map();
                 for column in &columns {
                     let index = map_first + u64::from(column >> params.hash_bits());
-                    if params.column_index(index, value) == *column {
-                        output.push(index);
+                    if params.column_index(index, self.value) == *column {
+                        self.indices.push(index);
                     }
                 }
                 if columns.len() >= limit as usize {
@@ -212,16 +301,18 @@ fn match_value(
                 }
             }
         }
-        active = full;
-        layer += 1;
+        self.active = full;
+        self.layer += 1;
+        Ok(true)
     }
-    output.sort_unstable();
-    output.dedup();
-    Ok(output)
 }
 
 /// Resolves sorted indices to the blocks that hold them. `first` is the first block of the range
 /// and `after` the block after the range.
+///
+/// With few indices, each block is found by a binary search over the range's pointers. With
+/// [`POINTER_SCAN_MIN_INDICES`] or more, all pointers of the range are read in one scan and the
+/// indices walk them.
 fn resolve_blocks(
     source: &impl FilterMapMatchSource,
     indices: &[u64],
@@ -229,6 +320,37 @@ fn resolve_blocks(
     after: BlockPointer,
 ) -> Result<Vec<u64>, FilterMapsError> {
     let mut blocks = Vec::new();
+    if indices.len() >= POINTER_SCAN_MIN_INDICES {
+        // `first` and `after` come from the same source, so the scan starts and ends with them.
+        // Each pointer must be above the one before, as each probe of the binary search checks.
+        let pointers = source.block_pointers(first.block..=after.block)?;
+        if let Some(offset) = pointers.windows(2).position(|pair| pair[0] >= pair[1]) {
+            let block = first.block + offset as u64 + 1;
+            return Err(FilterMapsError::PointerOrder { block, pointer: pointers[offset + 1] })
+        }
+        let last = pointers.len() - 1;
+        // The block at `offset` from `first` holds the slots from its pointer to the next one's.
+        let mut offset = 0;
+        for &index in indices {
+            while offset + 1 < last && pointers[offset + 1] <= index {
+                offset += 1;
+            }
+            let slots = pointers[offset]..pointers[offset + 1];
+            let block = first.block + offset as u64;
+            if !slots.contains(&index) {
+                return Err(FilterMapsError::CandidateOutsideBlock {
+                    index,
+                    block,
+                    pointer: slots.start,
+                    next_pointer: slots.end,
+                })
+            }
+            if blocks.last() != Some(&block) {
+                blocks.push(block);
+            }
+        }
+        return Ok(blocks)
+    }
     // The slots of the last resolved block: from its pointer to the next block's pointer.
     let mut latest = None::<Range<u64>>;
     for &index in indices {

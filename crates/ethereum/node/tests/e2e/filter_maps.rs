@@ -138,6 +138,29 @@ async fn filter_maps_resumes_a_stored_map_group_after_restart() -> eyre::Result<
     Ok(())
 }
 
+/// A restarted node indexes before the engine's first save after the start, up to the Finish
+/// checkpoint.
+///
+/// Only genesis is finalized before the restart, so no map is stored. After the restart, a
+/// finalized head with no new block gives the engine nothing to save.
+#[tokio::test]
+async fn filter_maps_indexes_before_the_first_persistence_after_restart() -> eyre::Result<()> {
+    reth_tracing::init_test_tracing();
+
+    let (mut node, wallet) = filter_maps_setup().with_restartable_nodes().build_single().await?;
+    node.set_finality(Finality::Keep);
+    let mut chain = Chain::deploy(&mut node, wallet.account(0)).await?;
+    chain.mine_heavy(&mut node, 3).await?;
+    node.wait_for_persisted_block(chain.head).await?;
+
+    let node = node.restart().await?;
+    assert_eq!(node.filter_maps_indexed_blocks()?, None);
+    node.finalize(node.block_hash(chain.head)).await?;
+    // Maps 0 to 2 finish in heavy[2], so the finished maps cover heavy[1].
+    node.wait_for_filter_maps_head(chain.heavy[1]).await?;
+    Ok(())
+}
+
 /// On a node that prunes receipts, the index starts at the receipt floor, which is the tail cutoff
 /// on a chain shorter than the history: the store resets when the floor passes its next block.
 /// Queries above the floor give the same logs, and a query below it fails as before.

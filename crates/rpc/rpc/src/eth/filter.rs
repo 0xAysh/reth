@@ -691,6 +691,8 @@ where
     /// Returns an error if:
     ///  - underlying database error
     ///  - amount of matches exceeds configured limit
+    ///  - the blocks on the header bloom path exceed the block limit: blocks that `FilterMaps`
+    ///    serves do not count
     async fn get_logs_in_block_range(
         self: Arc<Self>,
         filter: Filter,
@@ -705,8 +707,11 @@ where
             return Err(EthFilterError::InvalidBlockRangeParams)
         }
 
+        // A longer range goes on only if the index may serve part of it: the task counts the
+        // blocks it leaves to the header bloom.
         if let Some(max_blocks_per_filter) =
-            limits.max_blocks_per_filter.filter(|limit| to_block - from_block > *limit)
+            limits.max_blocks_per_filter.filter(|limit| to_block - from_block > *limit) &&
+            (self.filter_maps.get().is_none() || !match_pattern(&filter).has_searchable_values())
         {
             return Err(EthFilterError::QueryExceedsMaxBlocks(max_blocks_per_filter))
         }
@@ -764,6 +769,8 @@ where
     ///
     /// Returns an error if:
     ///  - underlying database error
+    ///  - the blocks on the header bloom path exceed the block limit, checked before the first
+    ///    window and before each window that falls back
     async fn get_logs_in_block_range_inner(
         self: Arc<Self>,
         filter: &Filter,
@@ -812,10 +819,23 @@ where
             None => None,
         };
 
+        let windows = log_windows(from_block..=to_block, indexed.as_ref(), self.max_headers_range);
+        // The block limit bounds the header scan, so only the blocks on the header bloom count. As
+        // in the check before the task, a range of `limit + 1` blocks passes.
+        let check_block_limit = |bloom_blocks: u64| match limits.max_blocks_per_filter {
+            Some(limit) if bloom_blocks.saturating_sub(1) > limit => {
+                Err(EthFilterError::QueryExceedsMaxBlocks(limit))
+            }
+            _ => Ok(()),
+        };
+        let mut bloom_blocks =
+            windows.iter().filter(|window| !window.indexed).map(LogWindow::blocks).sum::<u64>();
+        check_block_limit(bloom_blocks)?;
+
         // Scan the range window by window so that receipts are fetched while headers are still
         // being read: the log limit can end the query after the first window, memory is bounded by
         // one window, and a cancelled query stops at the next window.
-        for window in log_windows(from_block..=to_block, indexed.as_ref(), self.max_headers_range) {
+        for window in windows {
             // reading headers is blocking, this gives the cancellation check a chance to run
             tokio::task::yield_now().await;
 
@@ -839,6 +859,11 @@ where
                 }
                 _ => None,
             };
+            // A window whose lookup failed scans its headers too.
+            if window.indexed && candidates.is_none() {
+                bloom_blocks += window.blocks();
+                check_block_limit(bloom_blocks)?;
+            }
             // A window that falls back counts on the bloom path, so the two paths add up to the
             // query.
             let path = if candidates.is_some() { &mut stats.index } else { &mut stats.bloom };
@@ -849,7 +874,7 @@ where
                     self.candidate_headers(filter, candidates)?
                 }
                 None => {
-                    path.headers_read += window.to - window.from + 1;
+                    path.headers_read += window.blocks();
                     self.bloom_headers(filter, window.from..=window.to)?
                 }
             };
@@ -1250,6 +1275,13 @@ struct LogWindow {
     to: u64,
     /// Whether the `FilterMaps` index names the candidate blocks of the window.
     indexed: bool,
+}
+
+impl LogWindow {
+    /// Returns the number of blocks in the window.
+    const fn blocks(&self) -> u64 {
+        self.to - self.from + 1
+    }
 }
 
 /// Splits `blocks` at the edges of the `indexed` window, then into header windows.
@@ -2816,6 +2848,13 @@ mod tests {
         provider
     }
 
+    /// Deletes the pointer of `block` from the `FilterMaps` store at `path`. The key is the block
+    /// pointer prefix (Geth's `filterMapBlockLVPrefix`) and the block number.
+    fn delete_block_pointer(path: &Path, block: u64) {
+        let db = rocksdb::DB::open_default(path).unwrap();
+        db.delete([&b"fm-p"[..], &block.to_be_bytes()].concat()).unwrap();
+    }
+
     /// The filter of [`build_test_eth_api`].
     type TestEthFilter = EthFilter<
         EthApi<
@@ -2851,17 +2890,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let provider = index_chain_with_a_late_receipt(address, dir.path());
         // The lookup reads the pointer of the block after the window first.
-        {
-            let db = rocksdb::DB::open_default(dir.path()).unwrap();
-            db.delete([&b"fm-p"[..], &5u64.to_be_bytes()].concat()).unwrap();
-        }
-        let filter_maps = FilterMaps::open(dir.path(), FilterMapsConfig { history: 0 }).unwrap();
-        let eth_filter = EthFilter::new(
-            build_test_eth_api(provider),
-            EthFilterConfig::default(),
-            Runtime::test(),
-        );
-        eth_filter.set_filter_maps(filter_maps.reader());
+        delete_block_pointer(dir.path(), 5);
+        let eth_filter = eth_filter_with_index(provider, dir.path());
         let indexed = eth_filter.filter_maps().unwrap().snapshot().unwrap().indexed_blocks();
         assert_eq!(indexed, Some(0..=4));
 
@@ -2924,6 +2954,134 @@ mod tests {
         assert_eq!(stats.fallbacks, 1);
         assert_eq!(stats.bloom.headers_read, 5);
         assert_eq!(stats.index, PathStats::default());
+    }
+
+    /// A range of `limit + 1` blocks passes, a longer one is rejected, as in Geth.
+    #[tokio::test]
+    async fn a_range_above_the_block_limit_is_rejected() {
+        let address = Address::repeat_byte(7);
+        let (provider, _) = chain_with_logs_of(address);
+        let eth_filter = EthFilter::new(
+            build_test_eth_api(provider),
+            EthFilterConfig::default(),
+            Runtime::test(),
+        );
+        let limits = QueryLimits { max_blocks_per_filter: Some(1), ..Default::default() };
+        let query = |to_block| {
+            eth_filter.inner.clone().get_logs_in_block_range(
+                Filter::new().address(address),
+                0,
+                to_block,
+                limits,
+            )
+        };
+
+        let blocks =
+            query(1).await.unwrap().iter().map(|log| log.block_number.unwrap()).collect::<Vec<_>>();
+        assert_eq!(blocks, [1]);
+        let err = query(2).await.unwrap_err();
+        assert!(matches!(err, EthFilterError::QueryExceedsMaxBlocks(1)), "{err:?}");
+    }
+
+    /// The index covers blocks 0 to 4, so only block 5 counts toward a limit of one block.
+    #[tokio::test]
+    async fn indexed_blocks_do_not_count_toward_the_block_limit() {
+        let address = Address::repeat_byte(7);
+        let dir = tempfile::tempdir().unwrap();
+        let provider = index_chain_with_a_late_receipt(address, dir.path());
+        let eth_filter = eth_filter_with_index(provider, dir.path());
+
+        let limited =
+            query_blocks_0_to_5_with_a_limit_of_1(&eth_filter, Filter::new().address(address))
+                .await
+                .unwrap();
+        let unlimited = eth_filter
+            .inner
+            .clone()
+            .get_logs_in_block_range(Filter::new().address(address), 0, 5, QueryLimits::default())
+            .await
+            .unwrap();
+        assert_eq!(limited, unlimited);
+        let blocks = limited.iter().map(|log| log.block_number.unwrap()).collect::<Vec<_>>();
+        assert_eq!(blocks, [1, 3], "block 2 is no candidate of the index");
+    }
+
+    #[tokio::test]
+    async fn the_whole_range_counts_when_the_index_cannot_help() {
+        let address = Address::repeat_byte(7);
+        let dir = tempfile::tempdir().unwrap();
+        let provider = index_chain_with_a_late_receipt(address, dir.path());
+
+        let without_reader = EthFilter::new(
+            build_test_eth_api(provider.clone()),
+            EthFilterConfig::default(),
+            Runtime::test(),
+        );
+        let err =
+            query_blocks_0_to_5_with_a_limit_of_1(&without_reader, Filter::new().address(address))
+                .await
+                .unwrap_err();
+        assert!(
+            matches!(err, EthFilterError::QueryExceedsMaxBlocks(1)),
+            "without a reader: {err:?}"
+        );
+
+        let eth_filter = eth_filter_with_index(provider.clone(), dir.path());
+        let err =
+            query_blocks_0_to_5_with_a_limit_of_1(&eth_filter, Filter::new()).await.unwrap_err();
+        assert!(
+            matches!(err, EthFilterError::QueryExceedsMaxBlocks(1)),
+            "no address or topic: {err:?}"
+        );
+
+        provider.set_prune_checkpoint_reads_fail(true);
+        let err =
+            query_blocks_0_to_5_with_a_limit_of_1(&eth_filter, Filter::new().address(address))
+                .await
+                .unwrap_err();
+        assert!(
+            matches!(err, EthFilterError::QueryExceedsMaxBlocks(1)),
+            "no receipt floor: {err:?}"
+        );
+    }
+
+    /// The lookup of the indexed window fails, so its blocks fall back to the header bloom and
+    /// count.
+    #[tokio::test]
+    async fn a_failed_window_counts_toward_the_block_limit() {
+        let address = Address::repeat_byte(7);
+        let dir = tempfile::tempdir().unwrap();
+        let provider = index_chain_with_a_late_receipt(address, dir.path());
+        // The lookup reads the pointer of the block after the window first.
+        delete_block_pointer(dir.path(), 5);
+        let eth_filter = eth_filter_with_index(provider, dir.path());
+
+        let err =
+            query_blocks_0_to_5_with_a_limit_of_1(&eth_filter, Filter::new().address(address))
+                .await
+                .unwrap_err();
+        assert!(matches!(err, EthFilterError::QueryExceedsMaxBlocks(1)), "{err:?}");
+    }
+
+    /// Returns a filter over `provider` that reads the `FilterMaps` store at `path`.
+    fn eth_filter_with_index(provider: MockEthProvider, path: &Path) -> TestEthFilter {
+        let filter_maps = FilterMaps::open(path, FilterMapsConfig { history: 0 }).unwrap();
+        let eth_filter = EthFilter::new(
+            build_test_eth_api(provider),
+            EthFilterConfig::default(),
+            Runtime::test(),
+        );
+        eth_filter.set_filter_maps(filter_maps.reader());
+        eth_filter
+    }
+
+    /// Runs `filter` over blocks 0 to 5 with a block limit of one block.
+    async fn query_blocks_0_to_5_with_a_limit_of_1(
+        eth_filter: &TestEthFilter,
+        filter: Filter,
+    ) -> Result<Vec<alloy_rpc_types_eth::Log>, EthFilterError> {
+        let limits = QueryLimits { max_blocks_per_filter: Some(1), ..Default::default() };
+        eth_filter.inner.clone().get_logs_in_block_range(filter, 0, 5, limits).await
     }
 
     #[tokio::test]
