@@ -11,8 +11,9 @@ use crate::{
 use alloy_primitives::{Address, Bytes, Log, B256};
 use reth_filter_maps_test_utils::parser::{Block, Fixture, Origin};
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     collections::{BTreeMap, HashMap},
+    ops::RangeInclusive,
 };
 
 /// A [`FilterMapMatchSource`] that serves finished maps and block pointers from memory.
@@ -22,8 +23,12 @@ pub(crate) struct MemorySource {
     pub(crate) maps: BTreeMap<u32, HashMap<u32, Vec<u32>>>,
     /// Block pointers by block number.
     pub(crate) pointers: BTreeMap<u64, u64>,
-    /// The number of `row_prefixes` calls.
-    pub(crate) row_reads: Cell<usize>,
+    /// The maps and the row index of each `row_prefixes` call, in call order.
+    pub(crate) row_reads: RefCell<Vec<(Vec<u32>, u32)>>,
+    /// The number of `block_pointer` calls.
+    pub(crate) pointer_reads: Cell<usize>,
+    /// The number of `block_pointers` calls.
+    pub(crate) pointer_scans: Cell<usize>,
 }
 
 impl MemorySource {
@@ -42,7 +47,7 @@ impl FilterMapMatchSource for MemorySource {
         row_index: u32,
         max_columns: u32,
     ) -> Result<Vec<Vec<u32>>, FilterMapsError> {
-        self.row_reads.set(self.row_reads.get() + 1);
+        self.row_reads.borrow_mut().push((map_indices.to_vec(), row_index));
         map_indices
             .iter()
             .map(|map| {
@@ -57,10 +62,22 @@ impl FilterMapMatchSource for MemorySource {
     }
 
     fn block_pointer(&self, block_number: u64) -> Result<u64, FilterMapsError> {
+        self.pointer_reads.set(self.pointer_reads.get() + 1);
         self.pointers
             .get(&block_number)
             .copied()
             .ok_or_else(|| FilterMapsError::Corrupt(format!("block {block_number} has no pointer")))
+    }
+
+    fn block_pointers(&self, blocks: RangeInclusive<u64>) -> Result<Vec<u64>, FilterMapsError> {
+        self.pointer_scans.set(self.pointer_scans.get() + 1);
+        let mut entries = self.pointers.range(blocks.clone());
+        blocks
+            .map(|block| match entries.next() {
+                Some((&number, &pointer)) if number == block => Ok(pointer),
+                _ => Err(FilterMapsError::Corrupt(format!("block {block} has no pointer"))),
+            })
+            .collect()
     }
 }
 

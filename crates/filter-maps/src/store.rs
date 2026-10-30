@@ -11,7 +11,9 @@ use crate::{
 };
 use alloy_eips::BlockNumHash;
 use alloy_primitives::B256;
-use rocksdb::{properties, DBCompressionType, Options, SnapshotWithThreadMode, WriteBatch, DB};
+use rocksdb::{
+    properties, DBCompressionType, Options, ReadOptions, SnapshotWithThreadMode, WriteBatch, DB,
+};
 use std::{ops::RangeInclusive, path::Path};
 
 /// The store format version. A store with another version is wiped at open.
@@ -297,9 +299,33 @@ impl FilterMapMatchSource for StoreSnapshot<'_> {
         let value = self.snapshot.get(pointer_key(block_number))?.ok_or_else(|| {
             FilterMapsError::Corrupt(format!("block {block_number} has no pointer"))
         })?;
-        let bytes = <[u8; 8]>::try_from(value.as_slice())
-            .map_err(|_| FilterMapsError::Corrupt(format!("pointer of block {block_number}")))?;
-        Ok(u64::from_be_bytes(bytes))
+        decode_pointer(block_number, &value)
+    }
+
+    /// Reads the pointers with one forward scan: their keys are consecutive in block order.
+    fn block_pointers(&self, blocks: RangeInclusive<u64>) -> Result<Vec<u64>, FilterMapsError> {
+        let (first, last) = blocks.into_inner();
+        let mut options = ReadOptions::default();
+        options.set_iterate_upper_bound(pointer_key(last + 1));
+        let mut entries = self.snapshot.raw_iterator_opt(options);
+        // One key buffer for the scan: the prefix stays and each block writes its number.
+        let mut key = pointer_key(first);
+        entries.seek(&key);
+        (first..=last)
+            .map(|block| {
+                key[POINTER_PREFIX.len()..].copy_from_slice(&block.to_be_bytes());
+                // The iterator also stops at a read error.
+                if !entries.valid() {
+                    entries.status()?;
+                }
+                let pointer = match entries.item() {
+                    Some((entry, value)) if entry == key => decode_pointer(block, value),
+                    _ => Err(FilterMapsError::Corrupt(format!("block {block} has no pointer"))),
+                };
+                entries.next();
+                pointer
+            })
+            .collect()
     }
 }
 
@@ -404,6 +430,13 @@ fn last_block_key(map: u32) -> Vec<u8> {
 
 fn pointer_key(block: u64) -> Vec<u8> {
     [POINTER_PREFIX, &block.to_be_bytes()].concat()
+}
+
+/// Decodes the stored pointer of block `block`.
+fn decode_pointer(block: u64, value: &[u8]) -> Result<u64, FilterMapsError> {
+    let bytes = <[u8; 8]>::try_from(value)
+        .map_err(|_| FilterMapsError::Corrupt(format!("pointer of block {block}")))?;
+    Ok(u64::from_be_bytes(bytes))
 }
 
 /// Encodes the base parts of one row for every map of a group (Geth's `WriteFilterMapBaseRows`):
